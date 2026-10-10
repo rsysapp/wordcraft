@@ -42,6 +42,10 @@ pub struct CanvasState {
     pub scroll_to_doc: Option<(usize, f32)>,
     /// embed: the page filling most of the view last frame.
     pub visible_page: Option<usize>,
+    /// embed: this frame's canvas took a `scroll_to_doc`.
+    pub scroll_to_doc_taken: bool,
+    /// embed: the document scroll area's id, from the last frame it was shown.
+    pub scroll_area_id: Option<egui::Id>,
 }
 
 impl Default for CanvasState {
@@ -66,6 +70,8 @@ impl Default for CanvasState {
             context_synonyms: None,
             scroll_to_doc: None,
             visible_page: None,
+            scroll_to_doc_taken: false,
+            scroll_area_id: None,
         }
     }
 }
@@ -189,7 +195,10 @@ pub fn show(app: &mut WordApp, ui: &mut Ui) {
     // itself rather than through `scroll_to_rect`, so this frame's viewport already shows it: a scroll
     // target would move the view only on a later frame (and animated), leaving this frame to measure
     // the old position, which after an open is the previous document's.
-    let host_offset = app.canvas.scroll_to_doc.take().and_then(|(page, y)| {
+    let host_scroll = app.canvas.scroll_to_doc.take();
+    // embed: the host state reads this at the frame's end: a jump waiting on this scroll has landed.
+    app.canvas.scroll_to_doc_taken = host_scroll.is_some();
+    let host_offset = host_scroll.and_then(|(page, y)| {
         geo.rects.get(page).map(|pr| {
             // Kept within the page: a huge or non-finite offset would otherwise be unbounded.
             let dy = if y.is_finite() { (y * geo.scale).min(pr.height()).max(0.0) } else { 0.0 };
@@ -200,6 +209,18 @@ pub fn show(app: &mut WordApp, ui: &mut Ui) {
     // embed: a host jump wins over a caret scroll from the same frame, which would animate away from it.
     if host_offset.is_some() {
         scroll_target = None;
+        // embed: and over an animation or kinetic velocity still running from earlier frames (a find
+        // step's scroll, a flick), which would carry the view off the jump while the host is told
+        // it shows the target. egui keeps both private in the scroll area's stored state, so that
+        // state is replaced by a fresh one at the same offset (the jump then sets the vertical one).
+        if let Some(id) = app.canvas.scroll_area_id {
+            let ctx = ui.ctx();
+            let mut fresh = egui::scroll_area::State::default();
+            if let Some(stored) = egui::scroll_area::State::load(ctx, id) {
+                fresh.offset = stored.offset;
+            }
+            fresh.store(ctx, id);
+        }
     }
     let mut origin = area.min;
     let mut ui_area = ui.new_child(egui::UiBuilder::new().max_rect(area));
@@ -347,6 +368,8 @@ pub fn show(app: &mut WordApp, ui: &mut Ui) {
         }
         (resp, rects)
     });
+    // embed: the area's id, for the next host jump to reset its scrolling (above).
+    app.canvas.scroll_area_id = Some(out.id);
     let (resp, rects) = out.inner;
     // Focus: the canvas takes keyboard focus on click and keeps Tab/arrows.
     if resp.clicked() || resp.drag_started() || app.canvas.want_focus {

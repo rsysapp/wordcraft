@@ -462,6 +462,44 @@ fn a_host_jump_wins_over_a_caret_scroll_from_the_same_frame() {
     assert_eq!(bridge.take_events(), vec![HostEvent::PageChanged { page: 5 }]);
 }
 
+#[test]
+fn a_scroll_animation_already_running_does_not_carry_the_view_off_a_host_jump() {
+    // At 60 frames a second, so egui's scroll animation spans several frames (the harness's default
+    // step finishes it in one).
+    let bridge = HostBridge::new();
+    let app = WordApp::new(Session::new(Document::new()), Services::default()).with_host(bridge.clone(), EmbedProfile::View);
+    let mut h = egui_kittest::Harness::builder().with_size(WINDOW).with_step_dt(1.0 / 60.0).with_max_steps(12).build_ui_state(
+        |ui, app: &mut WordApp| {
+            let ctx = ui.ctx().clone();
+            app.logic(&ctx);
+            app.ui(ui);
+        },
+        app,
+    );
+    bridge.set_context(h.ctx.clone());
+    wordcraft_ui_egui::host::prepare_context(&h.ctx);
+    frames(&mut h, 2);
+    open_doc(&mut h, &bridge, &clauses(120));
+    assert!(pages(&mut h) >= 6, "fixture too short");
+    // The harness turns egui's scroll animation off; the browser has it on.
+    h.ctx.all_styles_mut(|style| style.scroll_animation = egui::style::ScrollAnimation::default());
+    // An animated scroll towards the caret near the end, as a find step starts one; a frame in, it
+    // is still running when the host jumps.
+    let far = Pos::body(119, 0);
+    h.state_mut().session.sel = wordcraft_engine::Selection { anchor: far.clone(), focus: far };
+    h.state_mut().canvas.scroll_to_caret = true;
+    h.step();
+    h.step();
+    assert_eq!(h.state().canvas.visible_page, Some(0), "the animation should still be running");
+    bridge.send(HostCommand::JumpTo(JumpTarget::Page { page: 2 }));
+    for _ in 0..40 {
+        h.step();
+    }
+    assert_eq!(h.state().canvas.visible_page, Some(1), "the animation moved the view off the jump");
+    let events = bridge.take_events();
+    assert_eq!(events.last(), Some(&HostEvent::PageChanged { page: 2 }), "{events:?}");
+}
+
 // --- The embed build's decompression and parse limits ---
 
 #[test]

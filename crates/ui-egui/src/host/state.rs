@@ -205,8 +205,9 @@ fn set_theme(app: &mut WordApp, host: &mut HostState, ctx: &egui::Context, theme
 
 pub(crate) fn after_frame(app: &mut WordApp, ctx: &egui::Context) {
     let Some(mut host) = app.host.take() else { return };
-    // The canvas took the queued scroll this frame: a waiting jump has landed.
-    if app.canvas.scroll_to_doc.is_none() {
+    // The canvas took the queued scroll this frame: a waiting jump has landed, even when something
+    // drawn after the canvas queued another scroll already.
+    if std::mem::take(&mut app.canvas.scroll_to_doc_taken) || app.canvas.scroll_to_doc.is_none() {
         host.pending_jump = None;
     }
     follow_the_view(app, &mut host, ctx);
@@ -507,6 +508,58 @@ mod tests {
         for blank in ["", " ", "\n\t ", "\u{FFFC}", " \u{FFFC}\n\u{FFFC} ", "\u{00A0}\u{2003}"] {
             assert_eq!(host_texts(blank), None, "{blank:?}");
         }
+    }
+
+    /// A scroll queued after the canvas, in the frame the canvas took a jump's scroll, must not keep
+    /// the jump waiting: an open next frame would answer it `jumpNotFound` although it landed.
+    #[test]
+    fn a_jump_whose_scroll_the_canvas_took_has_landed_whatever_is_queued_after_the_canvas() {
+        use std::cell::Cell;
+        use std::rc::Rc;
+
+        use wordcraft_doc::Document;
+        use wordcraft_engine::Session;
+
+        use crate::host::{EmbedProfile, HostCommand, HostEvent, JumpTarget};
+        use crate::{Services, WordApp};
+
+        let bridge = HostBridge::new();
+        let app = WordApp::new(Session::new(Document::new()), Services::default()).with_host(bridge.clone(), EmbedProfile::View);
+        // Off: the app's own frame. On: a frame whose canvas is followed by a scroll queued before
+        // the frame's end, as UI drawn after the canvas could queue one.
+        let race = Rc::new(Cell::new(false));
+        let racing = race.clone();
+        let mut h = egui_kittest::Harness::builder().with_size(egui::vec2(1100.0, 800.0)).with_max_steps(12).build_ui_state(
+            move |ui, app: &mut WordApp| {
+                let ctx = ui.ctx().clone();
+                app.logic(&ctx);
+                if racing.get() {
+                    crate::canvas::show(app, ui);
+                    app.canvas.scroll_to_doc = Some((0, 0.0));
+                    super::after_frame(app, &ctx);
+                } else {
+                    app.ui(ui);
+                }
+            },
+            app,
+        );
+        bridge.set_context(h.ctx.clone());
+        crate::host::prepare_context(&h.ctx);
+        h.run_steps(2);
+        let text: Vec<String> = (1..=120).map(|i| format!("Clause {i}. The Supplier shall deliver the goods within thirty days.")).collect();
+        let bytes = wordcraft_engine::io::save_bytes("a.docx", &Document::from_text(&text.join("\n"))).expect("writes");
+        bridge.send(HostCommand::Open { name: "a.docx".into(), bytes: bytes.clone() });
+        h.run_steps(4);
+        bridge.take_events();
+        bridge.send(HostCommand::JumpTo(JumpTarget::Page { page: 3 }));
+        race.set(true);
+        h.step();
+        race.set(false);
+        assert!(h.state().host.as_ref().is_some_and(|host| host.pending_jump.is_none()), "the jump landed");
+        bridge.send(HostCommand::Open { name: "a.docx".into(), bytes });
+        h.run_steps(4);
+        let events = bridge.take_events();
+        assert!(!events.iter().any(|event| matches!(event, HostEvent::JumpNotFound { .. })), "{events:?}");
     }
 
     #[test]
