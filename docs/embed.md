@@ -47,10 +47,14 @@ release needs network access and a changed upstream file fails the package until
 standard library notices come from the running toolchain, which must be the one the embed
 workflows pin (their `toolchain:` lines; `RUSTUP_TOOLCHAIN=<it>` locally).
 
-The zip is reproducible: on the same toolchain, tools and checkout path, the same commit gives the
-same bytes (fixed timestamps under `TZ=UTC`, byte-order file lists under `LC_ALL=C`, mode 644, no
-extra attributes or folder entries). The module records source paths and the commit (the About
-text's version line), so another checkout path or commit gives another hash.
+The zip is reproducible: its bytes depend only on the toolchain and tools (the pinned Rust
+toolchain, `wasm-bindgen`, `wasm-opt`, cargo-about), the commit and the dependencies locked in
+`Cargo.lock`, not on the machine, user or checkout path (fixed timestamps under `TZ=UTC`,
+byte-order file lists under `LC_ALL=C`, mode 644, no extra attributes or folder entries). The
+module records the commit (the About text's version line) and the source path of each panic
+location; the script rewrites those paths with `--remap-path-prefix` (registry and git crates to
+`/cargo/registry/src` and `/cargo/git/checkouts`, the checkout to `.`) and fails if the module or
+its glue still holds `CARGO_HOME`, the checkout path or the home folder.
 
 ## API
 
@@ -159,11 +163,19 @@ timeout on `mount`: `mount` resolves after the first frame, which a canvas that 
 hidden tab, say) or a failed start does not produce. On a `mount` timeout, keep the promise and
 `destroy` the editor if it resolves late.
 
+eframe paints on animation frames, which a browser does not run in a hidden or background tab. There
+`mount`'s first frame, and the `opened` or `openFailed` that answers an `open`, wait until the tab
+is visible again. A host therefore pauses its `open` and `mount` timeouts while `document.hidden`
+is true (resuming them on `visibilitychange`), or a document opened in a background tab is taken
+for a crash.
+
 - `destroy()` may be called from any handler, including one eframe triggers inside a frame (its
   text agent's `focusin`/`focusout`, or a `blur`): it stops everything at once and defers only the
   runner's teardown to a microtask, after the frame has returned. So calling it from a focus or blur
   handler is safe.
-- Calls after `destroy()` are no-ops.
+- Well-formed calls after `destroy()` are no-ops: they queue and deliver nothing. Malformed
+  arguments still throw their `TypeError` (see "Behaviour a host page relies on"), so a host that
+  validates nothing itself sees the same errors before and after `destroy()`.
 - Do not call `free()` from host code that runs inside an editor call: a getter, a Proxy or a
   `toJSON` passed in as an argument. wasm-bindgen then leaves the editor alive but unreachable (the
   call still holds it). Call `destroy()` instead, or `free()` afterwards.
@@ -186,7 +198,15 @@ and shows no ArtCraft names or links (`docs/brand/LICENSE-brand.txt`). WordCraft
 image; its community links and About wording sit behind the `brand` feature of
 `wordcraft-ui-egui`, on by default and off in the embed build, and the package script fails if
 they are in the module. Build `wordcraft-embed` with `-p wordcraft-embed` alone: building it
-together with the apps (`--workspace`, or `-p wordcraft-web`) unifies `brand` back on. What
-remains in the binary is never shown in view mode: the About dialog's copyright line, a sample
-document's link and the spelling dictionary's own words. `NOTICE` in the zip says in plain text
-that the build is based on WordCraft by the ArtCraft team.
+together with the apps (`--workspace`, or `-p wordcraft-web`) unifies `brand` back on.
+
+Three ArtCraft names remain in the binary, none of which view mode can show. The package script
+counts each exactly and fails on any other occurrence of the name, in any case:
+
+| Leftover | Source | Why view mode never shows it |
+|---|---|---|
+| the About dialog's copyright line | `crates/ui-egui/src/dialogs.rs` | view mode has no dialogs |
+| the sample document's link `https://getartcraft.com/` | `crates/engine/src/sample.rs` | only `file.new` with the `sample` template loads it; view mode refuses that command, and the host opens only its own files |
+| the word `artcraft` in the spelling dictionary | `crates/proof/src/lib.rs` | a dictionary word is shown only as a spelling suggestion, in the context menu view mode does not have |
+
+`NOTICE` in the zip says in plain text that the build is based on WordCraft by the ArtCraft team.

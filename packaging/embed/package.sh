@@ -42,6 +42,26 @@ mkdir -p "$WORK/bindgen" "$OUT"
 # notice, and a missing tool shows before the long build.
 "$ROOT/packaging/embed/third-party-licenses.sh" "$OUT/THIRD-PARTY-LICENSES.txt"
 
+# The module keeps the source path of every panic location. Registry and git crates sit under
+# CARGO_HOME, whose path names the builder's home folder and differs per machine, so they are
+# rewritten to fixed prefixes; the checkout itself becomes `.` (workspace paths are already
+# relative, this catches any that are not). rustc applies the last prefix that matches, so the
+# cargo folders come after the checkout, in case CARGO_HOME lies inside it. CARGO_ENCODED_RUSTFLAGS
+# replaces RUSTFLAGS and any configured target rustflags (the workspace configures none), so flags
+# a caller set are carried over, ahead of these.
+CARGO_HOME_DIR="${CARGO_HOME:-$HOME/.cargo}"
+SEP=$'\x1f'
+REMAP="--remap-path-prefix=$ROOT=.${SEP}--remap-path-prefix=$CARGO_HOME_DIR/registry/src=/cargo/registry/src${SEP}--remap-path-prefix=$CARGO_HOME_DIR/git/checkouts=/cargo/git/checkouts"
+if [ -n "${CARGO_ENCODED_RUSTFLAGS:-}" ]; then
+  CARGO_ENCODED_RUSTFLAGS="$CARGO_ENCODED_RUSTFLAGS$SEP$REMAP"
+elif [ -n "${RUSTFLAGS:-}" ]; then
+  read -r -a caller_flags <<<"$RUSTFLAGS"
+  CARGO_ENCODED_RUSTFLAGS="$(IFS="$SEP"; echo "${caller_flags[*]}")$SEP$REMAP"
+else
+  CARGO_ENCODED_RUSTFLAGS="$REMAP"
+fi
+export CARGO_ENCODED_RUSTFLAGS
+
 # This package alone: building it beside the apps would turn the `brand` feature back on.
 cargo build --release --locked --target wasm32-unknown-unknown -p wordcraft-embed
 
@@ -55,6 +75,19 @@ fi
 # As trunk's data-wasm-opt="z" for the web app: wasm-opt reads the module's own feature list.
 "$WASM_OPT" -Oz -o "$OUT/wordcraft_embed_bg.wasm" "$WORK/bindgen/wordcraft_embed_bg.wasm"
 cp "$WORK/bindgen/wordcraft_embed.js" "$WORK/bindgen/wordcraft_embed.d.ts" "$OUT/"
+
+# No path of this machine in what ships: it would name the builder and make the hash differ per
+# machine. A home folder of `/` would match everything, so only a real one is searched for.
+for path in "$CARGO_HOME_DIR" "$ROOT" "$HOME"; do
+  [ "${#path}" -gt 1 ] || continue
+  for file in wordcraft_embed_bg.wasm wordcraft_embed.js wordcraft_embed.d.ts; do
+    found="$({ LC_ALL=C grep -a -o -F -- "$path" "$OUT/$file" || true; } | wc -l | tr -d ' ')"
+    if [ "$found" != 0 ]; then
+      echo "error: $file holds $found copies of the local path $path; a --remap-path-prefix is missing" >&2
+      exit 1
+    fi
+  done
+done
 
 # The declarations the embed API promises (generated, so checked rather than trusted).
 for want in \
@@ -77,14 +110,36 @@ done
 # docs/brand/LICENSE-brand.txt: a modified build carries none of the ArtCraft logo images and shows
 # no ArtCraft names or links. WordCraft draws no logo image; its community links and About wording
 # are behind the `brand` feature, so finding them means the feature came back on (the module was
-# built beside the apps). The copyright line and a sample document's link stay in the binary,
-# unreachable in view mode, so the name alone is not searched for.
+# built beside the apps).
 for brand in 'discord.gg/artcraft' 'getartcraft.com/apps' 'Crafting Apps from the ArtCraft team'; do
   if grep -aqF -- "$brand" "$OUT/wordcraft_embed_bg.wasm"; then
     echo "error: the module holds the ArtCraft link or wording '$brand'; build wordcraft-embed on its own (no brand feature)" >&2
     exit 1
   fi
 done
+# Beyond those, the name may appear only in three known leftovers that view mode cannot show
+# (docs/embed.md, "Branding"), each counted exactly, so any new occurrence, in any case, fails:
+#   the About dialog's copyright line (crates/ui-egui/src/dialogs.rs): view mode has no dialogs;
+#   the sample document's link (crates/engine/src/sample.rs): only `file.new` with the `sample`
+#     template loads it, a command view mode refuses, and the host only opens its own files;
+#   the spelling dictionary's word (crates/proof/src/lib.rs): only shown as a suggestion, in the
+#     context menu view mode does not have.
+# The last two are the module's only lower-case "artcraft".
+brand_count() {
+  { LC_ALL=C grep -a -o "$1" -- "$2" "$OUT/wordcraft_embed_bg.wasm" || true; } | wc -l | tr -d ' '
+}
+while IFS='|' read -r expected flags needle; do
+  found="$(brand_count "$flags" "$needle")"
+  if [ "$found" != "$expected" ]; then
+    echo "error: the module holds '$needle' $found times (grep $flags), not the $expected known leftovers; every ArtCraft name in it must be one view mode cannot show (packaging/embed/package.sh, docs/embed.md \"Branding\")" >&2
+    exit 1
+  fi
+done <<'EOF_BRAND'
+1|-F|Copyright (c) 2026 ArtCraft Team and the WordCraft contributors.
+1|-F|https://getartcraft.com/
+2|-F|artcraft
+3|-iF|artcraft
+EOF_BRAND
 
 cp "$ROOT/LICENSE-MIT" "$ROOT/LICENSE-APACHE" "$ROOT/ATTRIBUTION.md" "$OUT/"
 {
@@ -100,13 +155,32 @@ cp "$ROOT/LICENSE-MIT" "$ROOT/LICENSE-APACHE" "$ROOT/ATTRIBUTION.md" "$OUT/"
 # name them): published name <- source. Registry crates are found through cargo's own resolution,
 # since their folder differs per machine. The word list and hyphenation patterns (public domain,
 # CC0) need no licence text; ATTRIBUTION.md and NOTICE name them.
+# Only packages the module links count: the normal dependencies reachable from wordcraft-embed in
+# the wasm32 resolve graph, not every package of the workspace (which also holds the desktop apps'
+# dependencies). A name that resolves to more than one package there is refused, since the licence
+# copied could be the wrong version's.
 METADATA="$(cargo metadata --format-version 1 --locked --filter-platform wasm32-unknown-unknown)"
 crate_dir() {
-  local dir
-  dir="$(printf '%s' "$METADATA" | grep -o "\"manifest_path\":\"[^\"]*/$1-[0-9][^\"/]*/Cargo.toml\"" | head -n 1 \
-    | sed -e 's/^"manifest_path":"//' -e 's#/Cargo.toml"$##')"
-  [ -n "$dir" ] || { echo "error: $1 is not among the module's dependencies" >&2; exit 1; }
-  echo "$dir"
+  local dirs count
+  dirs="$(printf '%s' "$METADATA" | jq -r --arg name "$1" '
+    (.resolve.nodes | map({key: .id, value: .}) | from_entries) as $nodes
+    | [.packages[] | select(.name == "wordcraft-embed") | .id] as $roots
+    | if ($roots | length) != 1 then error("wordcraft-embed is not one package of the workspace") else . end
+    | ({seen: {($roots[0]): true}, queue: $roots}
+       | until(.queue | length == 0;
+           .queue[0] as $id
+           | .queue |= .[1:]
+           | reduce ($nodes[$id].deps[]? | select(any(.dep_kinds[]; .kind == null)) | .pkg) as $dep (.;
+               if .seen[$dep] then . else .seen[$dep] = true | .queue += [$dep] end))
+       | .seen) as $linked
+    | .packages[] | select(.name == $name and $linked[.id]) | .manifest_path | rtrimstr("/Cargo.toml")')"
+  count="$(printf '%s' "$dirs" | grep -c . || true)"
+  case "$count" in
+    1) echo "$dirs" ;;
+    0) echo "error: $1 is not among the module's dependencies" >&2; exit 1 ;;
+    *) echo "error: $1 resolves to $count packages in the module's dependencies; this script must name the one whose licence ships:" >&2
+       printf '%s\n' "$dirs" >&2; exit 1 ;;
+  esac
 }
 EGUI_FONTS="$(crate_dir epaint_default_fonts)/fonts"
 KRILLA="$(crate_dir krilla)"
