@@ -134,6 +134,12 @@ pub fn canvas_events(app: &mut WordApp, ctx: &egui::Context) {
                 let id = if ctx.input(|i| i.modifiers.shift && i.modifiers.alt) { "edit.pasteText" } else { "edit.paste" };
                 let _ = app.run(id, json!({"text": t}));
             }
+            // embed: view mode copies what the host is told the selection holds (`copyText`).
+            egui::Event::Copy if app.profile.is_view() => {
+                if let Some(text) = crate::host::state::copy_text(app) {
+                    ctx.copy_text(text);
+                }
+            }
             egui::Event::Copy | egui::Event::Cut => {
                 let id = if matches!(e, egui::Event::Cut) { "edit.cut" } else { "edit.copy" };
                 if let Ok(r) = app.run(id, json!({}))

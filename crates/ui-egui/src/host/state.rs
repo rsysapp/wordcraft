@@ -283,6 +283,17 @@ fn read_selection(app: &mut WordApp, zoom: f32) -> Reading {
     Reading::Text(HostEvent::Selection { text, copy_text, page, x, y })
 }
 
+/// What Ctrl/⌘+C copies in view mode: the selection's `copyText` as the host hears it (no tracked
+/// deletions, hidden text or object placeholders), so the keyboard and a host's Copy button copy the
+/// same. `None` when the selection has nothing else in it.
+pub(crate) fn copy_text(app: &WordApp) -> Option<String> {
+    let (start, end) = app.session.sel.ordered();
+    if start == end {
+        return None;
+    }
+    host_texts(&visible_fragment_text(&app.session.doc.copy_range(&start, &end))).map(|(_, copy_text)| copy_text)
+}
+
 /// The selection's texts for the host, `(text, copy_text)`: `copy_text` keeps line breaks, `text`
 /// has its whitespace collapsed, and neither has the placeholder (U+FFFC) an inline object leaves
 /// in the text. `None` when nothing else is selected.

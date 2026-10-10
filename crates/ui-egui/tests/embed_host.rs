@@ -1686,6 +1686,44 @@ fn selection_text_leaves_out_tracked_deletions_and_hidden_text_and_is_found_agai
     }
 }
 
+#[test]
+fn a_selection_inside_deleted_and_hidden_runs_reports_and_copies_only_visible_text() {
+    use wordcraft_doc::para_block;
+    use wordcraft_doc::props::CharProps;
+    let plain = CharProps::default();
+    let deleted = CharProps { del: Some(0), ..CharProps::default() };
+    let hidden = CharProps { hidden: Some(true), ..CharProps::default() };
+    let mut doc = Document::new();
+    doc.body = vec![
+        para_block(paragraph_of(&[("The fee is ", plain.clone()), ("ten ", deleted), ("five dollars.", plain.clone())])),
+        para_block(paragraph_of(&[("Alpha ", plain.clone()), ("SECRET ", hidden), ("Beta.", plain)])),
+    ];
+    let (mut h, bridge) = embed_app();
+    open_doc(&mut h, &bridge, &doc);
+    // The canvas takes the keyboard on a click.
+    let at = screen_of(&mut h, &Pos::body(0, 3));
+    click(&mut h, at, egui::PointerButton::Primary);
+    bridge.take_events();
+    // Starting inside the deleted "ten " and ending inside the hidden "SECRET ", either way round.
+    let (inside_deleted, inside_hidden) = (Pos::body(0, 12), Pos::body(1, 9));
+    for (anchor, focus) in [(inside_deleted.clone(), inside_hidden.clone()), (inside_hidden, inside_deleted)] {
+        h.state_mut().session.sel = wordcraft_engine::Selection { anchor, focus };
+        frames(&mut h, 2);
+        let events = bridge.take_events();
+        let [HostEvent::Selection { text, copy_text, .. }] = events.as_slice() else { panic!("{events:?}") };
+        assert_eq!((text.as_str(), copy_text.as_str()), ("five dollars. Alpha", "five dollars.\nAlpha "));
+        // Ctrl/⌘+C copies exactly the reported `copyText`.
+        h.event(egui::Event::Copy);
+        h.step();
+        let commands = &h.output().platform_output.commands;
+        let copied: Vec<_> = commands.iter().filter_map(|c| if let egui::OutputCommand::CopyText(t) = c { Some(t.clone()) } else { None }).collect();
+        assert_eq!(copied, vec![copy_text.clone()]);
+        h.state_mut().session.sel = wordcraft_engine::Selection::default();
+        frames(&mut h, 2);
+        bridge.take_events();
+    }
+}
+
 /// A harness whose `ui` can be skipped for a frame (`logic` still runs), as eframe skips it when the
 /// view is not shown.
 fn skippable_app() -> (egui_kittest::Harness<'static, WordApp>, HostBridge, std::rc::Rc<std::cell::Cell<bool>>) {
