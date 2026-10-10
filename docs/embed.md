@@ -57,6 +57,17 @@ location; the script rewrites those paths with `--remap-path-prefix` (registry a
 `/cargo/registry/src` and `/cargo/git/checkouts`, the checkout to `.`) and fails if the module or
 its glue still holds `CARGO_HOME`, the checkout path or the home folder.
 
+The script sets `CARGO_ENCODED_RUSTFLAGS`, which cargo prefers over every other source of
+rustflags, so it carries over the caller's `RUSTFLAGS` (or the wasm target's or `build`'s
+environment variable) and refuses to build while a cargo config file on the checkout's ancestor
+path or in `CARGO_HOME` sets rustflags that could apply to the wasm build, because those would be
+replaced without a word: `[build]` (also `build.rustflags`), `[target.wasm32-unknown-unknown]`
+(also dotted or quoted) and any `[target.'cfg(...)']` section (a cfg expression may match wasm32
+and the script cannot evaluate it). Rustflags for another target triple, such as a host linker
+under `[target.x86_64-unknown-linux-gnu]`, never reach this build and are allowed; pass flags
+meant for the wasm build in `RUSTFLAGS`. `packaging/embed/rustflags-guard.sh` holds the check and
+`packaging/embed/test-rustflags-guard.sh` tests it.
+
 ### Reproducing a release
 
 To rebuild a release's zip and compare it with the published `.zip.sha256`:
@@ -84,8 +95,9 @@ release, so a build on another platform may differ in bytes (compare the files i
 ### CI and releases
 
 `Embed CI` (`.github/workflows/embed-ci.yml`) runs on pull requests into `*-embed` branches and on
-pushes to them: actionlint, shellcheck and `packaging/embed/test-verify-zip.sh` (crafted zips the
-verifier must refuse), `cargo --locked xtask ci` (which ends with `cargo xtask embed`: the host
+pushes to them: actionlint, shellcheck, `packaging/embed/test-verify-zip.sh` (crafted zips the
+verifier must refuse), `packaging/embed/test-rustflags-guard.sh` (the rustflags check above),
+`cargo --locked xtask ci` (which ends with `cargo xtask embed`: the host
 tests without default features, the configuration the module ships, and clippy for
 `wordcraft-embed` on wasm32; every cargo call in it is `--locked`) and a dry run of the package.
 A tag `embed-v<version>` runs `Embed release`: first a seconds-long job that fails a tag that does

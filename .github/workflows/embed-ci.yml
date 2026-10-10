@@ -56,6 +56,8 @@ jobs:
         run: shellcheck packaging/*.sh packaging/*/*.sh
       - name: verify-zip.sh refuses crafted zips
         run: packaging/embed/test-verify-zip.sh
+      - name: rustflags guard refuses only flags the wasm build would lose
+        run: packaging/embed/test-rustflags-guard.sh
 
   check:
     name: cargo xtask ci

@@ -21,6 +21,9 @@ if [ "${1:-}" = "--print-version" ]; then
 fi
 [ -n "$EMBED_VERSION" ] || { echo "error: no version in $CRATE/Cargo.toml" >&2; exit 1; }
 
+# shellcheck source=rustflags-guard.sh
+. "$ROOT/packaging/embed/rustflags-guard.sh"
+
 WASM_BINDGEN="${WASM_BINDGEN:-wasm-bindgen}"
 WASM_OPT="${WASM_OPT:-wasm-opt}"
 LOCKED="$(awk '/^name = "wasm-bindgen"$/ { getline; gsub(/version = |"/, ""); print; exit }' "$ROOT/Cargo.lock")"
@@ -60,26 +63,12 @@ mkdir -p "$WORK/bindgen" "$OUT"
 # otherwise have used are carried over, ahead of these, from the one source cargo would read:
 # CARGO_ENCODED_RUSTFLAGS, else RUSTFLAGS, else CARGO_TARGET_WASM32_UNKNOWN_UNKNOWN_RUSTFLAGS, else
 # CARGO_BUILD_RUSTFLAGS. Rustflags in a cargo config file cannot be read reliably without
-# unstable cargo, so the script refuses to build while one sets them (the workspace sets none).
+# unstable cargo, so the script refuses to build while one that can apply to the wasm build sets
+# them: [build], [target.wasm32-unknown-unknown] or a [target.'cfg(...)'] section (rustflags-guard.sh;
+# those for another target triple do not apply and are allowed). The workspace sets none.
 HOME_DIR="${HOME:-}"
 CARGO_HOME_DIR="${CARGO_HOME:-$HOME_DIR/.cargo}"
-config_dir="$ROOT"
-while :; do
-  for config in "$config_dir/.cargo/config.toml" "$config_dir/.cargo/config"; do
-    if [ -f "$config" ] && grep -Eq '^[[:space:]]*rustflags[[:space:]]*=' "$config"; then
-      echo "error: $config sets rustflags, which this build would silently replace; pass them in RUSTFLAGS instead" >&2
-      exit 1
-    fi
-  done
-  [ "$config_dir" != / ] || break
-  config_dir="$(dirname "$config_dir")"
-done
-for config in "$CARGO_HOME_DIR/config.toml" "$CARGO_HOME_DIR/config"; do
-  if [ -f "$config" ] && grep -Eq '^[[:space:]]*rustflags[[:space:]]*=' "$config"; then
-    echo "error: $config sets rustflags, which this build would silently replace; pass them in RUSTFLAGS instead" >&2
-    exit 1
-  fi
-done
+rustflags_guard_scan "$ROOT" "$CARGO_HOME_DIR" || exit 1
 SEP=$'\x1f'
 REMAP="--remap-path-prefix=$ROOT=.${SEP}--remap-path-prefix=$CARGO_HOME_DIR/registry/src=/cargo/registry/src${SEP}--remap-path-prefix=$CARGO_HOME_DIR/git/checkouts=/cargo/git/checkouts"
 caller_flags=()
