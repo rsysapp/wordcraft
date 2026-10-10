@@ -430,13 +430,14 @@ fn find_target(app: &mut WordApp, host: &mut HostState, target: &JumpTarget) -> 
 fn open(app: &mut WordApp, host: &mut HostState, name: &str, bytes: &[u8]) {
     match super::open::open_document(name, bytes) {
         Ok(doc) => {
-            // A jump found in the document being replaced never lands, so the host hears it failed.
-            if let Some(waiting) = host.pending_jump.take() {
-                host.bridge.emit(HostEvent::JumpNotFound { target: waiting.target });
-            }
+            // The embed API's order for one open: selectionCleared, then jumpNotFound, then opened.
             // The reported selection belonged to the document being replaced.
             if std::mem::take(&mut host.reported) {
                 host.bridge.emit(HostEvent::SelectionCleared);
+            }
+            // A jump found in the document being replaced never lands, so the host hears it failed.
+            if let Some(waiting) = host.pending_jump.take() {
+                host.bridge.emit(HostEvent::JumpNotFound { target: waiting.target });
             }
             app.session.set_document(doc);
             app.session.page_hint = 0;

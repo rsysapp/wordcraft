@@ -731,6 +731,27 @@ fn a_jump_waiting_when_an_open_replaces_the_document_answers_jump_not_found() {
     assert_eq!(events, vec![first, HostEvent::JumpNotFound { target: early }, second, HostEvent::PageChanged { page: 1 }]);
 }
 
+/// Embed API order for one open: the reported selection's `selectionCleared`, then the waiting
+/// jump's `jumpNotFound`, then `opened` (as the other editor sends them).
+#[test]
+fn an_open_clears_the_reported_selection_before_answering_the_waiting_jump() {
+    let (mut h, bridge) = embed_app();
+    open_doc(&mut h, &bridge, &clauses(120));
+    let (_, released) = drag_select(&mut h, &bridge, &Pos::body(0, 0), &Pos::body(0, 9));
+    frames(&mut h, 2);
+    let reported = [released, bridge.take_events()].concat();
+    assert!(reported.iter().any(is_selection), "no selection was reported: {reported:?}");
+    let target = JumpTarget::Page { page: 4 };
+    bridge.send(HostCommand::JumpTo(target.clone()));
+    bridge.send(HostCommand::Open { name: "next.docx".into(), bytes: docx(&clauses(30)) });
+    frames(&mut h, 4);
+    let count = pages(&mut h) as u32;
+    assert_eq!(
+        bridge.take_events(),
+        vec![HostEvent::SelectionCleared, HostEvent::JumpNotFound { target }, HostEvent::Opened { pages: count }, HostEvent::PageChanged { page: 1 }]
+    );
+}
+
 #[test]
 fn a_jump_waiting_when_an_open_fails_still_lands() {
     let (mut h, bridge) = embed_app();
