@@ -274,8 +274,142 @@ impl Iterator for Matches<'_> {
             };
             let end = at + query.len();
             self.current = Some((path, folded, end));
-            if let Some((start, finish)) = folded.source_range(at, end) {
-                return Some((Pos::new(StoryRef::Body, path.clone(), start), Pos::new(StoryRef::Body, path.clone(), finish)));
+            if let Some(found) = body_range(path, folded, at, end) {
+                return Some(found);
+            }
+        }
+    }
+}
+
+/// The document positions of the folded match `at..end` in a body paragraph.
+fn body_range(path: &Path, folded: &Folded, at: usize, end: usize) -> Option<(Pos, Pos)> {
+    let (start, finish) = folded.source_range(at, end)?;
+    Some((Pos::new(StoryRef::Body, path.clone(), start), Pos::new(StoryRef::Body, path.clone(), finish)))
+}
+
+/// One search for many passages at once, each wanting its first match that a caller's test accepts
+/// (see [`TextIndex::find_first`]). Every passage gets the match [`TextIndex::find_where`] with
+/// `nth` 0 would give it, in one pass over the document instead of one per passage. The pass can be
+/// spread over several calls, a paragraph at a time.
+#[derive(Default)]
+pub struct FirstMatches {
+    /// Every distinct folded passage; `None` when none can match or the automaton could not be built.
+    automaton: Option<aho_corasick::AhoCorasick>,
+    /// For each distinct folded passage (the automaton's pattern), the passages it stands for.
+    passages_of: Vec<Vec<usize>>,
+    /// For each pattern, where its next match may start, as (paragraph, folded byte): a pattern's
+    /// matches do not overlap, as in [`Matches`], so the same ones are tested.
+    resume: Vec<(usize, usize)>,
+    found: Vec<Option<(Pos, Pos)>>,
+    /// Passages that may still match and have not.
+    open: usize,
+    /// The next paragraph to search.
+    paragraph: usize,
+}
+
+impl FirstMatches {
+    /// A search for `passages`; one that folds to nothing or is longer than [`MAX_NEEDLE_CHARS`]
+    /// finds nothing, as with [`TextIndex::find_iter`].
+    pub fn new<'p>(passages: impl IntoIterator<Item = &'p str>) -> FirstMatches {
+        let mut patterns: Vec<String> = Vec::new();
+        let mut passages_of: Vec<Vec<usize>> = Vec::new();
+        let mut pattern_of: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+        let mut count = 0;
+        for (passage, text) in passages.into_iter().enumerate() {
+            count = passage + 1;
+            let Some(query) = fold_query(text) else { continue };
+            // Equal passages share one pattern: the automaton reports a pattern once per place.
+            let pattern = *pattern_of.entry(query.clone()).or_insert_with(|| {
+                patterns.push(query);
+                passages_of.push(Vec::new());
+                passages_of.len() - 1
+            });
+            if let Some(list) = passages_of.get_mut(pattern) {
+                list.push(passage);
+            }
+        }
+        let open = passages_of.iter().map(Vec::len).sum();
+        // Standard semantics with overlapping search report every place each pattern occurs, so a
+        // passage inside another (or a prefix of it) is not hidden by the longer one's match.
+        let automaton = if patterns.is_empty() {
+            None
+        } else {
+            match aho_corasick::AhoCorasick::builder().match_kind(aho_corasick::MatchKind::Standard).build(&patterns) {
+                Ok(automaton) => Some(automaton),
+                Err(error) => {
+                    log::warn!("host text search could not be built: {error}");
+                    None
+                }
+            }
+        };
+        let open = if automaton.is_some() { open } else { 0 };
+        FirstMatches { automaton, resume: vec![(0, 0); passages_of.len()], passages_of, found: vec![None; count], open, paragraph: 0 }
+    }
+
+    /// Start again from the document's first paragraph (the document or what `accept` tests
+    /// changed), keeping the automaton.
+    pub fn restart(&mut self) {
+        self.resume.iter_mut().for_each(|resume| *resume = (0, 0));
+        self.found.iter_mut().for_each(|found| *found = None);
+        self.open = if self.automaton.is_some() { self.passages_of.iter().map(Vec::len).sum() } else { 0 };
+        self.paragraph = 0;
+    }
+
+    /// Every passage either has its match or the whole document was searched.
+    pub fn done(&self) -> bool {
+        self.open == 0 || self.automaton.is_none()
+    }
+
+    /// Each passage's match, by its position in the list given to [`FirstMatches::new`].
+    pub fn found(&self) -> &[Option<(Pos, Pos)>] {
+        &self.found
+    }
+}
+
+impl TextIndex {
+    /// Continue `search` paragraph by paragraph, in document order, until it is done or `more`
+    /// answers `false` (asked after each paragraph). `accept(passage, start, end)` tests a match
+    /// for one passage; a passage keeps the first match accepted.
+    pub fn find_first(&self, search: &mut FirstMatches, mut accept: impl FnMut(usize, &Pos, &Pos) -> bool, mut more: impl FnMut() -> bool) {
+        let Some(automaton) = search.automaton.as_ref() else { return };
+        while search.open > 0 {
+            let number = search.paragraph;
+            let Some((path, folded)) = self.paragraphs.get(number) else {
+                search.open = 0;
+                return;
+            };
+            search.paragraph = number.saturating_add(1);
+            let Ok(places) = automaton.try_find_overlapping_iter(folded.text.as_str()) else {
+                search.open = 0;
+                return;
+            };
+            for place in places {
+                let pattern = place.pattern().as_usize();
+                let Some(resume) = search.resume.get_mut(pattern) else { continue };
+                if *resume > (number, place.start()) {
+                    continue;
+                }
+                *resume = (number, place.end());
+                let Some(passages) = search.passages_of.get(pattern) else { continue };
+                if passages.iter().all(|passage| search.found.get(*passage).is_none_or(Option::is_some)) {
+                    continue;
+                }
+                let Some((start, end)) = body_range(path, folded, place.start(), place.end()) else { continue };
+                for passage in passages {
+                    if let Some(slot) = search.found.get_mut(*passage)
+                        && slot.is_none()
+                        && accept(*passage, &start, &end)
+                    {
+                        *slot = Some((start.clone(), end.clone()));
+                        search.open = search.open.saturating_sub(1);
+                    }
+                }
+                if search.open == 0 {
+                    return;
+                }
+            }
+            if !more() {
+                return;
             }
         }
     }
@@ -658,5 +792,92 @@ mod tests {
         assert_eq!(Folded::new(sample).text, mapped);
         assert_eq!(fold(sample), mapped.trim_end());
         assert_eq!(fold(sample), "\"quoted\" text - fine 'x'");
+    }
+
+    /// Each passage's first accepted match, by the one-pass search and by `find_where` alone.
+    fn both_ways(
+        d: &Document,
+        passages: &[&str],
+        accept: impl Fn(usize, &Pos) -> bool,
+        stop_each_paragraph: bool,
+    ) -> (Vec<Option<(Pos, Pos)>>, Vec<Option<(Pos, Pos)>>) {
+        let mut index = TextIndex::default();
+        index.refresh(d, 1);
+        let mut search = FirstMatches::new(passages.iter().copied());
+        let mut calls = 0;
+        while !search.done() {
+            calls += 1;
+            assert!(calls <= index.paragraphs.len() + 1, "the search never finished");
+            index.find_first(&mut search, |k, start, _| accept(k, start), || !stop_each_paragraph);
+        }
+        let single = passages.iter().enumerate().map(|(k, passage)| index.find_where(passage, |start, _| accept(k, start), 0)).collect();
+        (search.found().to_vec(), single)
+    }
+
+    #[test]
+    fn one_pass_finds_each_passage_inside_or_after_another() {
+        let d = doc(&["The Supplier shall deliver the goods.", "the supplier shall pay; the supplier shall deliver"]);
+        // Prefixes, substrings, suffixes and a repeat of another passage: each needs its own first match.
+        let passages = [
+            "the supplier shall deliver",
+            "the supplier",
+            "supplier",
+            "shall",
+            "the supplier shall deliver",
+            "deliver",
+            "goods.",
+            "pay",
+            "",
+            "absent",
+        ];
+        let (one_pass, single) = both_ways(&d, &passages, |_, _| true, false);
+        assert_eq!(one_pass, single);
+        let text = |found: &Option<(Pos, Pos)>| found.as_ref().map(|(from, to)| (from.path.clone(), source_text(&d, from, to)));
+        assert_eq!(text(&one_pass[1]), Some((Pos::body(0, 0).path, "The Supplier".to_string())));
+        assert_eq!(text(&one_pass[2]), Some((Pos::body(0, 0).path, "Supplier".to_string())), "hidden by the longer passage's match");
+        assert_eq!(text(&one_pass[7]), Some((Pos::body(1, 0).path, "pay".to_string())));
+        assert_eq!((one_pass[8].clone(), one_pass[9].clone()), (None, None));
+    }
+
+    #[test]
+    fn one_pass_accepts_what_find_where_accepts() {
+        // Self-overlapping places: find_where tests only non-overlapping ones, and so must one pass.
+        let d = doc(&["aaaa aaaa", "xaaay", "ab ab abab"]);
+        let passages = ["aa", "aaa", "aa", "abab", "ab", "b ab"];
+        let reject_first_paragraph_start = |k: usize, start: &Pos| !(k.is_multiple_of(2) && start.path == Pos::body(0, 0).path && start.off == 0);
+        for stop in [false, true] {
+            let (one_pass, single) = both_ways(&d, &passages, reject_first_paragraph_start, stop);
+            assert_eq!(one_pass, single, "stopping after each paragraph: {stop}");
+            assert_eq!(one_pass[0].as_ref().map(|(from, _)| from.off), Some(2), "the next non-overlapping place");
+        }
+        let never = |_: usize, _: &Pos| false;
+        let (one_pass, single) = both_ways(&d, &passages, never, false);
+        assert_eq!(one_pass, single);
+        assert!(one_pass.iter().all(Option::is_none));
+    }
+
+    #[test]
+    fn one_pass_agrees_with_find_where_on_a_large_set() {
+        let paragraphs: Vec<String> = (1..=300)
+            .map(|i| format!("Clause {i}. The \u{201C}Supplier\u{201D} shall deliver the goods in Schedule {} within {} days.", i % 17, i % 23))
+            .collect();
+        let refs: Vec<&str> = paragraphs.iter().map(String::as_str).collect();
+        let d = doc(&refs);
+        let passages: Vec<String> = (0..2_000)
+            .map(|k| match k % 5 {
+                0 => format!("clause {}. the \"supplier\"", k % 400),
+                1 => format!("schedule {} within", k % 19),
+                2 => format!("within {} days. ", k % 29),
+                3 => "the \u{2018}supplier".to_string(),
+                _ => format!("deliver the goods in schedule {}", k % 17),
+            })
+            .collect();
+        let passage_refs: Vec<&str> = passages.iter().map(String::as_str).collect();
+        // A page hint stands in as "the k-th passage wants paragraph k % 300 or later" for every third one.
+        let accept = |k: usize, start: &Pos| !k.is_multiple_of(3) || start.path.0.first().is_some_and(|&n| n as usize >= k % 300);
+        let (one_pass, single) = both_ways(&d, &passage_refs, accept, false);
+        assert_eq!(one_pass.len(), 2_000);
+        assert!(one_pass.iter().filter(|found| found.is_some()).count() > 1_000, "the fixture finds too little");
+        assert_eq!(one_pass, single);
     }
 }

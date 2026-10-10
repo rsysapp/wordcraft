@@ -1073,3 +1073,59 @@ fn comment_balloons_stay_clickable_beside_marked_text() {
     assert!(activated(&bridge.take_events()).is_empty(), "a balloon click activated a mark");
     assert_eq!(h.state().session.sel.focus.path, Pos::body(2, 0).path, "the balloon's click moves to its comment");
 }
+
+#[test]
+fn a_large_mark_set_finds_what_a_search_per_mark_finds() {
+    let (mut h, bridge) = embed_app();
+    open_doc(&mut h, &bridge, &clauses(120));
+    let marks: Vec<MarkSpec> = (0..MAX_MARKS)
+        .map(|k| {
+            let id = format!("m{k}");
+            match k % 4 {
+                0 => mark(&id, &format!("Clause {}. The Supplier", k % 130)),
+                1 => mark_on(&id, "the supplier shall deliver", (k % 5) as u32),
+                2 => mark(&id, &format!("schedule {} within", k % 130)),
+                _ => mark_on(&id, "within thirty days of the order", 1),
+            }
+        })
+        .collect();
+    bridge.send(HostCommand::SetMarks(marks.clone()));
+    settle_marks(&mut h);
+    // What each mark finds when searched for alone, as jumps do.
+    let expected: Vec<Option<Pos>> = {
+        let app = h.state_mut();
+        let layout = app.session.layout();
+        let mut index = wordcraft_ui_egui::host::text_match::TextIndex::default();
+        index.refresh(&app.session.doc, app.session.rev());
+        let pages = layout.pages.len();
+        marks
+            .iter()
+            .map(|m| {
+                let on_page = match m.page {
+                    Some(page) => Some(wordcraft_ui_egui::host::wire::page_index(page, pages)?),
+                    None => None,
+                };
+                index.find_where(&m.text, |start, _| on_page.is_none_or(|p| layout.page_of(start) == Some(p)), 0).map(|(start, _)| start)
+            })
+            .collect()
+    };
+    let painted = mark_ids(&h);
+    assert!(painted.len() > 100, "the fixture paints too little: {}", painted.len());
+    for id in &painted {
+        let k: usize = id.trim_start_matches('m').parse().expect("mark id");
+        assert!(expected[k].is_some(), "{id} is painted but a search for it alone finds nothing");
+    }
+    // Every mark whose own match is on page 1 is painted there, over its match.
+    let view = h.state().canvas.canvas_rect.expect("canvas");
+    let mut checked = 0;
+    for (k, start) in expected.iter().enumerate() {
+        let Some(start) = start else { continue };
+        let on_first_page = h.state_mut().session.layout().page_of(start) == Some(0);
+        if !on_first_page || !view.contains(screen_of(&mut h, start)) {
+            continue;
+        }
+        assert!(marked_at(&mut h, start).contains(&format!("m{k}")), "m{k} is not painted over its match");
+        checked += 1;
+    }
+    assert!(checked > 100, "too few marks checked: {checked}");
+}

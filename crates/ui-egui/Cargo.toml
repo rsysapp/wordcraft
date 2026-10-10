@@ -21,6 +21,7 @@ serde_json = { workspace = true }
 log = { workspace = true }
 web-time = { workspace = true }
 unicode-normalization = { workspace = true }
+aho-corasick = { workspace = true } # embed: host marks
 
 [dev-dependencies]
 egui_kittest = { workspace = true, features = ["wgpu", "snapshot"] }
