@@ -82,6 +82,8 @@ pub fn view_app(doc: Document, pixels_per_point: f32) -> (Harness<'static, WordA
     let app = WordApp::new(Session::new(doc), Services::default()).with_host(bridge.clone(), EmbedProfile::View);
     let mut h = harness(app, pixels_per_point);
     bridge.set_context(h.ctx.clone());
+    // As the embed crate's app creator does.
+    wordcraft_ui_egui::host::prepare_context(&h.ctx);
     frames(&mut h, 2);
     // Start each test with an empty event queue.
     bridge.take_events();

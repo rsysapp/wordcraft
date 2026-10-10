@@ -45,6 +45,40 @@ fn files_that_cannot_be_shown_answer_open_failed_and_keep_the_open_document() {
 }
 
 #[test]
+fn an_open_over_the_cap_answers_too_large_in_order_without_copying_the_file() {
+    use wordcraft_ui_egui::host::open::{self, MAX_OPEN_BYTES, open_command};
+    let (mut h, bridge) = embed_app();
+    open_doc(&mut h, &bridge, &clauses(10));
+    let shown = doc_json(&h);
+    let mut copied = 0;
+    let mut copy = |n: usize| {
+        copied += n;
+        Ok::<_, ()>(Vec::new())
+    };
+    bridge.send(HostCommand::Open { name: "empty.docx".into(), bytes: Vec::new() });
+    // Too large whatever the name or contents would have said.
+    for (name, len) in [("big.docx", MAX_OPEN_BYTES + 1), ("big.pdf", usize::MAX)] {
+        let command = open_command(name.into(), len, &mut copy).expect("no copy to fail");
+        assert_eq!(command, HostCommand::OpenTooLarge { name: name.into(), len });
+        bridge.send(command);
+    }
+    bridge.send(open_command("detached.docx".into(), 0, &mut copy).expect("no copy to fail"));
+    bridge.send(HostCommand::Open { name: "notes.txt".into(), bytes: b"text".to_vec() });
+    assert_eq!(copied, 0, "nothing of an oversized or empty file was copied");
+    frames(&mut h, 2);
+    let messages: Vec<String> = bridge
+        .take_events()
+        .into_iter()
+        .map(|event| match event {
+            HostEvent::OpenFailed { message } => message,
+            other => panic!("unexpected {other:?}"),
+        })
+        .collect();
+    assert_eq!(messages, [open::EMPTY, open::TOO_LARGE, open::TOO_LARGE, open::EMPTY, open::UNSUPPORTED], "each open answered once, in order");
+    assert_eq!(doc_json(&h), shown, "a refused open keeps the document");
+}
+
+#[test]
 fn scrolling_to_another_page_reports_it_once() {
     let (mut h, bridge) = embed_app();
     open_doc(&mut h, &bridge, &clauses(120));
@@ -1663,6 +1697,24 @@ fn a_system_theme_change_never_replaces_the_hosts_choice() {
             }
         }
     }
+}
+
+#[test]
+fn a_host_theme_sends_no_window_theme_command() {
+    // eframe's web backend cannot act on `ViewportCommand::SetTheme` and logs a warning for each one
+    // into the host page's console; a canvas has no window decorations to theme anyway.
+    let (mut h, bridge) = embed_app();
+    open_doc(&mut h, &bridge, &clauses(5));
+    let mut sent = Vec::new();
+    for dark in [true, false, true, false] {
+        bridge.send(HostCommand::SetTheme(theme(dark, "#0f766e")));
+        for _ in 0..3 {
+            frames(&mut h, 1);
+            sent.extend(viewport_commands(&h));
+        }
+        assert_eq!(Tokens::get(&h.ctx).dark, dark);
+    }
+    assert!(!sent.iter().any(|command| matches!(command, egui::ViewportCommand::SetTheme(_))), "{sent:?}");
 }
 
 #[test]

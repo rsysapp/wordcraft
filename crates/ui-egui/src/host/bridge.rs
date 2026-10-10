@@ -13,6 +13,9 @@ use super::wire::{JumpTarget, MarkSpec, ThemeSpec};
 pub enum HostCommand {
     /// Open a document, replacing the open one; answered by `Opened` or `OpenFailed`.
     Open { name: String, bytes: Vec<u8> },
+    /// A file over `open::MAX_OPEN_BYTES`, of which nothing was copied (`open::open_command`).
+    /// Answered by `OpenFailed` (`open::TOO_LARGE`), in order with the other opens.
+    OpenTooLarge { name: String, len: usize },
     /// Show a page or a passage; answered by `JumpNotFound` when there is nothing to show.
     JumpTo(JumpTarget),
     /// Replace every host mark; an empty list clears them. Marks not found are skipped silently.

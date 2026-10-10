@@ -21,3 +21,15 @@ pub use profile::EmbedProfile;
 #[doc(hidden)]
 pub use state::HostState;
 pub use wire::{JumpTarget, MarkSpec, MountOptions, ThemeSpec};
+
+/// Set up the context an embed build's app runs in; call it once the runner made the context.
+///
+/// egui sends `ViewportCommand::SetTheme` whenever the theme preference changes, so that a native
+/// window's decorations follow it. A host page's canvas has no window decorations, and eframe's web
+/// backend cannot act on the command: it only logs a warning into the host page's console, once per
+/// `setTheme`. The preference itself is still set (`state::set_theme`), because egui's style for the
+/// chosen theme depends on it.
+#[doc(hidden)]
+pub fn prepare_context(ctx: &egui::Context) {
+    ctx.options_mut(|options| options.sync_window_theme = false);
+}

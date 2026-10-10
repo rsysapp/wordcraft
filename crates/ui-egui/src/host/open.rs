@@ -7,6 +7,8 @@
 use wordcraft_doc::Document;
 use wordcraft_engine::io::{DocxError, ReadLimits};
 
+use super::bridge::HostCommand;
+
 /// Largest file a host may open.
 pub const MAX_OPEN_BYTES: usize = 100 * 1024 * 1024;
 
@@ -50,6 +52,21 @@ pub fn precheck(name: &str, len: usize, head: &[u8]) -> Option<&'static str> {
         return Some(DAMAGED);
     }
     None
+}
+
+/// The command that opens a host's file of `len` bytes, where `copy(len)` copies the whole file
+/// into this module's memory. The size is judged first: a file over [`MAX_OPEN_BYTES`] is
+/// [`TOO_LARGE`] whatever it holds, so none of it is copied (a whole copy could take more memory
+/// than the module can get; a failed allocation aborts it, and its memory never shrinks). An empty
+/// file, which is also what a detached buffer reads as, is never touched; it opens as empty and is
+/// refused in order like any other.
+#[doc(hidden)]
+pub fn open_command<E>(name: String, len: usize, copy: impl FnOnce(usize) -> Result<Vec<u8>, E>) -> Result<HostCommand, E> {
+    if len > MAX_OPEN_BYTES {
+        return Ok(HostCommand::OpenTooLarge { name, len });
+    }
+    let bytes = if len == 0 { Vec::new() } else { copy(len)? };
+    Ok(HostCommand::Open { name, bytes })
 }
 
 /// Parse a host's file, or answer with a message the host can show as is.
@@ -163,5 +180,36 @@ mod tests {
                 assert!([DAMAGED, EMPTY].contains(&message.as_str()), "{len}: {message}");
             }
         }
+    }
+
+    #[test]
+    fn an_oversized_file_is_too_large_and_never_copied() {
+        let mut copied = false;
+        for (name, len) in [("big.docx", MAX_OPEN_BYTES + 1), ("locked.docx", MAX_OPEN_BYTES + 1), ("big.pdf", usize::MAX)] {
+            let command = open_command(name.into(), len, |_| {
+                copied = true;
+                Ok::<_, ()>(Vec::new())
+            });
+            assert_eq!(command, Ok(HostCommand::OpenTooLarge { name: name.into(), len }));
+        }
+        assert!(!copied, "nothing of an oversized file is copied");
+    }
+
+    #[test]
+    fn a_file_within_the_cap_is_copied_whole_and_an_empty_one_not_at_all() {
+        let mut asked = Vec::new();
+        let mut copy = |n: usize| {
+            asked.push(n);
+            Ok::<_, ()>(vec![b'P'; n.min(4)])
+        };
+        assert_eq!(open_command("a.docx".into(), 3, &mut copy), Ok(HostCommand::Open { name: "a.docx".into(), bytes: b"PPP".to_vec() }));
+        assert!(matches!(open_command("a.docx".into(), MAX_OPEN_BYTES, &mut copy), Ok(HostCommand::Open { .. })));
+        assert_eq!(open_command("a.docx".into(), 0, &mut copy), Ok(HostCommand::Open { name: "a.docx".into(), bytes: Vec::new() }));
+        assert_eq!(asked, [3, MAX_OPEN_BYTES], "an empty file is never read");
+    }
+
+    #[test]
+    fn a_failed_copy_queues_nothing() {
+        assert_eq!(open_command("a.docx".into(), 10, |_| Err("detached")), Err("detached"));
     }
 }

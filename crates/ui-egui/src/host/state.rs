@@ -172,6 +172,8 @@ pub(crate) fn before_frame(app: &mut WordApp, ctx: &egui::Context) {
     for command in host.bridge.take_commands() {
         match command {
             HostCommand::Open { name, bytes } => open(app, &mut host, &name, &bytes),
+            // Refused like any open that fails: the open document stays.
+            HostCommand::OpenTooLarge { .. } => host.bridge.emit(HostEvent::OpenFailed { message: super::open::TOO_LARGE.to_string() }),
             HostCommand::JumpTo(target) => jump(app, &mut host, target, ctx.cumulative_frame_nr()),
             // Looked for when next painted, against the layout painted then.
             HostCommand::SetMarks(marks) => host.marks.set(marks),

@@ -13,7 +13,7 @@ use wasm_bindgen::prelude::wasm_bindgen;
 use wasm_bindgen::{JsCast as _, JsValue};
 use wordcraft_engine::Session;
 use wordcraft_engine::doc::Document;
-use wordcraft_ui_egui::host::{EmbedProfile, HostBridge, HostCommand, HostEvent, wire};
+use wordcraft_ui_egui::host::{self, EmbedProfile, HostBridge, HostCommand, HostEvent, open, wire};
 use wordcraft_ui_egui::{Services, WordApp};
 
 #[wasm_bindgen(typescript_custom_section)]
@@ -50,8 +50,15 @@ impl EmbeddedEditor {
     ) -> Result<(), JsValue> {
         let file_name = file_name.as_string().ok_or_else(|| type_error("open: fileName must be a string"))?;
         let bytes = bytes.dyn_into::<js_sys::Uint8Array>().map_err(|_| type_error("open: bytes must be a Uint8Array"))?;
-        // Copied into wasm memory once, then moved into the queue.
-        self.send(HostCommand::Open { name: file_name, bytes: bytes.to_vec() });
+        // Nothing is copied for an editor that will never read it.
+        if self.destroyed.get() {
+            return Ok(());
+        }
+        // The length is read once. A file over the cap is refused without copying any of it, and an
+        // empty one (also what a detached buffer reads as) is never touched; the rest is copied into
+        // wasm memory once, then moved into the queue.
+        let len = byte_length(&bytes)?;
+        self.send(open::open_command(file_name, len, |len| copy_bytes(&bytes, len))?);
         Ok(())
     }
 
@@ -66,11 +73,7 @@ impl EmbeddedEditor {
     /// Replaces every host mark. An empty array clears them.
     #[wasm_bindgen(js_name = setMarks)]
     pub fn set_marks(&self, #[wasm_bindgen(unchecked_param_type = "Mark[]")] marks: JsValue) -> Result<(), JsValue> {
-        if js_sys::Array::is_array(&marks) {
-            for mark in marks.unchecked_ref::<js_sys::Array>().iter() {
-                check_counts(&mark, &["page"], "setMarks")?;
-            }
-        }
+        check_mark_pages(&marks)?;
         let marks = wire::parse_marks(&json_of(&marks)?).map_err(|e| type_error(&e))?;
         self.send(HostCommand::SetMarks(marks));
         Ok(())
@@ -103,23 +106,24 @@ impl EmbeddedEditor {
         if self.destroyed.replace(true) {
             return;
         }
-        self.runner.destroy();
-        // The runner has dropped the app; this drops the bridge's copy of its egui context and
-        // anything still queued, so nothing of the editor outlives it through this object.
+        // From here on nothing is queued or delivered: this drops the bridge's copy of the app's
+        // egui context and anything still queued, so nothing of the editor outlives it through
+        // this object, and the app's later events go nowhere.
         self.bridge.detach();
         // `try_borrow_mut`, not `replace`: this also runs from `Drop`, which must not panic. Event
         // delivery clones the listener out before calling it, so the cell is free here anyway.
         if let Ok(mut slot) = self.listener.try_borrow_mut() {
             *slot = None;
         }
+        stop_later(self.runner.clone());
     }
 }
 
 /// wasm-bindgen's `free()`, `[Symbol.dispose]()` and garbage collection drop the object without
 /// calling `destroy`. The runner's event listeners hold their own copies of it, so without this
 /// the editor would keep rendering on the canvas, unreachable. `destroy` is idempotent, so
-/// `destroy()` then `free()` is fine. Its runner calls cannot meet a borrowed runner: host code
-/// never runs inside a frame (events reach the listener in a later task).
+/// `destroy()` then `free()` is fine. `free()` may run inside a frame (from a focus handler), which
+/// is why `destroy` stops the runner from a microtask.
 impl Drop for EmbeddedEditor {
     fn drop(&mut self) {
         self.destroy();
@@ -156,19 +160,34 @@ async fn start(canvas: JsValue, options: JsValue) -> Result<EmbeddedEditor, JsVa
             Box::new(move |cc| {
                 // Commands wake the app from now on; the theme queued above waits for its frame.
                 app_bridge.set_context(cc.egui_ctx.clone());
+                host::prepare_context(&cc.egui_ctx);
                 let app = WordApp::new(Session::new(Document::new()), Services::default()).with_host(app_bridge.clone(), EmbedProfile::View);
                 Ok(Box::new(EmbedShell { app, bridge: app_bridge, listener: app_listener, first_frame: resolve_first_frame }))
             }),
         )
         .await;
-    if let Err(error) = started {
-        // No `EmbeddedEditor` exists to drop, so unsubscribe whatever the runner installed here.
-        runner.destroy();
+    let ready = match started {
+        Ok(()) => wasm_bindgen_futures::JsFuture::from(first_frame).await.map(drop),
+        Err(error) => Err(error),
+    };
+    if let Err(error) = ready {
+        // No `EmbeddedEditor` exists to drop, so stop whatever the runner installed here, the same
+        // way `destroy` does.
         bridge.detach();
+        stop_later(runner);
         return Err(error);
     }
-    wasm_bindgen_futures::JsFuture::from(first_frame).await?;
     Ok(EmbeddedEditor { runner, bridge, listener, destroyed: Cell::new(false) })
+}
+
+/// Stops `runner` from a microtask, after whatever is running now. Host code can run inside a
+/// frame, while the runner is borrowed: eframe focuses and blurs its text agent mid-frame (focusin
+/// and focusout bubble to the page) and opens links with `window.open`, which can fire blur.
+/// `WebRunner::destroy` there would panic ("already borrowed"), and a panic aborts the module.
+/// Microtasks run only once the frame has returned, and before the next frame or input event, so
+/// the runner paints nothing more after the current task.
+fn stop_later(runner: eframe::WebRunner) {
+    wasm_bindgen_futures::spawn_local(async move { runner.destroy() });
 }
 
 /// The app the runner drives: WordCraft in view mode, plus handing its events to the host.
@@ -259,6 +278,56 @@ fn check_counts(value: &JsValue, keys: &[&str], what: &str) -> Result<(), JsValu
         }
     }
     Ok(())
+}
+
+/// `check_counts` for each mark's page. Every read goes through `Reflect::get`, which turns a
+/// throwing getter or a revoked Proxy into an error here: an exception thrown through Rust code would
+/// skip its cleanup and leave this object borrowed. Only the first `MAX_MARKS` marks are read, the
+/// ones `parse_marks` keeps, so a wild `length` costs nothing. A value without a usable `length` is
+/// left to the parser, which refuses anything but an array.
+fn check_mark_pages(marks: &JsValue) -> Result<(), JsValue> {
+    if !marks.is_object() {
+        return Ok(());
+    }
+    let length = js_sys::Reflect::get(marks, &JsValue::from_str("length")).map_err(|_| type_error("setMarks: length could not be read"))?;
+    let Some(length) = length.as_f64().filter(|length| length.is_finite() && *length >= 0.0) else { return Ok(()) };
+    // A float-to-integer `as` saturates; the bound is far below u32::MAX.
+    let count = length.min(wire::MAX_MARKS as f64) as u32;
+    for index in 0..count {
+        let mark = js_sys::Reflect::get_u32(marks, index).map_err(|_| type_error(&format!("setMarks: mark {index} could not be read")))?;
+        check_counts(&mark, &["page"], "setMarks")?;
+    }
+    Ok(())
+}
+
+/// The host array's length, read through a catch-checked call (see [`copy_bytes`]).
+fn byte_length(bytes: &js_sys::Uint8Array) -> Result<usize, JsValue> {
+    let length = js_sys::Reflect::get(bytes, &JsValue::from_str("length")).map_err(|_| type_error("open: bytes could not be read"))?;
+    match length.as_f64() {
+        // A float-to-integer `as` saturates; a typed array's length is a whole number anyway.
+        Some(length) if length.is_finite() && length >= 0.0 => Ok(length as usize),
+        _ => Err(type_error("open: bytes could not be read")),
+    }
+}
+
+/// Copies the host's `len` bytes into a new vector, every JavaScript step through a catch-checked
+/// call. wasm-bindgen's own copy (`to_vec`) calls `Uint8Array.prototype.set` through an import that
+/// cannot fail: on a buffer detached or shrunk since its length was read, `set` throws, and an
+/// exception thrown through Rust code skips its cleanup, leaving this object borrowed (`free()`
+/// refused, `Drop` never run). Here it becomes a TypeError and nothing is queued.
+fn copy_bytes(source: &js_sys::Uint8Array, len: usize) -> Result<Vec<u8>, JsValue> {
+    let unreadable = |_| type_error("open: bytes could not be read");
+    let mut bytes = vec![0u8; len];
+    let args = js_sys::Array::of1(source);
+    // Taken after the allocation, which may have grown the memory and replaced its buffer. The view
+    // covers exactly the vector; `set` writes the host's bytes into it.
+    let memory = wasm_bindgen::memory().dyn_into::<js_sys::WebAssembly::Memory>().map_err(unreadable)?;
+    let offset = u32::try_from(bytes.as_mut_ptr() as usize).map_err(|_| type_error("open: bytes could not be read"))?;
+    let length = u32::try_from(len).map_err(|_| type_error("open: bytes could not be read"))?;
+    let view = js_sys::Uint8Array::new_with_byte_offset_and_length(&memory.buffer(), offset, length);
+    let set = js_sys::Reflect::get(&view, &JsValue::from_str("set")).and_then(|set| set.dyn_into::<js_sys::Function>()).map_err(unreadable)?;
+    js_sys::Reflect::apply(&set, &view, &args).map_err(unreadable)?;
+    Ok(bytes)
 }
 
 /// What a malformed argument throws.
