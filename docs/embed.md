@@ -56,6 +56,28 @@ location; the script rewrites those paths with `--remap-path-prefix` (registry a
 `/cargo/registry/src` and `/cargo/git/checkouts`, the checkout to `.`) and fails if the module or
 its glue still holds `CARGO_HOME`, the checkout path or the home folder.
 
+### CI and releases
+
+`Embed CI` (`.github/workflows/embed-ci.yml`) runs on pull requests and on pushes to branches
+named `*-embed`: actionlint and shellcheck, `cargo xtask ci` (which ends with `cargo xtask embed`:
+the host tests without default features, the configuration the module ships, and clippy for
+`wordcraft-embed` on wasm32) and a dry run of the package. A tag `embed-v<version>`, matching
+`apps/wordcraft-embed`'s version, runs `Embed release`: the same gates, the build, a check of the
+zip against `SHA256SUMS` and its `.sha256` (`packaging/embed/verify-zip.sh`), then a GitHub release
+holding `wordcraft-embed-<version>.zip` and `wordcraft-embed-<version>.zip.sha256`. The release job
+alone holds the write token and the right to attest.
+
+The release job attests the zip and its `.sha256` file with GitHub artifact attestation (signed
+SLSA build provenance, `actions/attest-build-provenance`). The checksum only shows that a file is
+consistent with itself; the attestation shows which repository, workflow and tag built it. A host
+verifies a downloaded zip before trusting it, with the GitHub CLI:
+
+```sh
+gh attestation verify wordcraft-embed-<version>.zip --repo rsysapp/wordcraft
+```
+
+The command fails for a file that was not built by this repository's release workflow.
+
 ## API
 
 ```ts

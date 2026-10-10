@@ -20,7 +20,9 @@ commands:
   assets          check that every icon/image/font/asset is attributed in ATTRIBUTION.md
   layers          enforce the crate dependency layering (plan/architecture.md §3)
   wasm            cargo check --target wasm32-unknown-unknown for the wasm-safe crates
-  ci              fmt --check, clippy -D warnings, test, assets, layers, wasm (stops at first failure)
+  embed           the embed build's own configuration: the host tests without default features, and
+                  clippy -D warnings for the wordcraft-embed crate on wasm32
+  ci              fmt --check, clippy -D warnings, test, assets, layers, wasm, embed (stops at first failure)
   corpus [--download]
                   show where test corpora live; --download fetches PngSuite into corpus/pngsuite
   stats [--exact] count tests and lines per crate (--exact: ask the test harness via `-- --list`)
@@ -36,6 +38,7 @@ fn main() -> ExitCode {
         Some("assets") => assets::run(&root()),
         Some("layers") => cmd_layers(),
         Some("wasm") => cmd_wasm(),
+        Some("embed") => cmd_embed(),
         Some("ci") => cmd_ci(),
         Some("corpus") => cmd_corpus(rest.contains(&"--download")),
         Some("stats") => stats::run(&root(), rest.contains(&"--exact")),
@@ -148,6 +151,17 @@ fn cmd_wasm() -> Result<(), String> {
     if failed == 0 { Ok(()) } else { Err(format!("{failed} crate(s) failed the wasm check")) }
 }
 
+/// The configuration the embed module ships: `wordcraft-embed` builds ui-egui without its default
+/// features, which `cargo test --workspace` (feature unification across the apps) never compiles.
+fn cmd_embed() -> Result<(), String> {
+    let mut test = cargo();
+    test.args(["test", "-p", "wordcraft-ui-egui", "--no-default-features", "--test", "embed_host", "--test", "embed_view", "--test", "app_harness"]);
+    run(test, "cargo test -p wordcraft-ui-egui --no-default-features --test embed_host --test embed_view --test app_harness")?;
+    let mut clippy = cargo();
+    clippy.args(["clippy", "--target", "wasm32-unknown-unknown", "-p", "wordcraft-embed", "--", "-D", "warnings"]);
+    run(clippy, "cargo clippy --target wasm32-unknown-unknown -p wordcraft-embed -- -D warnings")
+}
+
 fn cmd_ci() -> Result<(), String> {
     type Step = (&'static str, Box<dyn Fn() -> Result<(), String>>);
     let steps: Vec<Step> = vec![
@@ -178,6 +192,7 @@ fn cmd_ci() -> Result<(), String> {
         ("assets", Box::new(|| assets::run(&root()))),
         ("layers", Box::new(cmd_layers)),
         ("wasm", Box::new(cmd_wasm)),
+        ("embed", Box::new(cmd_embed)),
     ];
     let mut done = Vec::new();
     for (name, f) in &steps {

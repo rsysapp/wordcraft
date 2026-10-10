@@ -1,0 +1,146 @@
+# Embed build release: a tag embed-v<version> (the version of apps/wordcraft-embed) runs the gates
+# at that commit, builds wordcraft-embed-<version>.zip (the module, its generated JavaScript glue
+# and TypeScript declarations, licences including those of the compiled-in Rust crates,
+# SHA256SUMS), attests it and attaches it to a GitHub release of that tag. See docs/embed.md.
+name: Embed release
+
+on:
+  push:
+    tags: ["embed-v*"]
+
+# No token rights by default; each job asks for its own.
+permissions: {}
+
+concurrency:
+  group: embed-release-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: 0
+  BINARYEN_VERSION: "123"
+  # From the release's own .sha256 asset, cross-checked by hashing the tarball.
+  BINARYEN_SHA256: e959f2170af4c20c552e9de3a0253704d6a9d2766e8fdb88e4d6ac4bae9388fe
+
+jobs:
+  # The same gates as Embed CI's check job, at the tagged commit. No build cache in this workflow:
+  # a restored cache could carry another run's outputs into the release.
+  gates:
+    name: cargo xtask ci
+    runs-on: ubuntu-24.04
+    timeout-minutes: 150
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+      - name: Install system libraries
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libxkbcommon-dev libwayland-dev libx11-dev libxrandr-dev libxi-dev libgl1-mesa-dev
+      - uses: dtolnay/rust-toolchain@1d64bbcee8ef0c191a54710c227fd268a0d5014b # 1.95.0
+        with:
+          toolchain: 1.95.0
+          components: rustfmt, clippy
+          targets: wasm32-unknown-unknown
+      - name: cargo xtask ci
+        run: cargo xtask ci
+
+  # Builds with a read-only token. Nothing here can write to the repository. A named runner image,
+  # not -latest, keeps the operating system from changing between releases.
+  build:
+    name: Embed build (wasm)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+      - name: The tag names the crate's version
+        run: |
+          have="$(packaging/embed/package.sh --print-version)"
+          if [ "embed-v$have" != "$GITHUB_REF_NAME" ]; then
+            echo "::error::tag $GITHUB_REF_NAME, but apps/wordcraft-embed is version $have"
+            exit 1
+          fi
+      # dtolnay/rust-toolchain publishes each Rust release as a branch, not a tag; this is the
+      # 1.95.0 branch's commit.
+      - uses: dtolnay/rust-toolchain@1d64bbcee8ef0c191a54710c227fd268a0d5014b # 1.95.0
+        with:
+          toolchain: 1.95.0
+          targets: wasm32-unknown-unknown
+      - name: Install wasm-bindgen (the version in Cargo.lock)
+        run: |
+          v="$(awk '/^name = "wasm-bindgen"$/ { getline; gsub(/version = |"/, ""); print; exit }' Cargo.lock)"
+          cargo install wasm-bindgen-cli --version "$v" --locked
+      - name: Install wasm-opt (binaryen)
+        run: |
+          tarball="binaryen-version_${BINARYEN_VERSION}-x86_64-linux.tar.gz"
+          curl -fsSL -o "$RUNNER_TEMP/$tarball" "https://github.com/WebAssembly/binaryen/releases/download/version_${BINARYEN_VERSION}/$tarball"
+          echo "$BINARYEN_SHA256  $RUNNER_TEMP/$tarball" | sha256sum -c -
+          tar -xzf "$RUNNER_TEMP/$tarball" -C "$RUNNER_TEMP"
+          echo "$RUNNER_TEMP/binaryen-version_${BINARYEN_VERSION}/bin" >> "$GITHUB_PATH"
+      # The version and SHA-256 are in packaging/embed/cargo-about.env; the script checks the tarball.
+      - name: Install cargo-about (licence notices of the Rust crates)
+        run: packaging/embed/install-cargo-about.sh
+      - name: Build and zip
+        run: packaging/embed/package.sh
+      # The zip's own SHA256SUMS against its files, and the zip against its .sha256.
+      - name: Check the zip against its checksums
+        env:
+          TAG: ${{ github.ref_name }}
+        run: packaging/embed/verify-zip.sh "dist/release/wordcraft-embed-${TAG#embed-v}.zip"
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: wordcraft-embed
+          path: dist/release/wordcraft-embed-*
+          if-no-files-found: error
+
+  # Holds the write token and runs only `gh`: no toolchain, cargo or build action.
+  release:
+    name: Release
+    needs: [gates, build]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+      # Only for the attestation below: the OIDC token that Sigstore signs the provenance with,
+      # and the right to store the attestation against this repository.
+      id-token: write
+      attestations: write
+    steps:
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: wordcraft-embed
+          path: release
+      - name: Check the download against its checksum
+        id: files
+        run: |
+          version="${GITHUB_REF_NAME#embed-v}"
+          (cd release && sha256sum -c "wordcraft-embed-$version.zip.sha256")
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+      # Signed build provenance (Sigstore, through GitHub): ties the zip to this repository, this
+      # workflow and this tag, so a host can check where the file came from, not only that it
+      # matches its checksum. The checksum file is a separate release asset, so it is attested too.
+      # `gh attestation verify wordcraft-embed-<version>.zip --repo <owner>/wordcraft`
+      - name: Attest the release files
+        uses: actions/attest-build-provenance@e8998f949152b193b063cb0ec769d69d929409be # v2.4.0
+        with:
+          subject-path: |
+            release/wordcraft-embed-${{ steps.files.outputs.version }}.zip
+            release/wordcraft-embed-${{ steps.files.outputs.version }}.zip.sha256
+      - name: Attach to the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ steps.files.outputs.version }}
+        run: |
+          cd release
+          gh release create "$GITHUB_REF_NAME" "wordcraft-embed-$VERSION.zip" "wordcraft-embed-$VERSION.zip.sha256" \
+            --repo "$GITHUB_REPOSITORY" \
+            --title "Embed build $VERSION" \
+            --notes "wordcraft-embed-$VERSION.zip: the embed build's WebAssembly module, generated JavaScript glue and TypeScript declarations, licences (including those of the compiled-in Rust crates) and SHA256SUMS. See docs/embed.md." \
+            --latest=false \
+            --verify-tag
