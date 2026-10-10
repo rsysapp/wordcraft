@@ -9,7 +9,7 @@ use wordcraft_engine::Selection;
 use super::bridge::{HostBridge, HostCommand, HostEvent};
 use super::marks::Marks;
 use super::text_match::{TextIndex, visible_fragment_text};
-use super::wire::{JumpTarget, occurrence_index, page_index};
+use super::wire::{JumpTarget, ThemeSpec, occurrence_index, page_index};
 use crate::WordApp;
 
 /// Points left above a passage the host jumps to, so it does not sit on the view's edge. The PDF
@@ -71,6 +71,8 @@ pub struct HostState {
     index: TextIndex,
     /// The host's marks, and where they were found and painted.
     pub(crate) marks: Marks,
+    /// The chrome theme the host chose, if it did; it outranks the app's own dark setting.
+    pub(crate) dark: Option<bool>,
     /// The selection as it last settled: a person's (told to the host or not) or one the editor
     /// made itself. A selection that differs from it is a person's new one.
     settled: Selection,
@@ -152,6 +154,7 @@ impl HostState {
             last_page: None,
             index: TextIndex::default(),
             marks: Marks::default(),
+            dark: None,
             settled: Selection::default(),
             reported: false,
             clear_reported: false,
@@ -172,9 +175,26 @@ pub(crate) fn before_frame(app: &mut WordApp, ctx: &egui::Context) {
             HostCommand::JumpTo(target) => jump(app, &mut host, target, ctx.cumulative_frame_nr()),
             // Looked for when next painted, against the layout painted then.
             HostCommand::SetMarks(marks) => host.marks.set(marks),
+            HostCommand::SetTheme(theme) => set_theme(app, &mut host, ctx, &theme),
         }
     }
     app.host = Some(host);
+}
+
+/// Dark or light chrome and the host's accent. Pages are painted white whatever the theme.
+fn set_theme(app: &mut WordApp, host: &mut HostState, ctx: &egui::Context, theme: &ThemeSpec) {
+    let Some((accent, content)) = theme.colors() else {
+        log::warn!("embed: theme ignored, accent and accentContent must be #rrggbb");
+        return;
+    };
+    crate::theme::set_accent_override(ctx, Some(crate::theme::AccentOverride { accent, content }));
+    app.ui.dark = theme.dark;
+    host.dark = Some(theme.dark);
+    // An explicit preference: with egui's default (follow the system), a change of the operating
+    // system's theme would swap in the other, unstyled theme under the host's choice.
+    ctx.set_theme(if theme.dark { egui::Theme::Dark } else { egui::Theme::Light });
+    // Re-apply the egui style this frame, even when only the accent changed.
+    app.applied_dark = None;
 }
 
 pub(crate) fn after_frame(app: &mut WordApp, ctx: &egui::Context) {

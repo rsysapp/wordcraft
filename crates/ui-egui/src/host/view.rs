@@ -48,7 +48,13 @@ fn page_controls(app: &mut WordApp, ui: &mut Ui) {
     if icon_button(ui, "chevronUp", "Previous page", current > 0) {
         go_to_page(app, current.saturating_sub(1));
     }
-    status_label(ui, format!("Page {} of {pages}", if pages == 0 { 0 } else { current + 1 }));
+    // The current page as a pill in the host's accent, with the host's text colour on it.
+    let t = Tokens::get(ui.ctx());
+    let label = format!("Page {} of {pages}", if pages == 0 { 0 } else { current + 1 });
+    let galley = ui.painter().layout_no_wrap(label, regular(12.0), crate::theme::accent_content(ui.ctx()));
+    let (pill, _) = ui.allocate_exact_size(galley.size() + vec2(16.0, 6.0), Sense::hover());
+    ui.painter().rect_filled(pill, 10.0, t.accent);
+    ui.painter().galley(pill.center() - galley.size() / 2.0, galley, t.accent);
     if icon_button(ui, "chevronDown", "Next page", current.saturating_add(1) < pages) {
         go_to_page(app, current.saturating_add(1));
     }

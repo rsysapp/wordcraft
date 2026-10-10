@@ -119,7 +119,22 @@ impl Tokens {
         }
     }
     pub fn get(ctx: &egui::Context) -> Tokens {
-        if ctx.global_style().visuals.dark_mode { Tokens::dark() } else { Tokens::light() }
+        // embed: a host page's accent replaces the app colour.
+        Tokens::resolve(ctx.global_style().visuals.dark_mode, accent_override(ctx))
+    }
+
+    /// Light or dark tokens, with a host page's accent (embed build) in place of the app colour.
+    pub fn resolve(dark: bool, accent: Option<AccentOverride>) -> Tokens {
+        let mut tokens = if dark { Tokens::dark() } else { Tokens::light() };
+        if let Some(over) = accent {
+            tokens.accent = over.accent;
+            tokens.accent_text = over.accent;
+            // Pages are white in both themes, so the selection is judged against white.
+            let tint = over.selection_tint();
+            tokens.selection = Color32::from_rgba_unmultiplied(tint.r(), tint.g(), tint.b(), if dark { 0x55 } else { 0x48 });
+            tokens.checked = Color32::from_rgba_unmultiplied(over.accent.r(), over.accent.g(), over.accent.b(), 0x30);
+        }
+        tokens
     }
 }
 
@@ -214,4 +229,56 @@ pub fn apply(ctx: &egui::Context, t: &Tokens) {
 
 pub fn c32(c: wordcraft_doc::Rgb) -> Color32 {
     Color32::from_rgb(c.0, c.1, c.2)
+}
+
+/// embed: a host page's accent colour and the text colour on it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct AccentOverride {
+    pub accent: Color32,
+    pub content: Color32,
+}
+
+impl AccentOverride {
+    /// The colour the selection is tinted with on the white page: the accent, unless it is so pale
+    /// that a translucent wash of it would vanish on white; then the accent drawn toward the host's
+    /// own text colour.
+    fn selection_tint(self) -> Color32 {
+        if contrast_with_white(self.accent) >= 3.0 {
+            return self.accent;
+        }
+        let half = |a: u8, b: u8| ((u16::from(a) + u16::from(b)) / 2) as u8;
+        Color32::from_rgb(half(self.accent.r(), self.content.r()), half(self.accent.g(), self.content.g()), half(self.accent.b(), self.content.b()))
+    }
+}
+
+/// WCAG contrast ratio of `colour` against white.
+fn contrast_with_white(colour: Color32) -> f32 {
+    let linear = |channel: u8| {
+        let value = f32::from(channel) / 255.0;
+        if value <= 0.03928 { value / 12.92 } else { ((value + 0.055) / 1.055).powf(2.4) }
+    };
+    let luminance = 0.2126 * linear(colour.r()) + 0.7152 * linear(colour.g()) + 0.0722 * linear(colour.b());
+    1.05 / (luminance + 0.05)
+}
+
+fn accent_id() -> egui::Id {
+    egui::Id::new("wordcraft.embed.accent")
+}
+
+pub fn set_accent_override(ctx: &egui::Context, accent: Option<AccentOverride>) {
+    ctx.data_mut(|data| match accent {
+        Some(over) => {
+            data.insert_temp(accent_id(), over);
+        }
+        None => data.remove::<AccentOverride>(accent_id()),
+    });
+}
+
+pub fn accent_override(ctx: &egui::Context) -> Option<AccentOverride> {
+    ctx.data(|data| data.get_temp::<AccentOverride>(accent_id()))
+}
+
+/// Text colour on the accent (white unless a host page chose another).
+pub fn accent_content(ctx: &egui::Context) -> Color32 {
+    accent_override(ctx).map_or(Color32::WHITE, |over| over.content)
 }

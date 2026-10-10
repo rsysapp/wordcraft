@@ -1588,3 +1588,206 @@ fn a_backward_selection_reports_its_document_order_end() {
     let text = copy_text.split_whitespace().collect::<Vec<_>>().join(" ");
     assert_selection_at(&mut h, &after, &Pos::body(1, 9), &text);
 }
+
+// --- setTheme: dark or light chrome and the host's accent; pages stay white. ---
+
+use wordcraft_ui_egui::host::ThemeSpec;
+use wordcraft_ui_egui::theme::{AccentOverride, Tokens};
+
+fn theme(dark: bool, accent: &str) -> ThemeSpec {
+    ThemeSpec { dark, accent: accent.into(), accent_content: "#ffffff".into() }
+}
+
+#[test]
+fn set_theme_applies_dark_mode_and_the_accent_while_pages_stay_white() {
+    let (mut h, bridge) = embed_app();
+    open_doc(&mut h, &bridge, &clauses(5));
+    bridge.send(HostCommand::SetTheme(theme(true, "#0f766e")));
+    frames(&mut h, 3);
+    let teal = egui::Color32::from_rgb(0x0f, 0x76, 0x6e);
+    let tokens = Tokens::get(&h.ctx);
+    assert!(tokens.dark);
+    assert_eq!(tokens.accent, teal);
+    assert!(h.ctx.global_style().visuals.dark_mode);
+    assert_eq!(h.ctx.global_style().visuals.selection.bg_fill, egui::Color32::from_rgba_unmultiplied(0x0f, 0x76, 0x6e, 0x55));
+    let painted = shapes(&h);
+    assert!(painted.iter().any(|s| matches!(s, egui::Shape::Rect(r) if r.fill == egui::Color32::WHITE)), "pages must stay white");
+    assert!(painted.iter().any(|s| matches!(s, egui::Shape::Rect(r) if r.fill == teal)), "the page indicator uses the accent");
+}
+
+#[test]
+fn switching_back_to_light_keeps_the_accent() {
+    let (mut h, bridge) = embed_app();
+    open_doc(&mut h, &bridge, &clauses(5));
+    bridge.send(HostCommand::SetTheme(theme(true, "#0f766e")));
+    frames(&mut h, 2);
+    bridge.send(HostCommand::SetTheme(theme(false, "#7c3aed")));
+    frames(&mut h, 2);
+    let tokens = Tokens::get(&h.ctx);
+    assert!(!tokens.dark);
+    assert_eq!(tokens.accent, egui::Color32::from_rgb(0x7c, 0x3a, 0xed));
+    assert!(!h.ctx.global_style().visuals.dark_mode);
+}
+
+#[test]
+fn a_system_theme_change_never_replaces_the_hosts_choice() {
+    let other = |theme: egui::Theme| if theme == egui::Theme::Dark { egui::Theme::Light } else { egui::Theme::Dark };
+    // Every pairing of the host's choice with the system theme in force when it chose.
+    for host_dark in [true, false] {
+        for system_then in [egui::Theme::Dark, egui::Theme::Light] {
+            let (mut h, bridge) = embed_app();
+            // The test harness pins egui's theme; the page's browser starts out following the system.
+            h.ctx.set_theme(egui::ThemePreference::System);
+            open_doc(&mut h, &bridge, &clauses(5));
+            h.input_mut().system_theme = Some(system_then);
+            frames(&mut h, 2);
+            bridge.send(HostCommand::SetTheme(theme(host_dark, "#0f766e")));
+            frames(&mut h, 2);
+            // The system's theme changes after the host chose, and back again.
+            for changed in [other(system_then), system_then, other(system_then)] {
+                h.input_mut().system_theme = Some(changed);
+                frames(&mut h, 3);
+                let case = format!("host dark {host_dark}, system {system_then:?} then {changed:?}");
+                let tokens = Tokens::get(&h.ctx);
+                assert_eq!(tokens.dark, host_dark, "{case}: the host's choice was replaced");
+                assert_eq!(tokens.accent, egui::Color32::from_rgb(0x0f, 0x76, 0x6e), "{case}");
+                // The app's own style, not egui's default for the other theme.
+                let style = h.ctx.global_style();
+                assert_eq!(style.visuals.dark_mode, host_dark, "{case}");
+                assert_eq!(style.visuals.panel_fill, tokens.ribbon, "{case}: chrome lost the app's style");
+                assert_eq!(style.spacing.item_spacing, egui::vec2(6.0, 4.0), "{case}: chrome lost the app's spacing");
+            }
+        }
+    }
+}
+
+#[test]
+fn the_hosts_theme_wins_over_the_apps_own_dark_setting() {
+    let (mut h, bridge) = embed_app();
+    h.state_mut().ui.dark = true;
+    h.state_mut().session.view.dark_mode = true;
+    frames(&mut h, 2);
+    bridge.send(HostCommand::SetTheme(theme(false, "#0f766e")));
+    frames(&mut h, 3);
+    assert!(!Tokens::get(&h.ctx).dark);
+}
+
+#[test]
+fn set_theme_before_open_applies_to_the_first_frame() {
+    let bridge = HostBridge::new();
+    bridge.send(HostCommand::SetTheme(theme(true, "#7c3aed")));
+    let app = WordApp::new(Session::new(Document::new()), Services::default()).with_host(bridge.clone(), EmbedProfile::View);
+    let seen = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+    let recorder = seen.clone();
+    let _harness = egui_kittest::Harness::builder().with_size(WINDOW).with_max_steps(12).build_ui_state(
+        move |ui, app: &mut WordApp| {
+            let ctx = ui.ctx().clone();
+            app.logic(&ctx);
+            app.ui(ui);
+            let tokens = Tokens::get(&ctx);
+            recorder.borrow_mut().push((tokens.dark, tokens.accent, ctx.global_style().visuals.dark_mode));
+        },
+        app,
+    );
+    let violet = egui::Color32::from_rgb(0x7c, 0x3a, 0xed);
+    assert_eq!(seen.borrow().first(), Some(&(true, violet, true)), "the first frame was drawn with the default theme");
+}
+
+#[test]
+fn a_theme_with_a_bad_colour_changes_nothing_and_does_not_panic() {
+    let (mut h, bridge) = embed_app();
+    bridge.send(HostCommand::SetTheme(theme(true, "#0f766e")));
+    frames(&mut h, 2);
+    for (accent, content) in [("teal", "#ffffff"), ("#0f766e", ""), ("#0f766e80", "#ffffff"), ("#12345", "#fff"), ("\u{1F600}\u{1F600}", "#ffffff")] {
+        bridge.send(HostCommand::SetTheme(ThemeSpec { dark: false, accent: accent.into(), accent_content: content.into() }));
+        frames(&mut h, 2);
+        let tokens = Tokens::get(&h.ctx);
+        assert!(tokens.dark, "{accent:?}/{content:?} changed the theme");
+        assert_eq!(tokens.accent, egui::Color32::from_rgb(0x0f, 0x76, 0x6e));
+    }
+}
+
+#[test]
+fn the_page_indicator_keeps_its_text_and_uses_the_hosts_text_colour_on_the_accent() {
+    let (mut h, bridge) = embed_app();
+    open_doc(&mut h, &bridge, &clauses(120));
+    let pages = pages(&mut h);
+    bridge.send(HostCommand::SetTheme(ThemeSpec { dark: true, accent: "#fde047".into(), accent_content: "#1c1917".into() }));
+    frames(&mut h, 3);
+    assert!(drawn_text(&h).contains(&format!("Page 1 of {pages}")), "{}", drawn_text(&h));
+    let ink = egui::Color32::from_rgb(0x1c, 0x19, 0x17);
+    let colour = shapes(&h).iter().find_map(|s| match s {
+        egui::Shape::Text(t) if t.galley.text().starts_with("Page 1 of") => t.galley.job.sections.first().map(|section| section.format.color),
+        _ => None,
+    });
+    assert_eq!(colour, Some(ink));
+}
+
+#[test]
+fn the_theme_leaves_the_hosts_mark_colours_alone() {
+    let (mut h, bridge) = embed_app();
+    open_doc(&mut h, &bridge, &clauses(20));
+    bridge.send(HostCommand::SetMarks(vec![mark("t1", "Clause 2.")]));
+    frames(&mut h, 3);
+    assert!(shapes(&h).iter().any(|s| matches!(s, egui::Shape::Rect(r) if r.fill == amber())), "fixture: the mark is painted");
+    for dark in [true, false] {
+        bridge.send(HostCommand::SetTheme(theme(dark, "#0f766e")));
+        frames(&mut h, 3);
+        assert!(shapes(&h).iter().any(|s| matches!(s, egui::Shape::Rect(r) if r.fill == amber())), "dark {dark}: the mark changed colour");
+    }
+}
+
+fn luminance(colour: egui::Color32) -> f32 {
+    let linear = |channel: u8| {
+        let value = f32::from(channel) / 255.0;
+        if value <= 0.03928 { value / 12.92 } else { ((value + 0.055) / 1.055).powf(2.4) }
+    };
+    0.2126 * linear(colour.r()) + 0.7152 * linear(colour.g()) + 0.0722 * linear(colour.b())
+}
+
+fn contrast(first: egui::Color32, second: egui::Color32) -> f32 {
+    let (high, low) = (luminance(first).max(luminance(second)), luminance(first).min(luminance(second)));
+    (high + 0.05) / (low + 0.05)
+}
+
+/// `over` painted on the opaque `under`. `Color32` holds premultiplied channels.
+fn blended(over: egui::Color32, under: egui::Color32) -> egui::Color32 {
+    let keep = 1.0 - f32::from(over.a()) / 255.0;
+    let channel = |top: u8, bottom: u8| (f32::from(top) + f32::from(bottom) * keep).round().min(255.0) as u8;
+    egui::Color32::from_rgb(channel(over.r(), under.r()), channel(over.g(), under.g()), channel(over.b(), under.b()))
+}
+
+#[test]
+fn the_selection_stays_visible_on_the_white_page_for_any_accent_in_both_themes() {
+    // Pale accents (which come with dark text) included: the page is white in both themes.
+    let accents = ["#0f766e", "#7c3aed", "#dc2626", "#1d4ed8", "#fde047", "#fef9c3", "#e0f2fe", "#a7f3d0", "#ffffff", "#000000"];
+    for dark in [false, true] {
+        for accent in accents {
+            let spec = ThemeSpec {
+                dark,
+                accent: accent.into(),
+                accent_content: if luminance(wordcraft_ui_egui::host::wire::parse_color(accent).unwrap()) > 0.4 {
+                    "#111111".into()
+                } else {
+                    "#ffffff".into()
+                },
+            };
+            let (accent_colour, content) = spec.colors().expect("opaque colours");
+            let tokens = Tokens::resolve(dark, Some(AccentOverride { accent: accent_colour, content }));
+            let on_page = blended(tokens.selection, egui::Color32::WHITE);
+            assert!(contrast(on_page, egui::Color32::WHITE) >= 1.25, "dark {dark}, accent {accent}: selection {on_page:?} vanishes on the page");
+            assert!(contrast(on_page, egui::Color32::BLACK) >= 7.0, "dark {dark}, accent {accent}: page text is hard to read when selected");
+        }
+    }
+}
+
+#[test]
+fn clearing_the_accent_restores_the_apps_own_colours() {
+    let (mut h, bridge) = embed_app();
+    bridge.send(HostCommand::SetTheme(theme(false, "#0f766e")));
+    frames(&mut h, 2);
+    assert!(wordcraft_ui_egui::theme::accent_override(&h.ctx).is_some());
+    wordcraft_ui_egui::theme::set_accent_override(&h.ctx, None);
+    assert_eq!(Tokens::get(&h.ctx).accent, Tokens::light().accent);
+    assert_eq!(wordcraft_ui_egui::theme::accent_content(&h.ctx), egui::Color32::WHITE);
+}

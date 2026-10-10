@@ -6,7 +6,7 @@ use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 use serde::Serialize;
 
-use super::wire::{JumpTarget, MarkSpec};
+use super::wire::{JumpTarget, MarkSpec, ThemeSpec};
 
 /// What a host page asks of the editor.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -17,6 +17,8 @@ pub enum HostCommand {
     JumpTo(JumpTarget),
     /// Replace every host mark; an empty list clears them. Marks not found are skipped silently.
     SetMarks(Vec<MarkSpec>),
+    /// Dark or light chrome and the host's accent; pages stay white.
+    SetTheme(ThemeSpec),
 }
 
 /// What the editor tells the host page; serialises to the embed API's `EditorEvent`.

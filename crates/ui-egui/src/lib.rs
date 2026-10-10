@@ -337,9 +337,11 @@ impl WordApp {
         }
         // embed: a host page's commands apply before this frame's layout.
         host::state::before_frame(self, ctx);
-        let dark = self.ui.dark || self.session.view.dark_mode;
+        // embed: the host page's theme outranks the app's own setting.
+        let dark = self.host.as_ref().and_then(|host| host.dark).unwrap_or(self.ui.dark || self.session.view.dark_mode);
         if self.applied_dark != Some(dark) {
-            theme::apply(ctx, &if dark { theme::Tokens::dark() } else { theme::Tokens::light() });
+            // embed: the host's accent, when it set one, is part of the tokens.
+            theme::apply(ctx, &theme::Tokens::resolve(dark, theme::accent_override(ctx)));
             self.applied_dark = Some(dark);
         }
         self.drain_control(ctx);
