@@ -38,6 +38,7 @@ unicode-bidi = "0.3"
 unicode-segmentation = "1"
 unicode-linebreak = "0.1"
 regex = { version = "1", default-features = false, features = ["std", "unicode", "perf"] }
+unicode-normalization = "0.1"
 
 # text / rendering / formats
 skrifa = "0.47"

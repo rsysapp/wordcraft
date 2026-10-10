@@ -3,6 +3,7 @@
 //! lives here so upstream merges stay easy.
 
 pub mod bridge;
+pub mod text_match;
 pub mod wire;
 
 pub use bridge::{HostBridge, HostCommand, HostEvent};
