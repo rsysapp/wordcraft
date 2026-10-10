@@ -1,7 +1,11 @@
 //! View-only sessions (the embed build's view mode). While [`Session::view_only`] is set,
-//! `Session::run` refuses every command not listed here, whatever asked for it (keyboard, menus,
-//! control channel). An allow-list rather than `CommandSpec::mutates`, because Undo, Redo and
-//! Save are registered as pure.
+//! `Session::run` refuses every command not listed here: every command that reaches
+//! `Session::run`, whoever sent it. An allow-list rather than `CommandSpec::mutates`, because Undo,
+//! Redo and Save are registered as pure.
+//!
+//! This guards the engine only. UI paths that bypass `run` (the web save and export download in
+//! `App::run`, the comments pane writing the document directly, the backstage author and autosave
+//! settings) are closed by the UI guard in the embed build, not here.
 //!
 //! [`Session::view_only`]: crate::Session::view_only
 

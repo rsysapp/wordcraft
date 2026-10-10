@@ -232,7 +232,8 @@ fn replace_all(s: &mut Session, v: &Value) -> CmdResult {
 fn goto(s: &mut Session, v: &Value) -> CmdResult {
     if let Some(pg) = p::u64(v, "page") {
         let l = s.layout();
-        let idx = (pg.max(1) as usize - 1).min(l.pages.len().saturating_sub(1));
+        // embed: `as usize` truncates on wasm32 (a host-page jump can send any number); convert checked and clamp.
+        let idx = usize::try_from(pg.max(1) - 1).unwrap_or(usize::MAX).min(l.pages.len().saturating_sub(1));
         let target = l.pages.get(idx).and_then(|page| {
             page.items.iter().find_map(|it| match it {
                 wordcraft_layout::Placed::Lines { story, path, para, l0, .. } if *story == StoryRef::Body => {
@@ -255,7 +256,8 @@ fn goto(s: &mut Session, v: &Value) -> CmdResult {
     }
     if let Some(n) = p::u64(v, "paragraph") {
         let paths = s.doc.para_paths(StoryRef::Body);
-        if let Some(path) = paths.get((n.max(1) - 1) as usize) {
+        // embed: checked conversion, see `page` above; out of range selects nothing.
+        if let Some(path) = usize::try_from(n.max(1) - 1).ok().and_then(|index| paths.get(index)) {
             s.sel = Selection::caret(Pos { story: StoryRef::Body, path: path.clone(), off: 0 });
         }
         return sel_result(s);
