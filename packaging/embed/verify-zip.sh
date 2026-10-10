@@ -5,13 +5,17 @@
 # - the zip holds exactly the files the embed API promises (docs/embed.md, a fixed list, plus
 #   licenses/OFL-<family>.txt for the fonts of a craft-fonts build) and SHA256SUMS, nothing else;
 # - every entry name is a plain relative file name: no absolute path, no ".." component, no
-#   backslash, no folder entry, no characters a shell or unzip's wildcards could read differently;
+#   backslash, no folder entry, no characters a shell or unzip's wildcards could read differently,
+#   at most 100 characters, and no two names that differ only in case (on a case-insensitive file
+#   system one would overwrite the other);
 # - SHA256SUMS lists every file but itself, once, and each entry's bytes match its listed hash.
 #
 # Nothing is extracted: each entry is streamed out of the zip into the hasher, so no entry name can
 # make this script read or write a file outside the zip. Every refusal prints its reason.
 # Needs: unzip, and sha256sum or shasum. Self-test: packaging/embed/test-verify-zip.sh.
 set -euo pipefail
+# Byte semantics for every pattern and sort below: a caller's locale must not widen [A-Za-z].
+export LC_ALL=C
 
 fail() {
   echo "error: $*" >&2
@@ -59,7 +63,11 @@ zip_hash="$(hash_file "$zip")"
 # 2. The entry names, each refused for its own reason before any is used as an argument.
 entries="$(unzip -Z1 "$zip")" || fail "unzip cannot list $zip_name"
 [ -n "$entries" ] || fail "$zip_name is empty"
+# The longest name a build writes is about 40 characters; a craft-fonts family name stays well
+# under the cap.
+MAX_NAME=100
 while IFS= read -r entry; do
+  [ "${#entry}" -le "$MAX_NAME" ] || fail "entry '${entry:0:$MAX_NAME}...' is longer than $MAX_NAME characters"
   case "$entry" in
     /*) fail "entry '$entry' is an absolute path" ;;
     *\\*) fail "entry '$entry' holds a backslash" ;;
@@ -76,6 +84,8 @@ done <<<"$entries"
 sorted_entries="$(printf '%s\n' "$entries" | LC_ALL=C sort)"
 duplicates="$(printf '%s\n' "$sorted_entries" | uniq -d)"
 [ -z "$duplicates" ] || fail "the zip lists an entry twice: $(printf '%s' "$duplicates" | tr '\n' ' ')"
+case_twins="$(printf '%s\n' "$sorted_entries" | tr '[:upper:]' '[:lower:]' | sort | uniq -d)"
+[ -z "$case_twins" ] || fail "the zip holds entries that differ only in case: $(printf '%s' "$case_twins" | tr '\n' ' ')"
 
 # 3. The entry set is the required list plus SHA256SUMS, plus craft-fonts licence texts.
 missing=""

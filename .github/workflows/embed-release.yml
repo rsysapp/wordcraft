@@ -111,7 +111,9 @@ jobs:
   # Holds the write token and runs only `gh`: no toolchain, cargo or build action.
   release:
     name: Release
-    needs: [gates, build]
+    # version too, not only through gates and build: a refused tag never releases, even if a
+    # later edit stops those two from needing it.
+    needs: [version, gates, build]
     runs-on: ubuntu-24.04
     timeout-minutes: 15
     permissions:

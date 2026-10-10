@@ -70,6 +70,17 @@ elif mutation == "no-sums":
     pass
 elif mutation == "sums-malformed":
     sums_extra = "not a checksum line\n"
+elif mutation == "case-twins":
+    # Both match the craft-fonts pattern; extracted on a case-insensitive file system, one
+    # overwrites the other.
+    files["licenses/OFL-inter.txt"] = listed["licenses/OFL-inter.txt"] = b"other\n"
+elif mutation == "long-name":
+    name = "licenses/OFL-" + "F" * 120 + ".txt"
+    files[name] = listed[name] = b"family\n"
+elif mutation == "accented-name":
+    # Outside A-Z in bytes, though a UTF-8 locale's [A-Za-z] may take it for a letter.
+    name = "licenses/OFL-\u00cdnter.txt"
+    files[name] = listed[name] = b"family\n"
 elif mutation == "duplicate-entry":
     pass  # added below
 elif mutation == "craft-fonts-ok":
@@ -155,6 +166,19 @@ refusal sums-twice "SHA256SUMS lists a file twice"
 refusal sums-malformed "SHA256SUMS has a line that is not"
 refusal no-sums "the zip lacks: SHA256SUMS"
 refusal duplicate-entry "lists an entry twice"
+refusal case-twins "differ only in case"
+refusal long-name "is longer than 100 characters"
+# Whatever the caller's locale: the script judges names by bytes.
+make_zip accented-name
+for locale in C en_US.UTF-8 C.UTF-8; do
+  output="$(LC_ALL="$locale" bash "$VERIFY" "$(zip_of accented-name)" 2>&1)" && status=0 || status=$?
+  if [ "$status" = 0 ] || [[ "$output" != *"has characters outside"* ]]; then
+    echo "FAIL: accented-name under LC_ALL=$locale was not refused for its characters: $output" >&2
+    FAILURES=$((FAILURES + 1))
+  else
+    echo "pass: accented-name refused under LC_ALL=$locale"
+  fi
+done
 
 # The .sha256 file itself: it must name this zip, once, with this zip's hash.
 make_zip ok

@@ -54,16 +54,46 @@ mkdir -p "$WORK/bindgen" "$OUT"
 # CARGO_HOME, whose path names the builder's home folder and differs per machine, so they are
 # rewritten to fixed prefixes; the checkout itself becomes `.` (workspace paths are already
 # relative, this catches any that are not). rustc applies the last prefix that matches, so the
-# cargo folders come after the checkout, in case CARGO_HOME lies inside it. CARGO_ENCODED_RUSTFLAGS
-# replaces RUSTFLAGS and any configured target rustflags (the workspace configures none), so flags
-# a caller set are carried over, ahead of these.
-CARGO_HOME_DIR="${CARGO_HOME:-$HOME/.cargo}"
+# cargo folders come after the checkout, in case CARGO_HOME lies inside it.
+#
+# CARGO_ENCODED_RUSTFLAGS replaces every other source of rustflags, so the flags cargo would
+# otherwise have used are carried over, ahead of these, from the one source cargo would read:
+# CARGO_ENCODED_RUSTFLAGS, else RUSTFLAGS, else CARGO_TARGET_WASM32_UNKNOWN_UNKNOWN_RUSTFLAGS, else
+# CARGO_BUILD_RUSTFLAGS. Rustflags in a cargo config file cannot be read reliably without
+# unstable cargo, so the script refuses to build while one sets them (the workspace sets none).
+HOME_DIR="${HOME:-}"
+CARGO_HOME_DIR="${CARGO_HOME:-$HOME_DIR/.cargo}"
+config_dir="$ROOT"
+while :; do
+  for config in "$config_dir/.cargo/config.toml" "$config_dir/.cargo/config"; do
+    if [ -f "$config" ] && grep -Eq '^[[:space:]]*rustflags[[:space:]]*=' "$config"; then
+      echo "error: $config sets rustflags, which this build would silently replace; pass them in RUSTFLAGS instead" >&2
+      exit 1
+    fi
+  done
+  [ "$config_dir" != / ] || break
+  config_dir="$(dirname "$config_dir")"
+done
+for config in "$CARGO_HOME_DIR/config.toml" "$CARGO_HOME_DIR/config"; do
+  if [ -f "$config" ] && grep -Eq '^[[:space:]]*rustflags[[:space:]]*=' "$config"; then
+    echo "error: $config sets rustflags, which this build would silently replace; pass them in RUSTFLAGS instead" >&2
+    exit 1
+  fi
+done
 SEP=$'\x1f'
 REMAP="--remap-path-prefix=$ROOT=.${SEP}--remap-path-prefix=$CARGO_HOME_DIR/registry/src=/cargo/registry/src${SEP}--remap-path-prefix=$CARGO_HOME_DIR/git/checkouts=/cargo/git/checkouts"
+caller_flags=()
 if [ -n "${CARGO_ENCODED_RUSTFLAGS:-}" ]; then
-  CARGO_ENCODED_RUSTFLAGS="$CARGO_ENCODED_RUSTFLAGS$SEP$REMAP"
-elif [ -n "${RUSTFLAGS:-}" ]; then
-  read -r -a caller_flags <<<"$RUSTFLAGS"
+  IFS="$SEP" read -r -a caller_flags <<<"$CARGO_ENCODED_RUSTFLAGS"
+else
+  for source in RUSTFLAGS CARGO_TARGET_WASM32_UNKNOWN_UNKNOWN_RUSTFLAGS CARGO_BUILD_RUSTFLAGS; do
+    if [ -n "${!source:-}" ]; then
+      read -r -a caller_flags <<<"${!source}"
+      break
+    fi
+  done
+fi
+if [ "${#caller_flags[@]}" -gt 0 ]; then
   CARGO_ENCODED_RUSTFLAGS="$(IFS="$SEP"; echo "${caller_flags[*]}")$SEP$REMAP"
 else
   CARGO_ENCODED_RUSTFLAGS="$REMAP"
@@ -85,11 +115,18 @@ fi
 cp "$WORK/bindgen/wordcraft_embed.js" "$WORK/bindgen/wordcraft_embed.d.ts" "$OUT/"
 
 # No path of this machine in what ships: it would name the builder and make the hash differ per
-# machine. A home folder of `/` would match everything, so only a real one is searched for.
-for path in "$CARGO_HOME_DIR" "$ROOT" "$HOME"; do
+# machine. A path counts where it ends at a boundary (a `/` or a byte no file name part holds), so
+# a home folder of /home/a does not count /home/ab. A home folder of `/` (or none) would match
+# everything, so it is not searched for, and the script says so.
+if [ "${#HOME_DIR}" -le 1 ]; then
+  echo "note: HOME is '${HOME_DIR}', so the module is not searched for the home folder (CARGO_HOME and the checkout still are)" >&2
+fi
+for path in "$CARGO_HOME_DIR" "$ROOT" "$HOME_DIR"; do
   [ "${#path}" -gt 1 ] || continue
+  # The path as an extended regular expression: every character outside [A-Za-z0-9/_-] escaped.
+  pattern="$(printf '%s' "$path" | LC_ALL=C sed 's/[^A-Za-z0-9/_-]/\\&/g')([^A-Za-z0-9._-]|$)"
   for file in wordcraft_embed_bg.wasm wordcraft_embed.js wordcraft_embed.d.ts; do
-    found="$({ LC_ALL=C grep -a -o -F -- "$path" "$OUT/$file" || true; } | wc -l | tr -d ' ')"
+    found="$({ LC_ALL=C grep -a -o -E -- "$pattern" "$OUT/$file" || true; } | wc -l | tr -d ' ')"
     if [ "$found" != 0 ]; then
       echo "error: $file holds $found copies of the local path $path; a --remap-path-prefix is missing" >&2
       exit 1
