@@ -565,6 +565,20 @@ mod tests {
     }
 
     #[test]
+    fn a_run_explicitly_not_hidden_stays_visible() {
+        // `hidden: Some(false)` is what a file's `<w:vanish w:val="0"/>` reads as: shown text.
+        let mut paragraph = Paragraph::new();
+        for (text, hidden) in [("Alpha ", None), ("Shown ", Some(false)), ("Beta", Some(false))] {
+            paragraph.text.push_str(text);
+            paragraph.runs.push(Run { len: text.len(), props: CharProps { hidden, ..CharProps::default() } });
+        }
+        let (_, ranges) = found_in_paragraph(paragraph.clone(), "shown");
+        assert_eq!(sliced(&paragraph, &ranges), vec!["Shown"]);
+        let (_, ranges) = found_in_paragraph(paragraph.clone(), "alpha shown beta");
+        assert_eq!(ranges, vec![(0, paragraph.text.len())]);
+    }
+
+    #[test]
     fn a_field_result_against_text_on_both_sides_maps_at_the_object_edges() {
         let mut paragraph = Paragraph::with_text("Paynow", CharProps::default());
         assert!(paragraph.insert_object(3, field("Rp 5"), &CharProps::default()).is_ok());
