@@ -5,6 +5,9 @@
 //! field results inlined, tracked deletions left out ([`visible_text`]). A match may cross line
 //! breaks inside a paragraph, never a paragraph boundary.
 
+use std::collections::HashMap;
+use std::sync::Arc;
+
 use unicode_normalization::UnicodeNormalization;
 use unicode_normalization::char::is_combining_mark;
 use wordcraft_doc::para::OBJ;
@@ -287,49 +290,144 @@ fn body_range(path: &Path, folded: &Folded, at: usize, end: usize) -> Option<(Po
     Some((Pos::new(StoryRef::Body, path.clone(), start), Pos::new(StoryRef::Body, path.clone(), finish)))
 }
 
+/// Bytes of each folded passage the automaton holds (cut back to a character boundary). The rest of
+/// a passage is compared where its prefix is found, so the automaton stays small however long the
+/// passages are: at most `MAX_MARKS` × 64 bytes of patterns.
+const PREFIX_BYTES: usize = 64;
+
+/// Work between two looks at the caller's budget: places the automaton reported plus passages
+/// compared there. Bounds the time between looks inside one long paragraph too.
+const WORK_PER_CHECK: usize = 256;
+
+/// One distinct folded passage and the passages (by position in the caller's list) it stands for.
+struct Needle {
+    text: Arc<str>,
+    passages: Vec<usize>,
+    /// Where its next match may start, as (paragraph, folded byte): its matches do not overlap, as in
+    /// [`Matches`], so the same places are tested. `(usize::MAX, 0)` once all its passages are found.
+    resume: (usize, usize),
+}
+
 /// One search for many passages at once, each wanting its first match that a caller's test accepts
 /// (see [`TextIndex::find_first`]). Every passage gets the match [`TextIndex::find_where`] with
-/// `nth` 0 would give it, in one pass over the document instead of one per passage. The pass can be
-/// spread over several calls, a paragraph at a time.
+/// `nth` 0 would give it, in one pass over the document instead of one per passage. All the work
+/// (folding the passages, then the pass) can be spread over several calls.
 #[derive(Default)]
-pub struct FirstMatches {
-    /// Every distinct folded passage; `None` when none can match or the automaton could not be built.
+pub(crate) struct FirstMatches {
+    /// The passages as given, until folded; by position in the caller's list.
+    unfolded: Vec<String>,
+    /// How many of `unfolded` have been folded.
+    folded: usize,
+    /// While folding: each distinct folded passage's index in `needles`.
+    needle_of: HashMap<Arc<str>, usize>,
+    needles: Vec<Needle>,
+    /// Built once every passage is folded, over each needle's first [`PREFIX_BYTES`]; `None` when
+    /// no passage can match or it could not be built.
     automaton: Option<aho_corasick::AhoCorasick>,
-    /// For each distinct folded passage (the automaton's pattern), the passages it stands for.
-    passages_of: Vec<Vec<usize>>,
-    /// For each pattern, where its next match may start, as (paragraph, folded byte): a pattern's
-    /// matches do not overlap, as in [`Matches`], so the same ones are tested.
-    resume: Vec<(usize, usize)>,
+    built: bool,
+    /// For each automaton pattern (a distinct prefix), the needles that start with it.
+    needles_of: Vec<Vec<usize>>,
     found: Vec<Option<(Pos, Pos)>>,
+    /// Passages that cannot match: blank or too long once folded, or every one when the automaton
+    /// could not be built.
+    unmatchable: usize,
     /// Passages that may still match and have not.
     open: usize,
-    /// The next paragraph to search.
+    /// The paragraph being searched.
     paragraph: usize,
+    /// Inside `paragraph`, when the last call stopped there: the end of the last place handled and
+    /// how many places ending there were handled.
+    within: Option<(usize, usize)>,
 }
 
 impl FirstMatches {
     /// A search for `passages`; one that folds to nothing or is longer than [`MAX_NEEDLE_CHARS`]
-    /// finds nothing, as with [`TextIndex::find_iter`].
-    pub fn new<'p>(passages: impl IntoIterator<Item = &'p str>) -> FirstMatches {
-        let mut patterns: Vec<String> = Vec::new();
-        let mut passages_of: Vec<Vec<usize>> = Vec::new();
-        let mut pattern_of: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
-        let mut count = 0;
-        for (passage, text) in passages.into_iter().enumerate() {
-            count = passage + 1;
-            let Some(query) = fold_query(text) else { continue };
-            // Equal passages share one pattern: the automaton reports a pattern once per place.
-            let pattern = *pattern_of.entry(query.clone()).or_insert_with(|| {
-                patterns.push(query);
-                passages_of.push(Vec::new());
-                passages_of.len() - 1
-            });
-            if let Some(list) = passages_of.get_mut(pattern) {
-                list.push(passage);
+    /// finds nothing, as with [`TextIndex::find_iter`]. Nothing is folded yet.
+    pub(crate) fn new(passages: Vec<String>) -> FirstMatches {
+        let count = passages.len();
+        FirstMatches { unfolded: passages, found: vec![None; count], open: count, ..FirstMatches::default() }
+    }
+
+    /// Start again from the document's first paragraph (the document or what `accept` tests
+    /// changed), keeping what was folded and built.
+    pub(crate) fn restart(&mut self) {
+        for needle in &mut self.needles {
+            needle.resume = (0, 0);
+        }
+        self.found.iter_mut().for_each(|found| *found = None);
+        self.open = self.found.len().saturating_sub(self.unmatchable);
+        self.paragraph = 0;
+        self.within = None;
+    }
+
+    /// Every passage either has its match or the whole document was searched.
+    pub(crate) fn done(&self) -> bool {
+        self.open == 0
+    }
+
+    /// Each passage's match, by its position in the list given to [`FirstMatches::new`].
+    pub(crate) fn found(&self) -> &[Option<(Pos, Pos)>] {
+        &self.found
+    }
+
+    /// Fold the passages not yet folded, asking `more` after each, then build the automaton;
+    /// `true` once it is built.
+    fn prepare(&mut self, more: &mut impl FnMut() -> bool) -> bool {
+        while let Some(raw) = self.unfolded.get_mut(self.folded) {
+            let passage = self.folded;
+            let raw = std::mem::take(raw);
+            self.folded += 1;
+            match fold_query(&raw) {
+                None => {
+                    self.unmatchable += 1;
+                    self.open = self.open.saturating_sub(1);
+                }
+                Some(query) => {
+                    let query: Arc<str> = query.into();
+                    let next = self.needles.len();
+                    // Equal passages share one needle: each place is compared once for all of them.
+                    let needle = *self.needle_of.entry(query.clone()).or_insert(next);
+                    if needle == next {
+                        self.needles.push(Needle { text: query, passages: Vec::new(), resume: (0, 0) });
+                    }
+                    if let Some(needle) = self.needles.get_mut(needle) {
+                        needle.passages.push(passage);
+                    }
+                }
+            }
+            if !more() {
+                return false;
             }
         }
-        let open = passages_of.iter().map(Vec::len).sum();
-        // Standard semantics with overlapping search report every place each pattern occurs, so a
+        if !self.built {
+            self.build();
+        }
+        true
+    }
+
+    fn build(&mut self) {
+        self.built = true;
+        self.unfolded = Vec::new();
+        self.needle_of = HashMap::new();
+        let mut patterns: Vec<&str> = Vec::new();
+        let mut pattern_of: HashMap<&str, usize> = HashMap::new();
+        let mut needles_of: Vec<Vec<usize>> = Vec::new();
+        for (index, needle) in self.needles.iter().enumerate() {
+            let mut cut = needle.text.len().min(PREFIX_BYTES);
+            while !needle.text.is_char_boundary(cut) {
+                cut -= 1;
+            }
+            let prefix = needle.text.get(..cut).unwrap_or_default();
+            let pattern = *pattern_of.entry(prefix).or_insert_with(|| {
+                patterns.push(prefix);
+                needles_of.push(Vec::new());
+                needles_of.len() - 1
+            });
+            if let Some(list) = needles_of.get_mut(pattern) {
+                list.push(index);
+            }
+        }
+        // Standard semantics with overlapping search report every place each prefix occurs, so a
         // passage inside another (or a prefix of it) is not hidden by the longer one's match.
         let automaton = if patterns.is_empty() {
             None
@@ -342,72 +440,92 @@ impl FirstMatches {
                 }
             }
         };
-        let open = if automaton.is_some() { open } else { 0 };
-        FirstMatches { automaton, resume: vec![(0, 0); passages_of.len()], passages_of, found: vec![None; count], open, paragraph: 0 }
-    }
-
-    /// Start again from the document's first paragraph (the document or what `accept` tests
-    /// changed), keeping the automaton.
-    pub fn restart(&mut self) {
-        self.resume.iter_mut().for_each(|resume| *resume = (0, 0));
-        self.found.iter_mut().for_each(|found| *found = None);
-        self.open = if self.automaton.is_some() { self.passages_of.iter().map(Vec::len).sum() } else { 0 };
-        self.paragraph = 0;
-    }
-
-    /// Every passage either has its match or the whole document was searched.
-    pub fn done(&self) -> bool {
-        self.open == 0 || self.automaton.is_none()
-    }
-
-    /// Each passage's match, by its position in the list given to [`FirstMatches::new`].
-    pub fn found(&self) -> &[Option<(Pos, Pos)>] {
-        &self.found
+        if automaton.is_none() {
+            self.unmatchable = self.found.len();
+            self.open = 0;
+        }
+        self.automaton = automaton;
+        self.needles_of = needles_of;
     }
 }
 
 impl TextIndex {
-    /// Continue `search` paragraph by paragraph, in document order, until it is done or `more`
-    /// answers `false` (asked after each paragraph). `accept(passage, start, end)` tests a match
-    /// for one passage; a passage keeps the first match accepted.
-    pub fn find_first(&self, search: &mut FirstMatches, mut accept: impl FnMut(usize, &Pos, &Pos) -> bool, mut more: impl FnMut() -> bool) {
-        let Some(automaton) = search.automaton.as_ref() else { return };
-        while search.open > 0 {
-            let number = search.paragraph;
+    /// Continue `search` in document order until it is done or `more` answers `false`. `more` is
+    /// asked after each passage folded, after each paragraph and every [`WORK_PER_CHECK`] units of
+    /// work inside one. `accept(passage, start, end)` tests a match for one passage; a passage keeps
+    /// the first match accepted.
+    pub(crate) fn find_first(&self, search: &mut FirstMatches, mut accept: impl FnMut(usize, &Pos, &Pos) -> bool, mut more: impl FnMut() -> bool) {
+        if search.done() || !search.prepare(&mut more) {
+            return;
+        }
+        let FirstMatches { automaton, needles, needles_of, found, open, paragraph, within, .. } = search;
+        let Some(automaton) = automaton.as_ref() else { return };
+        let mut work = 0usize;
+        while *open > 0 {
+            let number = *paragraph;
             let Some((path, folded)) = self.paragraphs.get(number) else {
-                search.open = 0;
+                *open = 0;
                 return;
             };
-            search.paragraph = number.saturating_add(1);
-            let Ok(places) = automaton.try_find_overlapping_iter(folded.text.as_str()) else {
-                search.open = 0;
-                return;
-            };
-            for place in places {
-                let pattern = place.pattern().as_usize();
-                let Some(resume) = search.resume.get_mut(pattern) else { continue };
-                if *resume > (number, place.start()) {
-                    continue;
-                }
-                *resume = (number, place.end());
-                let Some(passages) = search.passages_of.get(pattern) else { continue };
-                if passages.iter().all(|passage| search.found.get(*passage).is_none_or(Option::is_some)) {
-                    continue;
-                }
-                let Some((start, end)) = body_range(path, folded, place.start(), place.end()) else { continue };
-                for passage in passages {
-                    if let Some(slot) = search.found.get_mut(*passage)
-                        && slot.is_none()
-                        && accept(*passage, &start, &end)
-                    {
-                        *slot = Some((start.clone(), end.clone()));
-                        search.open = search.open.saturating_sub(1);
+            let text = folded.text.as_str();
+            // Resuming inside the paragraph: every place ending at or after the last one handled
+            // starts at most a prefix's length before it, and the automaton reports the places that
+            // end at one byte in the same order from there.
+            let resumed = within.take();
+            let from = resumed.map_or(0, |(end, _)| end.saturating_sub(PREFIX_BYTES));
+            let places =
+                if from <= text.len() { automaton.try_find_overlapping_iter(aho_corasick::Input::new(text).range(from..)).ok() } else { None };
+            let mut handled = resumed;
+            let mut skipped_at_end = 0usize;
+            for place in places.into_iter().flatten() {
+                if let Some((end, count)) = resumed {
+                    if place.end() < end {
+                        continue;
+                    }
+                    if place.end() == end && skipped_at_end < count {
+                        skipped_at_end += 1;
+                        continue;
                     }
                 }
-                if search.open == 0 {
-                    return;
+                handled = Some(match handled {
+                    Some((end, count)) if end == place.end() => (end, count.saturating_add(1)),
+                    _ => (place.end(), 1),
+                });
+                let sharing = needles_of.get(place.pattern().as_usize()).map(Vec::as_slice).unwrap_or_default();
+                work = work.saturating_add(1 + sharing.len());
+                for &index in sharing {
+                    let Some(needle) = needles.get_mut(index) else { continue };
+                    if needle.resume > (number, place.start()) || !text.get(place.start()..).is_some_and(|rest| rest.starts_with(&*needle.text)) {
+                        continue;
+                    }
+                    let end = place.start().saturating_add(needle.text.len());
+                    needle.resume = (number, end);
+                    let Some((start, finish)) = body_range(path, folded, place.start(), end) else { continue };
+                    let mut all_found = true;
+                    for passage in &needle.passages {
+                        let Some(slot) = found.get_mut(*passage) else { continue };
+                        if slot.is_none() && accept(*passage, &start, &finish) {
+                            *slot = Some((start.clone(), finish.clone()));
+                            *open = open.saturating_sub(1);
+                        }
+                        all_found &= slot.is_some();
+                    }
+                    if all_found {
+                        needle.resume = (usize::MAX, 0);
+                    }
+                    if *open == 0 {
+                        return;
+                    }
+                }
+                if work >= WORK_PER_CHECK {
+                    work = 0;
+                    if !more() {
+                        *within = handled;
+                        return;
+                    }
                 }
             }
+            *paragraph = number.saturating_add(1);
             if !more() {
                 return;
             }
@@ -799,16 +917,16 @@ mod tests {
         d: &Document,
         passages: &[&str],
         accept: impl Fn(usize, &Pos) -> bool,
-        stop_each_paragraph: bool,
+        stop_at_every_look: bool,
     ) -> (Vec<Option<(Pos, Pos)>>, Vec<Option<(Pos, Pos)>>) {
         let mut index = TextIndex::default();
         index.refresh(d, 1);
-        let mut search = FirstMatches::new(passages.iter().copied());
+        let mut search = FirstMatches::new(passages.iter().map(|passage| passage.to_string()).collect());
         let mut calls = 0;
         while !search.done() {
             calls += 1;
-            assert!(calls <= index.paragraphs.len() + 1, "the search never finished");
-            index.find_first(&mut search, |k, start, _| accept(k, start), || !stop_each_paragraph);
+            assert!(calls <= 1_000_000, "the search never finished");
+            index.find_first(&mut search, |k, start, _| accept(k, start), || !stop_at_every_look);
         }
         let single = passages.iter().enumerate().map(|(k, passage)| index.find_where(passage, |start, _| accept(k, start), 0)).collect();
         (search.found().to_vec(), single)
@@ -837,6 +955,119 @@ mod tests {
         assert_eq!(text(&one_pass[2]), Some((Pos::body(0, 0).path, "Supplier".to_string())), "hidden by the longer passage's match");
         assert_eq!(text(&one_pass[7]), Some((Pos::body(1, 0).path, "pay".to_string())));
         assert_eq!((one_pass[8].clone(), one_pass[9].clone()), (None, None));
+    }
+
+    #[test]
+    fn passages_that_share_the_automatons_prefix_are_told_apart() {
+        // Exactly the automaton's prefix length, then endings that differ only after it.
+        let shared = "a shared opening long enough to fill the prefix of the automaton";
+        assert_eq!(shared.len(), PREFIX_BYTES);
+        let first = format!("{shared} then the first ending");
+        let second = format!("{shared} then the second ending");
+        let d = doc(&[&first, "unrelated", &second, &format!("x {shared} y")]);
+        let passages = [second.clone(), first.clone(), shared.to_string(), format!("{shared} then a third ending"), format!("{shared} then")];
+        let refs: Vec<&str> = passages.iter().map(String::as_str).collect();
+        for stop in [false, true] {
+            let (one_pass, single) = both_ways(&d, &refs, |_, _| true, stop);
+            assert_eq!(one_pass, single, "stopping at every look: {stop}");
+            let paragraph = |found: &Option<(Pos, Pos)>| found.as_ref().map(|(from, _)| from.path.clone());
+            assert_eq!(paragraph(&one_pass[0]), Some(Pos::body(2, 0).path), "the second ending is found past the first");
+            assert_eq!(paragraph(&one_pass[1]), Some(Pos::body(0, 0).path));
+            assert_eq!(paragraph(&one_pass[2]), Some(Pos::body(0, 0).path), "the prefix alone is a passage too");
+            assert_eq!(one_pass[3], None);
+            // A page-like filter that skips the first two places of the prefix-only passage.
+            let later = |k: usize, start: &Pos| k != 2 || start.path.0.first().is_some_and(|&n| n >= 3);
+            let (one_pass, single) = both_ways(&d, &refs, later, stop);
+            assert_eq!(one_pass, single);
+            assert_eq!(paragraph(&one_pass[2]), Some(Pos::body(3, 0).path));
+        }
+        // Multi-byte characters around the cut: the prefix ends on a character boundary.
+        let accented = format!("{}\u{e9}\u{e9} and more", "e".repeat(PREFIX_BYTES - 1));
+        let d = doc(&[&accented]);
+        let passages = [accented.as_str(), &accented[..PREFIX_BYTES - 1]];
+        let (one_pass, single) = both_ways(&d, &passages, |_, _| true, true);
+        assert_eq!(one_pass, single);
+        assert!(one_pass.iter().all(Option::is_some));
+    }
+
+    #[test]
+    fn one_pass_stops_and_resumes_inside_a_long_paragraph() {
+        // One paragraph with thousands of overlapping places, so the budget is looked at inside it.
+        let long = "ab ".repeat(3_000) + "abc ab abd";
+        let d = doc(&["start", &long, "ab abc"]);
+        let passages = [
+            "ab",
+            "b a",
+            "ab ab",
+            "ab ab ab",
+            "abc",
+            "abd",
+            "ab abc",
+            "b ab ab",
+            "ab ab ab ab ab ab ab ab ab ab ab ab ab ab ab ab ab ab ab ab ab ab ab x",
+        ];
+        // Each passage wants a place further along, so the search must go deep into the paragraph.
+        let further = |k: usize, start: &Pos| start.path != Pos::body(1, 0).path || start.off >= k * 700;
+        let mut index = TextIndex::default();
+        index.refresh(&d, 1);
+        let mut search = FirstMatches::new(passages.iter().map(|passage| passage.to_string()).collect());
+        let mut stops_inside = 0;
+        while !search.done() {
+            index.find_first(&mut search, |k, start, _| further(k, start), || false);
+            stops_inside += usize::from(search.within.is_some());
+        }
+        assert!(stops_inside > 10, "the search stopped inside the long paragraph only {stops_inside} times");
+        let single: Vec<Option<(Pos, Pos)>> =
+            passages.iter().enumerate().map(|(k, passage)| index.find_where(passage, |start, _| further(k, start), 0)).collect();
+        assert_eq!(search.found(), single.as_slice());
+        assert!(search.found().iter().filter(|found| found.is_some()).count() >= 7);
+    }
+
+    #[test]
+    fn the_search_moves_on_when_one_place_costs_more_than_a_look() {
+        // Hundreds of passages share one prefix and never match in full, so every place of that prefix
+        // is more work than one look allows; a short passage ends at the same byte. Each call must
+        // still get past the places it handled before, or the search would never end.
+        let shared = "a shared opening long enough to fill the prefix of the automaton";
+        let d = doc(&[&format!("{shared} {shared} {shared} automaton")]);
+        let mut passages: Vec<String> = (0..300).map(|k| format!("{shared} but ending {k}")).collect();
+        passages.push("automaton".to_string());
+        let mut index = TextIndex::default();
+        index.refresh(&d, 1);
+        let mut search = FirstMatches::new(passages.clone());
+        let mut calls = 0;
+        while !search.done() {
+            calls += 1;
+            assert!(calls < 10_000, "the search does not move on");
+            index.find_first(&mut search, |_, _, _| true, || false);
+        }
+        let last = search.found().last().cloned().flatten();
+        assert_eq!(last, index.find_where("automaton", |_, _| true, 0));
+        assert!(search.found().iter().take(300).all(Option::is_none));
+    }
+
+    #[test]
+    fn the_automaton_stays_small_for_the_most_and_longest_passages() {
+        // MAX_MARKS passages at the length cap, each with its own opening, so prefixes share little.
+        let mut seed: u64 = 0x2545_F491_4F6C_DD1D;
+        let passages: Vec<String> = (0..crate::host::wire::MAX_MARKS)
+            .map(|_| {
+                (0..MAX_NEEDLE_CHARS)
+                    .map(|_| {
+                        seed = seed.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1_442_695_040_888_963_407);
+                        char::from(b'a' + ((seed >> 33) % 26) as u8)
+                    })
+                    .collect()
+            })
+            .collect();
+        let mut search = FirstMatches::new(passages);
+        assert!(search.prepare(&mut || true));
+        let automaton = search.automaton.as_ref().expect("built");
+        assert_eq!(automaton.patterns_len(), crate::host::wire::MAX_MARKS);
+        // At most 2,000 × 64 bytes = 128,000 trie states; at a few dozen bytes a state that is a few
+        // megabytes. 16 MB leaves room for the library's choice of representation, and is far below
+        // the hundreds of megabytes whole passages took.
+        assert!(automaton.memory_usage() < 16 * 1024 * 1024, "{} bytes", automaton.memory_usage());
     }
 
     #[test]

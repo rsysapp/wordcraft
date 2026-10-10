@@ -7,6 +7,14 @@
 //! the document or the layout change. The pass and the placing of rectangles stop after a time
 //! budget per frame and go on in the next, so a long list on a long document never stalls a frame;
 //! painting touches only the rectangles on visible pages.
+//!
+//! Limits: the budget is looked at after each passage folded, after each paragraph searched,
+//! every `WORK_PER_CHECK` places (plus passages compared) inside one paragraph, and after each mark
+//! placed. Between two looks the work is bounded by: folding one passage (linear in its length as
+//! sent; folding stops at `MAX_NEEDLE_CHARS` folded characters), building the automaton once
+//! (at most `MAX_MARKS` × 64 bytes of prefixes: about 5 ms and 1.5 MB measured natively), comparing
+//! one place with every passage sharing its prefix (each comparison at most a passage's length),
+//! and the document's text index, built once per document and shared with jumps.
 
 use std::sync::{Arc, Weak};
 
@@ -55,7 +63,8 @@ impl Marks {
             .take(MAX_MARKS)
             .filter_map(|mark| Some((HostMark { color: parse_color(&mark.color)?, id: mark.id, page: mark.page }, mark.text)))
             .unzip();
-        let search = FirstMatches::new(texts.iter().map(String::as_str));
+        // Folded within the frame budget when first painted, not here: 2,000 long passages take a while.
+        let search = FirstMatches::new(texts);
         *self = Marks { marks, search, ..Marks::default() };
     }
 

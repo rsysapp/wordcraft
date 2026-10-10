@@ -1066,6 +1066,17 @@ fn comment_balloons_stay_clickable_beside_marked_text() {
     });
     let balloon = balloon.expect("the comment's balloon is drawn with marks set");
     assert!(mark_rects(&h).iter().all(|(rect, _)| !rect.intersects(balloon)), "a mark covers the balloon");
+    // The balloon's leader line runs from the anchor, inside the marked passage, to the page edge:
+    // it is painted after the marks, so they do not cover it.
+    let painted = shapes(&h);
+    let marked: Vec<egui::Rect> = mark_rects(&h).into_iter().map(|(rect, _)| rect.expand(1.0)).collect();
+    let last_mark = painted.iter().rposition(|s| matches!(s, egui::Shape::Rect(r) if r.fill == amber())).expect("mark painted");
+    let leader_in_mark = painted.iter().position(|s| match s {
+        egui::Shape::LineSegment { points, .. } => points.iter().any(|at| marked.iter().any(|rect| rect.contains(*at))),
+        _ => false,
+    });
+    let leader_in_mark = leader_in_mark.expect("the leader line starts inside the marked passage");
+    assert!(leader_in_mark > last_mark, "the leader line (shape {leader_in_mark}) is under the marks (last at {last_mark})");
     h.state_mut().session.sel = Selection::caret(Pos::body(0, 0));
     frames(&mut h, 2);
     bridge.take_events();
