@@ -3,6 +3,7 @@
 //! lives here so upstream merges stay easy.
 
 pub mod bridge;
+pub mod open;
 // Public only for the embed crate and the tests; not part of the desktop or web app's API.
 #[doc(hidden)]
 pub mod profile;

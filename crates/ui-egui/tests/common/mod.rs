@@ -146,3 +146,25 @@ pub fn panes_harness(app: WordApp) -> Harness<'static, WordApp> {
         app,
     )
 }
+
+use wordcraft_ui_egui::host::{HostCommand, HostEvent};
+
+/// View mode with nothing open yet, as right after `EmbeddedEditor.mount`.
+pub fn embed_app() -> (Harness<'static, WordApp>, HostBridge) {
+    view_app(Document::new(), 1.0)
+}
+
+pub fn docx(doc: &Document) -> Vec<u8> {
+    wordcraft_engine::io::save_bytes("fixture.docx", doc).expect("write docx")
+}
+
+/// Open `doc` the way a host page does; returns the events that followed.
+pub fn open_doc(h: &mut Harness<'_, WordApp>, bridge: &HostBridge, doc: &Document) -> Vec<HostEvent> {
+    bridge.send(HostCommand::Open { name: "agreement.docx".into(), bytes: docx(doc) });
+    frames(h, 4);
+    bridge.take_events()
+}
+
+pub fn pages(h: &mut Harness<'_, WordApp>) -> usize {
+    h.state_mut().session.layout().pages.len()
+}

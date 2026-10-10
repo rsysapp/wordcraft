@@ -1,0 +1,151 @@
+//! Opening a host page's file: Word documents only, with a plain message for anything that cannot
+//! be shown. The editor never asks for a password in view mode.
+//!
+//! Nothing here may panic: a panic aborts the WebAssembly module (embed API, "Crashes"). The cheap
+//! checks run before any parse, and the DOCX reader bounds what it decompresses and parses.
+
+use wordcraft_doc::Document;
+
+/// Largest file a host may open.
+pub const MAX_OPEN_BYTES: usize = 100 * 1024 * 1024;
+const WORD_EXTENSIONS: &[&str] = &["docx", "docm", "dotx"];
+/// OLE compound files: password-protected Word packages (and legacy binary files) start with this.
+const COMPOUND_FILE: [u8; 8] = [0xD0, 0xCF, 0x11, 0xE0, 0xA1, 0xB1, 0x1A, 0xE1];
+
+// The host shows these as they are, so they read like pdfcraft's: plain words, one sentence.
+pub const UNSUPPORTED: &str = "Only Word documents (.docx, .docm, .dotx) can be shown here.";
+pub const EMPTY: &str = "This file is empty and can't be shown.";
+pub const TOO_LARGE: &str = "This file is larger than 100 MB and can't be shown here.";
+pub const ENCRYPTED: &str = "This file is password-protected and can't be shown here.";
+pub const DAMAGED: &str = "This file is damaged or isn't a Word document and can't be shown.";
+
+/// Why a file named `name` of `len` bytes starting with `head` cannot be opened, before parsing it.
+pub fn precheck(name: &str, len: usize, head: &[u8]) -> Option<&'static str> {
+    let ext = name.rsplit_once('.').map(|(_, e)| e.to_ascii_lowercase()).unwrap_or_default();
+    if !WORD_EXTENSIONS.contains(&ext.as_str()) {
+        return Some(UNSUPPORTED);
+    }
+    if len == 0 {
+        return Some(EMPTY);
+    }
+    if len > MAX_OPEN_BYTES {
+        return Some(TOO_LARGE);
+    }
+    if head.starts_with(&COMPOUND_FILE) {
+        return Some(ENCRYPTED);
+    }
+    if !head.starts_with(b"PK") {
+        return Some(DAMAGED);
+    }
+    None
+}
+
+/// Parse a host's file, or answer with a message the host can show as is.
+pub fn open_document(name: &str, bytes: &[u8]) -> Result<Document, String> {
+    match precheck(name, bytes.len(), bytes.get(..COMPOUND_FILE.len()).unwrap_or(bytes)) {
+        Some(ENCRYPTED) => return Err(compound_file_problem(bytes).to_string()),
+        Some(problem) => return Err(problem.to_string()),
+        None => {}
+    }
+    // The parser's own error names zip entries and XML details, which mean nothing to the reader;
+    // it goes to the log for whoever investigates.
+    wordcraft_engine::io::open_bytes(name, bytes).map_err(|e| {
+        log::warn!("embed: a host file could not be opened: {e}");
+        DAMAGED.to_string()
+    })
+}
+
+/// An OLE compound file is either a password-protected Word package (an `EncryptedPackage` stream)
+/// or a legacy binary file such as a `.doc` renamed to `.docx` (a `WordDocument` stream). Stream
+/// names are stored in UTF-16LE in the file's directory, which may sit anywhere in the file.
+fn compound_file_problem(bytes: &[u8]) -> &'static str {
+    let contains = |name: &str| {
+        let needle: Vec<u8> = name.encode_utf16().flat_map(u16::to_le_bytes).collect();
+        bytes.windows(needle.len()).any(|w| w == needle.as_slice())
+    };
+    if !contains("EncryptedPackage") && contains("WordDocument") { UNSUPPORTED } else { ENCRYPTED }
+}
+
+#[cfg(test)]
+mod tests {
+    use wordcraft_doc::StoryRef;
+
+    use super::*;
+
+    fn utf16(name: &str) -> Vec<u8> {
+        name.encode_utf16().flat_map(u16::to_le_bytes).collect()
+    }
+
+    #[test]
+    fn word_extensions_only_in_any_case() {
+        assert_eq!(precheck("A.DOCX", 10, b"PK\x03\x04"), None);
+        assert_eq!(precheck("a.dotx", 10, b"PK"), None);
+        assert_eq!(precheck("a.DocM", 10, b"PK"), None);
+        for name in ["a.doc", "a.pdf", "a.txt", "a.json", "a.md", "docx", "", ".", "a.docx.", "a.docx\u{FFFD}", "\u{FFFD}.\u{FFFD}"] {
+            assert_eq!(precheck(name, 10, b"PK"), Some(UNSUPPORTED), "{name}");
+        }
+        // Replacement characters stand in for a name that was not valid Unicode.
+        assert_eq!(precheck("\u{FFFD}\u{1F4C4}.docx", 10, b"PK"), None);
+    }
+
+    #[test]
+    fn size_limits() {
+        assert_eq!(precheck("a.docx", 0, b""), Some(EMPTY));
+        assert_eq!(precheck("a.docx", MAX_OPEN_BYTES, b"PK"), None);
+        assert_eq!(precheck("a.docx", MAX_OPEN_BYTES + 1, b"PK"), Some(TOO_LARGE));
+        assert_eq!(precheck("a.docx", usize::MAX, b"PK"), Some(TOO_LARGE));
+    }
+
+    #[test]
+    fn short_or_foreign_heads_are_damaged() {
+        for head in [&b"P"[..], b"\0", b"%PDF-1.7", b"{\\rtf1", &COMPOUND_FILE[..7]] {
+            assert_eq!(precheck("a.docx", 10, head), Some(DAMAGED), "{head:?}");
+        }
+    }
+
+    #[test]
+    fn compound_files_are_reported_as_encrypted() {
+        assert_eq!(precheck("a.docx", 4096, &COMPOUND_FILE), Some(ENCRYPTED));
+        assert_eq!(open_document("a.docx", &COMPOUND_FILE).unwrap_err(), ENCRYPTED);
+    }
+
+    #[test]
+    fn a_legacy_word_file_renamed_to_docx_is_not_called_password_protected() {
+        let mut legacy = COMPOUND_FILE.to_vec();
+        legacy.extend(vec![0; 500]);
+        legacy.extend(utf16("WordDocument"));
+        assert_eq!(open_document("old.docx", &legacy).unwrap_err(), UNSUPPORTED);
+
+        let mut encrypted = COMPOUND_FILE.to_vec();
+        encrypted.extend(utf16("EncryptionInfo"));
+        encrypted.extend(utf16("EncryptedPackage"));
+        encrypted.extend(utf16("WordDocument"));
+        assert_eq!(open_document("locked.docx", &encrypted).unwrap_err(), ENCRYPTED);
+        assert_eq!(open_document("old.doc", &legacy).unwrap_err(), UNSUPPORTED);
+    }
+
+    #[test]
+    fn messages_are_one_plain_sentence() {
+        for message in [UNSUPPORTED, EMPTY, TOO_LARGE, ENCRYPTED, DAMAGED] {
+            assert!(message.ends_with('.') && message.matches(". ").count() == 0, "{message}");
+            assert!(!message.contains("zip") && !message.contains("XML") && !message.contains('/'), "{message}");
+        }
+    }
+
+    #[test]
+    fn a_real_docx_opens() {
+        let bytes = wordcraft_engine::io::save_bytes("x.docx", &Document::from_text("Hello")).unwrap();
+        assert_eq!(open_document("x.docx", &bytes).unwrap().plain_text(StoryRef::Body), "Hello");
+    }
+
+    #[test]
+    fn a_truncated_docx_is_damaged_at_every_length() {
+        let bytes = wordcraft_engine::io::save_bytes("x.docx", &Document::from_text("Hello")).unwrap();
+        // Every cut that removes the zip's central directory leaves no readable package.
+        for len in (1..bytes.len()).step_by(7) {
+            if let Err(message) = open_document("x.docx", bytes.get(..len).unwrap_or_default()) {
+                assert!([DAMAGED, EMPTY].contains(&message.as_str()), "{len}: {message}");
+            }
+        }
+    }
+}

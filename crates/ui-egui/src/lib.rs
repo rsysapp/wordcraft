@@ -335,6 +335,8 @@ impl WordApp {
             theme::install_fonts(ctx);
             self.styled = true;
         }
+        // embed: a host page's commands apply before this frame's layout.
+        host::state::before_frame(self);
         let dark = self.ui.dark || self.session.view.dark_mode;
         if self.applied_dark != Some(dark) {
             theme::apply(ctx, &if dark { theme::Tokens::dark() } else { theme::Tokens::light() });
@@ -436,6 +438,8 @@ impl WordApp {
                 self.last_title = title;
             }
         }
+        // embed: this frame's events for the host page.
+        host::state::after_frame(self);
         self.frame_ms = now_ms() - t0;
     }
 

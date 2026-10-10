@@ -38,6 +38,10 @@ pub struct CanvasState {
     pub want_focus: bool,
     pub context_issue: Option<serde_json::Value>,
     pub context_synonyms: Option<serde_json::Value>,
+    /// embed: a host jump's target (page index, points from the page top), scrolled to the view's top.
+    pub scroll_to_doc: Option<(usize, f32)>,
+    /// embed: the page filling most of the view last frame.
+    pub visible_page: Option<usize>,
 }
 
 impl Default for CanvasState {
@@ -60,6 +64,8 @@ impl Default for CanvasState {
             want_focus: true,
             context_issue: None,
             context_synonyms: None,
+            scroll_to_doc: None,
+            visible_page: None,
         }
     }
 }
@@ -179,6 +185,11 @@ pub fn show(app: &mut WordApp, ui: &mut Ui) {
         scroll_target = Some(r.expand2(vec2(40.0, 60.0)));
     }
     app.canvas.scroll_to_caret = false;
+    // embed: a host jump puts its target at the top of the view.
+    let host_target = app.canvas.scroll_to_doc.take().and_then(|(page, y)| {
+        let y = if y.is_finite() { y.max(0.0) } else { 0.0 };
+        geo.rects.get(page).map(|pr| Rect::from_min_size(pos2(pr.min.x, pr.min.y + y * geo.scale), vec2(pr.width(), 1.0)))
+    });
     let mut origin = area.min;
     let mut ui_area = ui.new_child(egui::UiBuilder::new().max_rect(area));
     let out = egui::ScrollArea::both().id_salt("canvas_scroll").auto_shrink([false, false]).show_viewport(&mut ui_area, |ui, viewport| {
@@ -188,6 +199,12 @@ pub fn show(app: &mut WordApp, ui: &mut Ui) {
         if let Some(tr) = scroll_target {
             ui.scroll_to_rect(Rect::from_min_size(ui.min_rect().min + tr.min.to_vec2(), tr.size()), None);
         }
+        // embed: after the caret's scroll, so a host jump wins when both are pending.
+        if let Some(tr) = host_target {
+            ui.scroll_to_rect(Rect::from_min_size(ui.min_rect().min + tr.min.to_vec2(), tr.size()), Some(egui::Align::TOP));
+        }
+        // embed: the host hears which page is in view.
+        app.canvas.visible_page = crate::host::view::visible_page(&geo.rects, viewport);
         let painter = ui.painter_at(ui.clip_rect());
         let ppp = ui.ctx().pixels_per_point();
         let max_tex = ui.ctx().input(|i| i.max_texture_side) as f32;
