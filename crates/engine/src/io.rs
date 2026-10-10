@@ -27,6 +27,17 @@ pub fn open_bytes(name: &str, bytes: &[u8]) -> Result<Document, String> {
     Ok(doc)
 }
 
+// embed: a caller with less memory than the desktop (the embed build in a browser tab) opens Word
+// packages within tighter limits, and tells a refusal for size apart from a broken file.
+pub use wordcraft_docx::{DocxError, ReadLimits};
+
+/// A Word package (`.docx`, `.docm`, `.dotx`) read within `limits`, as [`open_bytes`] reads one.
+pub fn open_docx_with_limits(bytes: &[u8], limits: &ReadLimits) -> Result<Document, DocxError> {
+    let mut doc = wordcraft_docx::read_with_limits(bytes, limits)?;
+    doc.ensure_nonempty();
+    Ok(doc)
+}
+
 /// Serialise a document; `name` gives the format by extension.
 pub fn save_bytes(name: &str, doc: &Document) -> Result<Vec<u8>, String> {
     let ext = ext_of(name);
@@ -83,5 +94,23 @@ pub fn decode_text(b: &[u8]) -> String {
     match std::str::from_utf8(b) {
         Ok(s) => s.to_string(),
         Err(_) => b.iter().map(|c| *c as char).collect(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_word_package_opens_within_the_callers_limits() {
+        let bytes = save_bytes("x.docx", &Document::from_text("Hello\nWorld")).expect("write docx");
+        let opened = open_docx_with_limits(&bytes, &ReadLimits::default()).expect("opens with the defaults");
+        assert_eq!(
+            opened.plain_text(wordcraft_doc::StoryRef::Body),
+            open_bytes("x.docx", &bytes).expect("opens").plain_text(wordcraft_doc::StoryRef::Body)
+        );
+        let tight = ReadLimits { max_elements: 3, ..ReadLimits::default() };
+        assert!(matches!(open_docx_with_limits(&bytes, &tight), Err(DocxError::Limit(_))));
+        assert!(matches!(open_docx_with_limits(b"not a zip", &ReadLimits::default()), Err(DocxError::Zip(_))));
     }
 }

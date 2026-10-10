@@ -1,5 +1,6 @@
 //! OPC package access: bounded zip reading, relationships, part names.
 
+use std::cell::Cell;
 use std::collections::BTreeMap;
 use std::io::{Cursor, Read, Write};
 
@@ -39,17 +40,48 @@ pub fn rel_is(t: &str, full: &str) -> bool {
     t == full || tail(t) == tail(full)
 }
 
+/// embed: how much of a package [`crate::read_with_limits`] may decompress and parse. A caller with
+/// less memory than the desktop (a browser tab) passes tighter limits; the defaults are [`crate::read`]'s.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ReadLimits {
+    /// Largest single part decompressed, in bytes.
+    pub max_part_bytes: u64,
+    /// Largest total of all decompressed parts, in bytes.
+    pub max_total_bytes: u64,
+    /// Most XML elements parsed across every part of the package (each part also stays within the
+    /// parser's own per-part limit). Every parse counts, so a part read twice counts twice.
+    pub max_elements: usize,
+}
+
+impl Default for ReadLimits {
+    fn default() -> Self {
+        ReadLimits { max_part_bytes: MAX_PART, max_total_bytes: MAX_TOTAL, max_elements: usize::MAX }
+    }
+}
+
 /// The decompressed parts of a package (bounded).
 pub struct Package {
     files: BTreeMap<String, Vec<u8>>,
+    /// embed: elements `xml` may still parse, and whether a parse ran out of them. The reader skips
+    /// a broken secondary part, so a spent budget is recorded here and refused at the end.
+    elements_left: Cell<usize>,
+    budget_spent: Cell<bool>,
 }
 
 impl Package {
+    // embed: the reader opens through `open_with`; these two remain for the tests below.
+    #[cfg(test)]
     pub fn open(bytes: &[u8]) -> Result<Package, DocxError> {
-        Package::open_limited(bytes, MAX_PART, MAX_TOTAL)
+        Package::open_with(bytes, &ReadLimits::default())
     }
 
+    #[cfg(test)]
     pub fn open_limited(bytes: &[u8], max_part: u64, max_total: u64) -> Result<Package, DocxError> {
+        Package::open_with(bytes, &ReadLimits { max_part_bytes: max_part, max_total_bytes: max_total, ..ReadLimits::default() })
+    }
+
+    pub fn open_with(bytes: &[u8], limits: &ReadLimits) -> Result<Package, DocxError> {
+        let (max_part, max_total) = (limits.max_part_bytes, limits.max_total_bytes);
         let mut zip = zip::ZipArchive::new(Cursor::new(bytes)).map_err(|e| DocxError::Zip(e.to_string()))?;
         if zip.len() > MAX_ENTRIES {
             return Err(DocxError::Limit(format!("{} zip entries", zip.len())));
@@ -85,7 +117,12 @@ impl Package {
             total = total.saturating_add(buf.len() as u64);
             files.insert(name, buf);
         }
-        Ok(Package { files })
+        Ok(Package { files, elements_left: Cell::new(limits.max_elements), budget_spent: Cell::new(false) })
+    }
+
+    /// embed: whether a part was refused because the package's element budget ran out.
+    pub fn budget_spent(&self) -> bool {
+        self.budget_spent.get()
     }
 
     /// Part bytes by name (leading `/` ignored; case-insensitive fallback).
@@ -98,9 +135,20 @@ impl Package {
     }
 
     pub fn xml(&self, name: &str) -> Result<Option<El>, DocxError> {
-        match self.get(name) {
-            Some(b) => xml::parse(b).map(Some),
-            None => Ok(None),
+        let Some(b) = self.get(name) else { return Ok(None) };
+        // embed: one element budget across the package, so many parts cannot each fill the per-part limit.
+        let left = self.elements_left.get();
+        match xml::parse_limited(b, left.min(xml::MAX_ELEMENTS)) {
+            Ok((root, used)) => {
+                self.elements_left.set(left.saturating_sub(used));
+                Ok(Some(root))
+            }
+            Err(e) => {
+                if left < xml::MAX_ELEMENTS && matches!(&e, DocxError::Limit(m) if m == xml::TOO_MANY_ELEMENTS) {
+                    self.budget_spent.set(true);
+                }
+                Err(e)
+            }
         }
     }
 

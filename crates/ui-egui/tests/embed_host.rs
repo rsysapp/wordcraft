@@ -96,16 +96,30 @@ fn a_jump_past_the_last_page_or_with_a_wild_offset_moves_nothing_and_never_panic
 
 // --- Malformed input: every class answers `openFailed` and leaves the open document showing. ---
 
-/// CRC-32 (IEEE), so a stored entry reads back as valid.
-fn crc32(data: &[u8]) -> u32 {
-    let mut crc = !0u32;
-    for byte in data {
-        crc ^= u32::from(*byte);
-        for _ in 0..8 {
-            crc = if crc & 1 == 1 { (crc >> 1) ^ 0xEDB8_8320 } else { crc >> 1 };
+/// CRC-32 (IEEE), table-driven so the large fixtures below stay quick; real CRCs mean a refusal
+/// can only come from the limit being tested, never from a checksum.
+fn crc32_update(crc: u32, data: &[u8]) -> u32 {
+    static TABLE: std::sync::OnceLock<[u32; 256]> = std::sync::OnceLock::new();
+    let table = TABLE.get_or_init(|| {
+        let mut table = [0u32; 256];
+        for (i, slot) in table.iter_mut().enumerate() {
+            let mut c = i as u32;
+            for _ in 0..8 {
+                c = if c & 1 == 1 { (c >> 1) ^ 0xEDB8_8320 } else { c >> 1 };
+            }
+            *slot = c;
         }
+        table
+    });
+    let mut crc = !crc;
+    for byte in data {
+        crc = table[((crc ^ u32::from(*byte)) & 0xFF) as usize] ^ (crc >> 8);
     }
     !crc
+}
+
+fn crc32(data: &[u8]) -> u32 {
+    crc32_update(0, data)
 }
 
 struct Entry {
@@ -119,6 +133,25 @@ struct Entry {
 impl Entry {
     fn stored(name: &'static str, data: &[u8]) -> Entry {
         Entry { name, method: 0, data: data.to_vec(), crc: crc32(data), declared_size: data.len() as u32 }
+    }
+
+    /// `prefix`, then `len` copies of `fill`, then `suffix`, deflated to about `len / 160` bytes,
+    /// with its real CRC; `declared` is the size its headers claim.
+    fn bomb(name: &'static str, prefix: &[u8], fill: u8, len: usize, suffix: &[u8], declared: u32) -> Entry {
+        let mut crc = crc32_update(0, prefix);
+        let chunk = vec![fill; 1 << 20];
+        let mut left = len;
+        while left > 0 {
+            let take = left.min(chunk.len());
+            crc = crc32_update(crc, &chunk[..take]);
+            left -= take;
+        }
+        crc = crc32_update(crc, suffix);
+        Entry { name, method: 8, data: deflate_fill(prefix, fill, len, suffix), crc, declared_size: declared }
+    }
+
+    fn real_size(&self) -> usize {
+        self.declared_size as usize
     }
 }
 
@@ -164,9 +197,10 @@ fn zip(entries: &[Entry]) -> Vec<u8> {
     out
 }
 
-/// A raw deflate stream (one fixed-Huffman block) that inflates to `len` zero bytes from about
-/// `len / 160` bytes: one literal, then copies of 258 bytes at distance 1.
-fn deflate_zeros(len: usize) -> Vec<u8> {
+/// A raw deflate stream (one fixed-Huffman block): `prefix` as literals, `len` bytes of `fill` as
+/// one literal and copies of 258 bytes at distance 1, then `suffix` as literals. Every byte must be
+/// below 144, which covers ASCII.
+fn deflate_fill(prefix: &[u8], fill: u8, len: usize, suffix: &[u8]) -> Vec<u8> {
     struct Bits {
         out: Vec<u8>,
         acc: u32,
@@ -190,15 +224,27 @@ fn deflate_zeros(len: usize) -> Vec<u8> {
                 self.put((code >> i) & 1, 1);
             }
         }
+        fn literal(&mut self, byte: u8) {
+            assert!(byte < 144, "8-bit literal codes only");
+            self.code(0x30 + u32::from(byte), 8);
+        }
     }
     let mut bits = Bits { out: Vec::new(), acc: 0, n: 0 };
     bits.put(1, 1); // final block
     bits.put(1, 2); // fixed Huffman codes
-    bits.code(0x30, 8); // literal 0
-    for _ in 0..(len - 1) / 258 {
-        bits.code(0xC5, 8); // length 258 (code 285)
-        bits.code(0, 5); // distance 1
+    prefix.iter().for_each(|b| bits.literal(*b));
+    if len > 0 {
+        bits.literal(fill);
+        let copies = (len - 1) / 258;
+        for _ in 0..copies {
+            bits.code(0xC5, 8); // length 258 (code 285)
+            bits.code(0, 5); // distance 1
+        }
+        for _ in 0..(len - 1) % 258 {
+            bits.literal(fill);
+        }
     }
+    suffix.iter().for_each(|b| bits.literal(*b));
     bits.code(0, 7); // end of block
     bits.put(0, 7);
     bits.out
@@ -208,9 +254,29 @@ fn content_types() -> Entry {
     Entry::stored("[Content_Types].xml", br#"<?xml version="1.0"?><Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"/>"#)
 }
 
+const DOCUMENT_START: &[u8] =
+    br#"<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:body><w:p><w:r><w:t>Hello</w:t></w:r></w:p>"#;
+const DOCUMENT_END: &[u8] = b"</w:body></w:document>";
+
+/// A valid document whose `document.xml` is padded with `spaces` spaces between paragraphs, so
+/// without a size limit it would open; `declared` is what its headers claim.
+fn padded_document(spaces: usize, declared: u32) -> Vec<u8> {
+    zip(&[content_types(), Entry::bomb("word/document.xml", DOCUMENT_START, b' ', spaces, DOCUMENT_END, declared)])
+}
+
+/// A valid document whose body holds `elements` empty unknown elements, which the reader parses
+/// and then ignores: the package holds `elements + 2` elements in all.
+fn document_with_elements(elements: usize) -> Vec<u8> {
+    let mut xml = br#"<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">"#.to_vec();
+    xml.extend(b"<w:body>");
+    xml.extend(b"<w:x/>".repeat(elements));
+    xml.extend(b"</w:body></w:document>");
+    zip(&[content_types(), Entry::stored("word/document.xml", &xml)])
+}
+
 /// One file per class of input the embed build must refuse without crashing.
 fn malformed_files() -> Vec<(String, Vec<u8>, &'static str)> {
-    use wordcraft_ui_egui::host::open::{DAMAGED, EMPTY, ENCRYPTED, MAX_OPEN_BYTES, TOO_LARGE, UNSUPPORTED};
+    use wordcraft_ui_egui::host::open::{DAMAGED, EMBED_LIMITS, EMPTY, ENCRYPTED, MAX_OPEN_BYTES, TOO_LARGE, UNSUPPORTED};
     let good = docx(&clauses(2));
     let mut legacy_word = vec![0xD0, 0xCF, 0x11, 0xE0, 0xA1, 0xB1, 0x1A, 0xE1];
     legacy_word.extend([0u8; 504]);
@@ -220,9 +286,9 @@ fn malformed_files() -> Vec<(String, Vec<u8>, &'static str)> {
     encrypted.extend("EncryptedPackage".encode_utf16().flat_map(u16::to_le_bytes));
     let mut too_large = vec![0u8; MAX_OPEN_BYTES + 1];
     too_large[..2].copy_from_slice(b"PK");
-    let bomb_size = 300 * 1024 * 1024;
-    let bomb = deflate_zeros(bomb_size);
-    let bomb_crc = 0;
+    // Past the embed build's per-part limit, honest about it or not.
+    let spaces = EMBED_LIMITS.max_part_bytes as usize + 16 * 1024 * 1024;
+    let honest = (spaces + DOCUMENT_START.len() + DOCUMENT_END.len()) as u32;
     vec![
         ("empty.docx".into(), Vec::new(), EMPTY),
         ("one-byte.docx".into(), b"P".to_vec(), DAMAGED),
@@ -237,19 +303,8 @@ fn malformed_files() -> Vec<(String, Vec<u8>, &'static str)> {
         ("no-word-part.docx".into(), zip(&[content_types()]), DAMAGED),
         ("not-xml.docx".into(), zip(&[content_types(), Entry::stored("word/document.xml", b"<w:document><w:body><w:p>")]), DAMAGED),
         ("other-xml.docx".into(), zip(&[content_types(), Entry::stored("word/document.xml", b"<html/>")]), DAMAGED),
-        (
-            "huge-part.docx".into(),
-            zip(&[
-                content_types(),
-                Entry { name: "word/document.xml", method: 8, data: bomb.clone(), crc: bomb_crc, declared_size: bomb_size as u32 },
-            ]),
-            DAMAGED,
-        ),
-        (
-            "lying-bomb.docx".into(),
-            zip(&[content_types(), Entry { name: "word/document.xml", method: 8, data: bomb, crc: bomb_crc, declared_size: 1024 }]),
-            DAMAGED,
-        ),
+        ("huge-part.docx".into(), padded_document(spaces, honest), TOO_LARGE),
+        ("lying-bomb.docx".into(), padded_document(spaces, 1024), TOO_LARGE),
     ]
 }
 
@@ -307,4 +362,59 @@ fn a_host_jump_wins_over_a_caret_scroll_from_the_same_frame() {
     frames(&mut h, 6);
     assert_eq!(h.state().canvas.visible_page, Some(4));
     assert_eq!(bridge.take_events(), vec![HostEvent::PageChanged { page: 5 }]);
+}
+
+// --- The embed build's decompression and parse limits ---
+
+#[test]
+fn a_part_just_over_the_embed_limit_is_too_large_and_one_at_it_opens() {
+    use wordcraft_ui_egui::host::open::{EMBED_LIMITS, TOO_LARGE, open_document};
+    let room = EMBED_LIMITS.max_part_bytes as usize - DOCUMENT_START.len() - DOCUMENT_END.len();
+    for declared in [None, Some(1024)] {
+        let fits = padded_document(room, declared.unwrap_or((room + DOCUMENT_START.len() + DOCUMENT_END.len()) as u32));
+        let over = padded_document(room + 1, declared.unwrap_or((room + 1 + DOCUMENT_START.len() + DOCUMENT_END.len()) as u32));
+        assert_eq!(open_document("big.docx", &over).err().as_deref(), Some(TOO_LARGE), "declared {declared:?}");
+        // A lying size is caught by the decompression cap; an honest one at the limit is read.
+        if declared.is_none() {
+            let doc = open_document("big.docx", &fits).expect("a part at the limit opens");
+            assert!(doc.plain_text(wordcraft_doc::StoryRef::Body).starts_with("Hello"));
+        }
+    }
+}
+
+#[test]
+fn parts_just_over_the_embed_total_are_too_large() {
+    use wordcraft_ui_egui::host::open::{EMBED_LIMITS, TOO_LARGE, open_document};
+    let part = EMBED_LIMITS.max_part_bytes as usize;
+    let parts = (EMBED_LIMITS.max_total_bytes / EMBED_LIMITS.max_part_bytes) as usize;
+    let filler = |name: &'static str, len: usize| Entry::bomb(name, b"", b'0', len, b"", len as u32);
+    let package = |last: usize| {
+        let mut entries = vec![content_types(), Entry::stored("word/document.xml", &[DOCUMENT_START, DOCUMENT_END].concat())];
+        let used: usize = entries.iter().map(Entry::real_size).sum();
+        let names = ["word/media/a.bin", "word/media/b.bin", "word/media/c.bin", "word/media/d.bin"];
+        for name in names.iter().take(parts - 1) {
+            entries.push(filler(name, part));
+        }
+        // The last part brings the total to exactly the limit, plus `last`.
+        let total_before = used + part * (parts - 1);
+        entries.push(filler(names[parts - 1], EMBED_LIMITS.max_total_bytes as usize - total_before + last));
+        zip(&entries)
+    };
+    assert_eq!(open_document("many.docx", &package(1)).err().as_deref(), Some(TOO_LARGE));
+    assert!(open_document("many.docx", &package(0)).is_ok(), "exactly the total opens");
+}
+
+#[test]
+fn elements_just_over_the_embed_budget_are_too_large_and_at_it_open() {
+    use wordcraft_ui_egui::host::open::{EMBED_LIMITS, TOO_LARGE, open_document};
+    let budget = EMBED_LIMITS.max_elements;
+    assert_eq!(open_document("dense.docx", &document_with_elements(budget - 2 + 1)).err().as_deref(), Some(TOO_LARGE));
+    assert!(open_document("dense.docx", &document_with_elements(budget - 2)).is_ok());
+}
+
+#[test]
+fn a_normal_document_opens_within_the_embed_limits() {
+    use wordcraft_ui_egui::host::open::open_document;
+    let doc = open_document("agreement.docx", &docx(&clauses(400))).expect("opens");
+    assert!(doc.plain_text(wordcraft_doc::StoryRef::Body).contains("Clause 400."));
 }

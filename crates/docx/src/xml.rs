@@ -160,8 +160,17 @@ impl El {
     }
 }
 
+/// The error `parse_limited` answers when a part holds more elements than it may.
+pub const TOO_MANY_ELEMENTS: &str = "too many XML elements";
+
 /// Parse XML bytes into the root element.
 pub fn parse(bytes: &[u8]) -> Result<El, DocxError> {
+    parse_limited(bytes, MAX_ELEMENTS).map(|(root, _)| root)
+}
+
+/// embed: [`parse`] with at most `max_elements` elements; also answers how many it read, so a
+/// package can spend one budget across its parts.
+pub fn parse_limited(bytes: &[u8], max_elements: usize) -> Result<(El, usize), DocxError> {
     // Strip a UTF-8 BOM; UTF-16 parts are rare in OOXML and rejected.
     let bytes = bytes.strip_prefix(&[0xEF, 0xBB, 0xBF][..]).unwrap_or(bytes);
     if bytes.starts_with(&[0xFF, 0xFE]) || bytes.starts_with(&[0xFE, 0xFF]) {
@@ -189,8 +198,8 @@ pub fn parse(bytes: &[u8]) -> Result<El, DocxError> {
         match ev {
             Event::Start(ref e) | Event::Empty(ref e) => {
                 count += 1;
-                if count > MAX_ELEMENTS {
-                    return Err(DocxError::Limit("too many XML elements".into()));
+                if count > max_elements {
+                    return Err(DocxError::Limit(TOO_MANY_ELEMENTS.into()));
                 }
                 let local = String::from_utf8_lossy(e.local_name().as_ref()).into_owned();
                 let name = match el_prefix {
@@ -269,7 +278,7 @@ pub fn parse(bytes: &[u8]) -> Result<El, DocxError> {
     while let Some(el) = stack.pop() {
         attach(&mut stack, &mut root, el);
     }
-    root.ok_or_else(|| DocxError::Xml("no root element".into()))
+    root.map(|root| (root, count)).ok_or_else(|| DocxError::Xml("no root element".into()))
 }
 
 fn push_text(top: &mut El, s: &str) {

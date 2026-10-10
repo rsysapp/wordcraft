@@ -13,7 +13,7 @@ use wordcraft_doc::styles::{Style, StyleKind, StyleSheet, TableStyleParts};
 use wordcraft_doc::{Blocks, Comment, Document, PartKind, Revision, RevisionKind};
 
 use crate::DocxError;
-use crate::package::{Package, Rels, rt};
+use crate::package::{Package, ReadLimits, Rels, rt};
 use crate::units::{flag, int, on_off, tw, u32_of};
 use crate::xml::El;
 pub(crate) use props::PropCtx;
@@ -38,7 +38,12 @@ pub(crate) struct Reader<'p> {
 
 /// Read a `.docx` package.
 pub fn read(bytes: &[u8]) -> Result<Document, DocxError> {
-    let pkg = Package::open(bytes)?;
+    read_with_limits(bytes, &ReadLimits::default())
+}
+
+/// embed: [`read`] within `limits`; a package past any of them is refused with [`DocxError::Limit`].
+pub fn read_with_limits(bytes: &[u8], limits: &ReadLimits) -> Result<Document, DocxError> {
+    let pkg = Package::open_with(bytes, limits)?;
     let root_rels = pkg.rels("");
     let main = root_rels.by_type(rt::OFFICE_DOC).filter(|r| !r.external).map(|r| r.target.clone()).unwrap_or_else(|| "word/document.xml".to_string());
     let Some(root) = pkg.xml(&main)? else {
@@ -116,6 +121,10 @@ pub fn read(bytes: &[u8]) -> Result<Document, DocxError> {
         && let Some(b) = pkg.get(&c.target)
     {
         r.doc.passthrough.insert("docProps/custom.xml".into(), Arc::new(b.to_vec()));
+    }
+    // embed: a skipped part must not pass for a whole document when the budget ran out.
+    if pkg.budget_spent() {
+        return Err(DocxError::Limit("too many XML elements in the package".into()));
     }
     let mut doc = r.doc;
     doc.ensure_nonempty();

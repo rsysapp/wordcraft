@@ -3,7 +3,7 @@
 use std::io::Write;
 
 use proptest::prelude::*;
-use wordcraft_docx::{DocxError, read, write};
+use wordcraft_docx::{DocxError, ReadLimits, read, read_with_limits, write};
 
 const W_NS: &str = r#"xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships""#;
 const ROOT_RELS: &str = r#"<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="word/document.xml"/></Relationships>"#;
@@ -190,4 +190,55 @@ proptest! {
         z.extend(&bytes);
         let _ = read(&z);
     }
+}
+
+/// A document of `paragraphs` one-run paragraphs (3 elements each) with a styles part of `styles`
+/// empty styles, and how many elements its parts hold in all.
+fn counted_package(paragraphs: usize, styles: usize) -> (Vec<u8>, usize) {
+    let body = "<w:p><w:r><w:t>x</w:t></w:r></w:p>".repeat(paragraphs);
+    let document = format!(r#"<w:document {W_NS}><w:body>{body}</w:body></w:document>"#);
+    let styles_xml = format!(r#"<w:styles {W_NS}>{}</w:styles>"#, "<w:style/>".repeat(styles));
+    let doc_rels = r#"<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/styles" Target="styles.xml"/></Relationships>"#;
+    let z = zip(&[
+        ("_rels/.rels", ROOT_RELS.as_bytes()),
+        ("word/document.xml", document.as_bytes()),
+        ("word/_rels/document.xml.rels", doc_rels.as_bytes()),
+        ("word/styles.xml", styles_xml.as_bytes()),
+    ]);
+    // Root rels 2, document 2 + 3 per paragraph, document rels 2, styles 1 + one per style.
+    (z, 2 + 2 + 3 * paragraphs + 2 + 1 + styles)
+}
+
+#[test]
+fn default_limits_are_unchanged() {
+    let (z, _) = counted_package(1_000, 10);
+    assert_eq!(read_with_limits(&z, &ReadLimits::default()).map(|d| d.body.len()), read(&z).map(|d| d.body.len()));
+    let limits = ReadLimits::default();
+    assert_eq!((limits.max_part_bytes, limits.max_total_bytes, limits.max_elements), (256 << 20, 512 << 20, usize::MAX));
+}
+
+#[test]
+fn a_caller_can_read_under_tighter_limits() {
+    let (z, elements) = counted_package(1_000, 10);
+    let with = |change: fn(&mut ReadLimits, usize)| {
+        let mut limits = ReadLimits::default();
+        change(&mut limits, elements);
+        read_with_limits(&z, &limits)
+    };
+    assert!(with(|l, n| l.max_elements = n).is_ok(), "exactly the package's elements fit");
+    assert!(matches!(with(|l, n| l.max_elements = n - 1), Err(DocxError::Limit(_))));
+    assert!(matches!(with(|l, _| l.max_part_bytes = 10_000), Err(DocxError::Limit(_))), "document.xml is about 36 KB");
+    assert!(matches!(with(|l, _| l.max_total_bytes = 30_000), Err(DocxError::Limit(_))));
+}
+
+#[test]
+fn the_element_budget_spans_every_part_and_is_never_skipped() {
+    // Each part alone fits, together they do not. The styles part is read leniently (a broken one
+    // is skipped), but a spent budget must refuse the file rather than show it without its styles.
+    let (z, elements) = counted_package(1_000, 2_000);
+    let limits = ReadLimits { max_elements: elements - 1, ..ReadLimits::default() };
+    assert!(matches!(read_with_limits(&z, &limits), Err(DocxError::Limit(_))));
+    assert!(read_with_limits(&z, &ReadLimits { max_elements: elements, ..ReadLimits::default() }).is_ok());
+    let (document_part, styles_part) = (2 + 3 * 1_000, 1 + 2_000);
+    assert!(elements - 1 > document_part.max(styles_part), "each part alone is under the budget");
 }

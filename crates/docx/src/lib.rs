@@ -13,7 +13,8 @@ mod units;
 mod write;
 mod xml;
 
-pub use read::read;
+pub use package::ReadLimits;
+pub use read::{read, read_with_limits};
 pub use write::write;
 
 /// Errors from reading or writing a DOCX package.

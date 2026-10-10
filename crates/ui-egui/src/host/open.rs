@@ -5,9 +5,20 @@
 //! checks run before any parse, and the DOCX reader bounds what it decompresses and parses.
 
 use wordcraft_doc::Document;
+use wordcraft_engine::io::{DocxError, ReadLimits};
 
 /// Largest file a host may open.
 pub const MAX_OPEN_BYTES: usize = 100 * 1024 * 1024;
+
+/// How much of a Word package the embed build decompresses and parses. A failed allocation aborts a
+/// WebAssembly module, and its memory never shrinks, so these sit well below the desktop's limits
+/// (256 MiB a part, 512 MiB in all, 8 million elements a part). Reading peaks at about 190 to 630
+/// bytes per XML element (measured: empty-paragraph floods cost the most), so 2 million elements
+/// stay near 1.3 GB at worst, leaving the rest of the 4 GiB address space for layout and pages. A
+/// formatted page holds roughly a thousand elements, so real documents of a couple of thousand
+/// pages fit. Pictures make up most of a package's bytes: 64 MiB for one is generous, and 192 MiB
+/// in all leaves room beside the up-to-100 MB file itself.
+pub const EMBED_LIMITS: ReadLimits = ReadLimits { max_part_bytes: 64 << 20, max_total_bytes: 192 << 20, max_elements: 2_000_000 };
 const WORD_EXTENSIONS: &[&str] = &["docx", "docm", "dotx"];
 /// OLE compound files: password-protected Word packages (and legacy binary files) start with this.
 const COMPOUND_FILE: [u8; 8] = [0xD0, 0xCF, 0x11, 0xE0, 0xA1, 0xB1, 0x1A, 0xE1];
@@ -15,7 +26,8 @@ const COMPOUND_FILE: [u8; 8] = [0xD0, 0xCF, 0x11, 0xE0, 0xA1, 0xB1, 0x1A, 0xE1];
 // The host shows these as they are, so they read like pdfcraft's: plain words, one sentence.
 pub const UNSUPPORTED: &str = "Only Word documents (.docx, .docm, .dotx) can be shown here.";
 pub const EMPTY: &str = "This file is empty and can't be shown.";
-pub const TOO_LARGE: &str = "This file is larger than 100 MB and can't be shown here.";
+/// For a file over `MAX_OPEN_BYTES` and for one whose contents exceed `EMBED_LIMITS` alike.
+pub const TOO_LARGE: &str = "This file is too large or complex to be shown here.";
 pub const ENCRYPTED: &str = "This file is password-protected and can't be shown here.";
 pub const DAMAGED: &str = "This file is damaged or isn't a Word document and can't be shown.";
 
@@ -49,9 +61,13 @@ pub fn open_document(name: &str, bytes: &[u8]) -> Result<Document, String> {
     }
     // The parser's own error names zip entries and XML details, which mean nothing to the reader;
     // it goes to the log for whoever investigates.
-    wordcraft_engine::io::open_bytes(name, bytes).map_err(|e| {
+    wordcraft_engine::io::open_docx_with_limits(bytes, &EMBED_LIMITS).map_err(|e| {
         log::warn!("embed: a host file could not be opened: {e}");
-        DAMAGED.to_string()
+        match e {
+            DocxError::Limit(_) => TOO_LARGE,
+            _ => DAMAGED,
+        }
+        .to_string()
     })
 }
 
