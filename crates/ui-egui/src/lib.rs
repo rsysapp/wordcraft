@@ -439,7 +439,7 @@ impl WordApp {
             }
         }
         // embed: this frame's events for the host page.
-        host::state::after_frame(self);
+        host::state::after_frame(self, &ctx);
         self.frame_ms = now_ms() - t0;
     }
 

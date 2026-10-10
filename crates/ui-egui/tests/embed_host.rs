@@ -3,7 +3,11 @@
 mod common;
 
 use common::*;
-use wordcraft_ui_egui::host::{HostCommand, HostEvent};
+use wordcraft_doc::{Document, Pos};
+use wordcraft_engine::Session;
+use wordcraft_ui_egui::host::text_match::MAX_NEEDLE_CHARS;
+use wordcraft_ui_egui::host::{EmbedProfile, HostBridge, HostCommand, HostEvent, JumpTarget};
+use wordcraft_ui_egui::{Services, WordApp};
 
 #[test]
 fn opening_a_word_document_answers_opened_and_page_one() {
@@ -417,4 +421,355 @@ fn a_normal_document_opens_within_the_embed_limits() {
     use wordcraft_ui_egui::host::open::open_document;
     let doc = open_document("agreement.docx", &docx(&clauses(400))).expect("opens");
     assert!(doc.plain_text(wordcraft_doc::StoryRef::Body).contains("Clause 400."));
+}
+
+// --- jumpTo: pages and passages ---
+
+fn text_target(text: &str, page: Option<u32>, occurrence: u32) -> JumpTarget {
+    JumpTarget::Text { text: text.into(), page, occurrence }
+}
+
+fn page_target(h: &egui_kittest::Harness<'_, WordApp>) -> Option<usize> {
+    h.state().host.as_ref().and_then(|host| host.page_target())
+}
+
+/// Where the selection's start is drawn this frame, if its page is on screen.
+fn selection_start_on_screen(h: &mut egui_kittest::Harness<'_, WordApp>) -> Option<egui::Pos2> {
+    let start = h.state().session.sel.ordered().0;
+    let app = h.state_mut();
+    let caret = app.session.layout().caret_on(&start, app.session.page_hint)?;
+    wordcraft_ui_egui::canvas::page_to_screen(app, caret.page, caret.x, caret.top + caret.height / 2.0)
+}
+
+/// The paragraph positions of "The Supplier" in each clause that starts on page index `page`.
+fn clause_starts_on(h: &mut egui_kittest::Harness<'_, WordApp>, clauses: usize, page: usize) -> Vec<Pos> {
+    let app = h.state_mut();
+    let layout = app.session.layout();
+    (0..clauses).map(|i| Pos::body(i, format!("Clause {}. ", i + 1).len())).filter(|p| layout.page_of(p) == Some(page)).collect()
+}
+
+#[test]
+fn jumping_to_a_page_puts_its_top_at_the_top_of_the_view() {
+    let (mut h, bridge) = embed_app();
+    open_doc(&mut h, &bridge, &clauses(120));
+    bridge.send(HostCommand::JumpTo(JumpTarget::Page { page: 3 }));
+    frames(&mut h, 4);
+    assert_eq!(bridge.take_events(), vec![HostEvent::PageChanged { page: 3 }]);
+    let app = h.state();
+    let (page, view) = (app.canvas.page_rects[2], app.canvas.canvas_rect.expect("canvas"));
+    assert!((page.min.y - view.min.y).abs() < 2.0, "page 3 top at {}, view top at {}", page.min.y, view.min.y);
+    assert_eq!(page_target(&h), Some(2));
+}
+
+#[test]
+fn jumping_to_text_selects_the_folded_match_and_scrolls_to_it() {
+    let (mut h, bridge) = embed_app();
+    open_doc(&mut h, &bridge, &clauses(120));
+    bridge.send(HostCommand::JumpTo(text_target("CLAUSE 77. the  supplier", None, 0)));
+    frames(&mut h, 4);
+    assert_eq!(h.state().session.selected_text(), "Clause 77. The Supplier");
+    let page = {
+        let app = h.state_mut();
+        app.session.layout().page_of(&app.session.sel.ordered().0).expect("laid out")
+    };
+    let events = bridge.take_events();
+    assert_eq!(events, vec![HostEvent::PageChanged { page: page as u32 + 1 }], "the passage's page is reported");
+    assert!(!events.iter().any(|e| matches!(e, HostEvent::Selection { .. })), "a jump is not a person's selection");
+    assert_eq!(page_target(&h), Some(page));
+    // The passage is on screen, below the top of the view by no more than the jump's margin.
+    let view = h.state().canvas.canvas_rect.expect("canvas");
+    let at = selection_start_on_screen(&mut h).expect("the passage's page is on screen");
+    assert!(view.contains(at), "the passage at {at:?} is outside the view {view:?}");
+    let margin = 60.0 * h.state().canvas.scale;
+    assert!(at.y - view.min.y <= margin + 20.0, "the passage sits {} below the view's top", at.y - view.min.y);
+}
+
+#[test]
+fn page_and_occurrence_narrow_a_text_jump() {
+    let (mut h, bridge) = embed_app();
+    open_doc(&mut h, &bridge, &clauses(120));
+    let on_page_two = clause_starts_on(&mut h, 120, 1);
+    assert!(on_page_two.len() >= 2, "fixture has too few clauses on page 2");
+    bridge.send(HostCommand::JumpTo(text_target("the supplier shall deliver", Some(2), 1)));
+    frames(&mut h, 4);
+    assert_eq!(h.state().session.sel.ordered().0, on_page_two[1]);
+    assert_eq!(h.state().session.selected_text(), "The Supplier shall deliver");
+    assert_eq!(bridge.take_events(), vec![HostEvent::PageChanged { page: 2 }]);
+    // Without a page, the occurrence counts through the whole document.
+    bridge.send(HostCommand::JumpTo(text_target("the supplier shall deliver", None, 76)));
+    frames(&mut h, 4);
+    assert_eq!(h.state().session.sel.ordered().0, Pos::body(76, "Clause 77. ".len()));
+    // The last match on a page is found; one past it is not.
+    let last = on_page_two.len() as u32 - 1;
+    bridge.take_events();
+    bridge.send(HostCommand::JumpTo(text_target("the supplier shall deliver", Some(2), last)));
+    frames(&mut h, 4);
+    assert_eq!(h.state().session.sel.ordered().0, on_page_two[last as usize]);
+    bridge.take_events();
+    let past = text_target("the supplier shall deliver", Some(2), last + 1);
+    bridge.send(HostCommand::JumpTo(past.clone()));
+    frames(&mut h, 2);
+    // Finding nothing drops the target, so the host hears the page that is in view from then on.
+    let events = bridge.take_events();
+    assert_eq!(events.first(), Some(&HostEvent::JumpNotFound { target: past }), "{events:?}");
+    let visible = h.state().canvas.visible_page.expect("a visible page");
+    assert!(events[1..].iter().all(|e| *e == HostEvent::PageChanged { page: visible as u32 + 1 }), "{events:?}");
+}
+
+#[test]
+fn a_match_may_cross_lines_but_not_paragraphs() {
+    let (mut h, bridge) = embed_app();
+    open_doc(&mut h, &bridge, &clauses(20));
+    // Clause 3 wraps: its whole text spans more than one line.
+    let clause = "Clause 3. The Supplier shall deliver the goods listed in Schedule 3 within thirty days of the order.";
+    bridge.send(HostCommand::JumpTo(text_target(clause, None, 0)));
+    frames(&mut h, 4);
+    assert_eq!(h.state().session.selected_text(), clause);
+    let (start, end) = h.state().session.sel.ordered();
+    let app = h.state_mut();
+    let layout = app.session.layout();
+    let (top, bottom) = (layout.caret_on(&start, 0).expect("start").top, layout.caret_on(&end, 0).expect("end").top);
+    assert!(bottom > top, "the fixture's clause fits on one line, so this proves nothing");
+    bridge.take_events();
+    let across = text_target("of the order. Clause 4.", None, 0);
+    bridge.send(HostCommand::JumpTo(across.clone()));
+    frames(&mut h, 2);
+    assert_eq!(bridge.take_events(), vec![HostEvent::JumpNotFound { target: across }]);
+}
+
+#[test]
+fn a_jump_that_finds_nothing_answers_jump_not_found_with_its_target() {
+    let (mut h, bridge) = embed_app();
+    open_doc(&mut h, &bridge, &clauses(20));
+    for target in [
+        text_target("no such passage", None, 0),
+        text_target("Clause 7.", Some(99), 0),
+        text_target("Clause 7.", None, 5),
+        JumpTarget::Page { page: 99 },
+    ] {
+        bridge.send(HostCommand::JumpTo(target.clone()));
+        frames(&mut h, 2);
+        assert_eq!(bridge.take_events(), vec![HostEvent::JumpNotFound { target }]);
+    }
+}
+
+#[test]
+fn saturated_zero_and_empty_targets_answer_jump_not_found() {
+    let (mut h, bridge) = embed_app();
+    open_doc(&mut h, &bridge, &clauses(20));
+    let before = h.state().session.sel.clone();
+    let targets = [
+        JumpTarget::Page { page: 0 },
+        JumpTarget::Page { page: u32::MAX },
+        text_target("Clause 1.", Some(0), 0),
+        text_target("Clause 1.", Some(u32::MAX), 0),
+        text_target("Clause 1.", None, u32::MAX),
+        text_target("Clause 1.", Some(1), u32::MAX),
+        text_target("", None, 0),
+        text_target(" \t\n ", None, 0),
+        text_target("\u{FFFC}", None, 0),
+        text_target(&"a".repeat(MAX_NEEDLE_CHARS + 1), None, 0),
+    ];
+    for target in targets {
+        bridge.send(HostCommand::JumpTo(target.clone()));
+        frames(&mut h, 2);
+        assert_eq!(bridge.take_events(), vec![HostEvent::JumpNotFound { target: target.clone() }], "{:.40?}", target);
+    }
+    assert_eq!(h.state().session.sel, before);
+    assert_eq!(page_target(&h), None);
+}
+
+#[test]
+fn a_passage_at_the_length_limit_is_found_and_one_past_it_is_not() {
+    let (mut h, bridge) = embed_app();
+    let long = "x".repeat(MAX_NEEDLE_CHARS + 5);
+    open_doc(&mut h, &bridge, &Document::from_text(&format!("Start\n{long}")));
+    bridge.send(HostCommand::JumpTo(text_target(&"X".repeat(MAX_NEEDLE_CHARS), None, 0)));
+    frames(&mut h, 4);
+    assert_eq!(h.state().session.selected_text().len(), MAX_NEEDLE_CHARS);
+    assert!(!bridge.take_events().iter().any(|e| matches!(e, HostEvent::JumpNotFound { .. })));
+    let over = text_target(&"x".repeat(MAX_NEEDLE_CHARS + 1), None, 0);
+    bridge.send(HostCommand::JumpTo(over.clone()));
+    frames(&mut h, 2);
+    assert_eq!(bridge.take_events(), vec![HostEvent::JumpNotFound { target: over }]);
+}
+
+#[test]
+fn commands_sent_before_the_first_frame_apply_in_order() {
+    let bridge = HostBridge::new();
+    let app = WordApp::new(Session::new(Document::new()), Services::default()).with_host(bridge.clone(), EmbedProfile::View);
+    // Queued before the app ran a single frame, as a host may do right after mount.
+    bridge.send(HostCommand::Open { name: "agreement.docx".into(), bytes: docx(&clauses(120)) });
+    bridge.send(HostCommand::JumpTo(text_target("Clause 90.", None, 0)));
+    let mut h = harness(app, 1.0);
+    frames(&mut h, 4);
+    let events = bridge.take_events();
+    assert!(matches!(events.first(), Some(HostEvent::Opened { .. })), "{events:?}");
+    assert!(!events.iter().any(|e| matches!(e, HostEvent::JumpNotFound { .. })), "{events:?}");
+    assert_eq!(h.state().session.selected_text(), "Clause 90.");
+    let page = {
+        let app = h.state_mut();
+        app.session.layout().page_of(&app.session.sel.ordered().0).expect("laid out")
+    };
+    assert_eq!(events.last(), Some(&HostEvent::PageChanged { page: page as u32 + 1 }), "{events:?}");
+    assert!(selection_start_on_screen(&mut h).is_some_and(|at| h.state().canvas.canvas_rect.is_some_and(|view| view.contains(at))));
+}
+
+#[test]
+fn a_newer_host_jump_replaces_a_waiting_one() {
+    let (mut h, bridge) = embed_app();
+    open_doc(&mut h, &bridge, &clauses(120));
+    // Both arrive before a frame: only the second lands, and the first is not answered.
+    bridge.send(HostCommand::JumpTo(JumpTarget::Page { page: 4 }));
+    bridge.send(HostCommand::JumpTo(text_target("Clause 30.", None, 0)));
+    frames(&mut h, 4);
+    let page = {
+        let app = h.state_mut();
+        app.session.layout().page_of(&Pos::body(29, 0)).expect("laid out")
+    };
+    assert_ne!(page, 3, "the fixture puts clause 30 on page 4, so this proves nothing");
+    assert_eq!(bridge.take_events(), vec![HostEvent::PageChanged { page: page as u32 + 1 }]);
+    assert_eq!(h.state().session.selected_text(), "Clause 30.");
+    // A newer jump that finds nothing replaces a waiting one too: the view stays where it was.
+    let before = h.state().canvas.page_rects.clone();
+    let missing = text_target("no such passage", None, 0);
+    bridge.send(HostCommand::JumpTo(JumpTarget::Page { page: 5 }));
+    bridge.send(HostCommand::JumpTo(missing.clone()));
+    frames(&mut h, 4);
+    assert_eq!(bridge.take_events(), vec![HostEvent::JumpNotFound { target: missing }]);
+    assert_eq!(h.state().canvas.page_rects, before, "the replaced jump still moved the view");
+    assert_eq!(page_target(&h), None);
+}
+
+#[test]
+fn a_host_jump_replaces_the_page_target() {
+    let (mut h, bridge) = embed_app();
+    open_doc(&mut h, &bridge, &clauses(120));
+    // The view bar set a target first.
+    wordcraft_ui_egui::host::view::go_to_page(h.state_mut(), 1);
+    frames(&mut h, 4);
+    assert_eq!(page_target(&h), Some(1));
+    bridge.send(HostCommand::JumpTo(JumpTarget::Page { page: 4 }));
+    frames(&mut h, 4);
+    assert_eq!(page_target(&h), Some(3));
+    bridge.send(HostCommand::JumpTo(text_target("Clause 3.", None, 0)));
+    frames(&mut h, 4);
+    assert_eq!(page_target(&h), Some(0));
+    bridge.take_events();
+    // Not found: the target is dropped, and the host hears the page that is in view.
+    bridge.send(HostCommand::JumpTo(JumpTarget::Page { page: 99 }));
+    frames(&mut h, 4);
+    assert_eq!(page_target(&h), None);
+    assert_eq!(bridge.take_events(), vec![HostEvent::JumpNotFound { target: JumpTarget::Page { page: 99 } }]);
+}
+
+#[test]
+fn a_jump_waiting_when_an_open_replaces_the_document_answers_jump_not_found() {
+    let (mut h, bridge) = embed_app();
+    open_doc(&mut h, &bridge, &clauses(120));
+    let second = docx(&clauses(30));
+    for target in [JumpTarget::Page { page: 4 }, text_target("Clause 90.", None, 0)] {
+        // The jump is found in the open document but has not landed when the next one replaces it.
+        bridge.send(HostCommand::JumpTo(target.clone()));
+        bridge.send(HostCommand::Open { name: "next.docx".into(), bytes: second.clone() });
+        frames(&mut h, 4);
+        let count = pages(&mut h) as u32;
+        assert_eq!(
+            bridge.take_events(),
+            vec![HostEvent::JumpNotFound { target: target.clone() }, HostEvent::Opened { pages: count }, HostEvent::PageChanged { page: 1 }]
+        );
+        assert_eq!(h.state().canvas.visible_page, Some(0), "{target:?} was applied to the new document");
+        assert_eq!(h.state().session.sel.ordered().0, Pos::body(0, 0));
+        assert_eq!(page_target(&h), None);
+        open_doc(&mut h, &bridge, &clauses(120));
+    }
+    // Also when all three are queued before the app ran a single frame.
+    let bridge = HostBridge::new();
+    let app = WordApp::new(Session::new(Document::new()), Services::default()).with_host(bridge.clone(), EmbedProfile::View);
+    let early = text_target("Clause 90.", None, 0);
+    bridge.send(HostCommand::Open { name: "a.docx".into(), bytes: docx(&clauses(120)) });
+    bridge.send(HostCommand::JumpTo(early.clone()));
+    bridge.send(HostCommand::Open { name: "b.docx".into(), bytes: second.clone() });
+    let mut h = harness(app, 1.0);
+    frames(&mut h, 4);
+    let events = bridge.take_events();
+    let (first, second) = (HostEvent::Opened { pages: 8 }, HostEvent::Opened { pages: pages(&mut h) as u32 });
+    assert_eq!(events, vec![first, HostEvent::JumpNotFound { target: early }, second, HostEvent::PageChanged { page: 1 }]);
+}
+
+#[test]
+fn a_jump_waiting_when_an_open_fails_still_lands() {
+    let (mut h, bridge) = embed_app();
+    open_doc(&mut h, &bridge, &clauses(120));
+    bridge.send(HostCommand::JumpTo(JumpTarget::Page { page: 4 }));
+    bridge.send(HostCommand::Open { name: "broken.docx".into(), bytes: b"PK\x03\x04 broken".to_vec() });
+    frames(&mut h, 4);
+    let events = bridge.take_events();
+    assert!(matches!(events.as_slice(), [HostEvent::OpenFailed { .. }, HostEvent::PageChanged { page: 4 }]), "{events:?}");
+}
+
+#[test]
+fn a_resize_keeps_the_jump_target_in_view() {
+    let (mut h, bridge) = embed_app();
+    open_doc(&mut h, &bridge, &clauses(120));
+    bridge.send(HostCommand::JumpTo(JumpTarget::Page { page: 3 }));
+    frames(&mut h, 4);
+    bridge.take_events();
+    // A narrower window rescales the fitted pages: page 3 goes back to the top of the view.
+    for size in [egui::vec2(700.0, 800.0), egui::vec2(1400.0, 600.0)] {
+        h.set_size(size);
+        frames(&mut h, 4);
+        let app = h.state();
+        let (page, view) = (app.canvas.page_rects[2], app.canvas.canvas_rect.expect("canvas"));
+        assert!((page.min.y - view.min.y).abs() < 2.0, "{size:?}: page 3 top at {}, view top at {}", page.min.y, view.min.y);
+        assert_eq!(page_target(&h), Some(2), "{size:?}: a resize is not a person scrolling");
+    }
+    assert!(bridge.take_events().is_empty(), "the reported page stays 3");
+    // A passage stays in view too.
+    h.set_size(WINDOW);
+    bridge.send(HostCommand::JumpTo(text_target("Clause 77.", None, 0)));
+    frames(&mut h, 4);
+    for size in [egui::vec2(600.0, 800.0), egui::vec2(1400.0, 700.0)] {
+        h.set_size(size);
+        frames(&mut h, 4);
+        let view = h.state().canvas.canvas_rect.expect("canvas");
+        let at = selection_start_on_screen(&mut h);
+        assert!(at.is_some_and(|at| view.contains(at)), "{size:?}: the passage at {at:?} left the view {view:?}");
+    }
+}
+
+#[test]
+fn a_selection_drag_that_scrolls_the_view_drops_the_page_target() {
+    let (mut h, bridge) = embed_app();
+    open_doc(&mut h, &bridge, &clauses(120));
+    bridge.send(HostCommand::JumpTo(JumpTarget::Page { page: 3 }));
+    frames(&mut h, 4);
+    assert_eq!(page_target(&h), Some(2));
+    let view = h.state().canvas.canvas_rect.expect("canvas");
+    // The start of the first clause whose first line is drawn in `band` (screen y).
+    let clause_start_in = |h: &mut egui_kittest::Harness<'_, WordApp>, band: std::ops::Range<f32>| {
+        (0..120).map(|i| screen_of(h, &Pos::body(i, 0))).find(|at| band.contains(&at.y)).expect("a clause in the band")
+    };
+    // A drag across the middle of the view selects without scrolling: the target stays.
+    let middle = clause_start_in(&mut h, view.center().y - 100.0..view.center().y + 100.0) + egui::vec2(4.0, 0.0);
+    h.event(egui::Event::PointerMoved(middle));
+    h.event(press(middle, egui::PointerButton::Primary));
+    h.event(egui::Event::PointerMoved(middle + egui::vec2(80.0, 0.0)));
+    frames(&mut h, 3);
+    h.event(release(middle + egui::vec2(80.0, 0.0), egui::PointerButton::Primary));
+    frames(&mut h, 4);
+    assert!(!h.state().session.sel.is_collapsed(), "the drag selected nothing");
+    assert_eq!(page_target(&h), Some(2), "a drag that did not scroll dropped the target");
+    // One that starts near the bottom edge moves the view to keep the selection's end in sight: the
+    // person moved the view, so what is visible is reported from now on.
+    let top_before = h.state().canvas.page_rects[2].min.y;
+    let low = egui::pos2(middle.x, view.max.y - 40.0);
+    h.event(egui::Event::PointerMoved(low));
+    h.event(press(low, egui::PointerButton::Primary));
+    h.event(egui::Event::PointerMoved(low + egui::vec2(80.0, 0.0)));
+    frames(&mut h, 8);
+    assert_ne!(h.state().canvas.page_rects[2].min.y, top_before, "the drag did not scroll, so this proves nothing");
+    assert_eq!(page_target(&h), None);
+    h.event(release(low + egui::vec2(80.0, 0.0), egui::PointerButton::Primary));
+    frames(&mut h, 2);
 }

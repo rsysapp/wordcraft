@@ -86,10 +86,10 @@ fn step_zoom(app: &mut WordApp, command: &str) {
     keep_target_in_view(app);
 }
 
-/// A zoom moves every page: put the jump's target page at the top again, so it stays in view.
+/// A zoom moves every page: put the jump's target at the top again, so it stays in view.
 fn keep_target_in_view(app: &mut WordApp) {
-    if let Some(page) = app.host.as_ref().and_then(|host| host.page_target) {
-        app.canvas.scroll_to_doc = Some((page, 0.0));
+    if let Some(target) = app.host.as_mut().and_then(|host| host.target_scroll()) {
+        app.canvas.scroll_to_doc = Some(target);
     }
 }
 

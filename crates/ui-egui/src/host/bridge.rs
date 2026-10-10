@@ -13,6 +13,8 @@ use super::wire::JumpTarget;
 pub enum HostCommand {
     /// Open a document, replacing the open one; answered by `Opened` or `OpenFailed`.
     Open { name: String, bytes: Vec<u8> },
+    /// Show a page or a passage; answered by `JumpNotFound` when there is nothing to show.
+    JumpTo(JumpTarget),
 }
 
 /// What the editor tells the host page; serialises to the embed API's `EditorEvent`.
