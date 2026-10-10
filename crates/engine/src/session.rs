@@ -152,6 +152,8 @@ pub struct Session {
     pub merge: crate::cmd::mailings::MergeState,
     /// Requests from commands to the UI (open a dialog, scroll…), drained by the front end.
     pub ui_requests: Vec<Value>,
+    /// embed: a view-only session runs only `crate::view_only::COMMANDS`.
+    pub view_only: bool,
 }
 
 /// Maximum undo depth.
@@ -194,6 +196,7 @@ impl Session {
             bib_style: "APA".into(),
             merge: Default::default(),
             ui_requests: Vec::new(),
+            view_only: false,
         }
     }
 
@@ -266,6 +269,10 @@ impl Session {
         self.history.iter().rev().map(|u| u.label.clone()).collect()
     }
     pub fn undo(&mut self) -> bool {
+        // embed: history belongs to editing; a view-only session never restores other states.
+        if self.view_only {
+            return false;
+        }
         self.typing_open = false;
         let Some(u) = self.history.pop() else { return false };
         let cur = Undo { label: u.label.clone(), doc: std::mem::replace(&mut self.doc, u.doc), sel: std::mem::replace(&mut self.sel, u.sel) };
@@ -274,6 +281,10 @@ impl Session {
         true
     }
     pub fn redo(&mut self) -> bool {
+        // embed: see `undo`.
+        if self.view_only {
+            return false;
+        }
         self.typing_open = false;
         let Some(u) = self.redo.pop() else { return false };
         let cur = Undo { label: u.label.clone(), doc: std::mem::replace(&mut self.doc, u.doc), sel: std::mem::replace(&mut self.sel, u.sel) };
@@ -312,6 +323,10 @@ impl Session {
     pub fn run(&mut self, id: &str, params: &Value) -> Result<Value, CmdError> {
         let reg = self.registry.clone();
         let Some(spec) = reg.get(id) else { return Err(CmdError::Unknown(id.to_string())) };
+        // embed: a view-only session refuses every edit path, not just the ones marked as mutating.
+        if self.view_only && !crate::view_only::allows(id) {
+            return Err(CmdError::Disabled(format!("{id}: the document is open for viewing only")));
+        }
         if let Some(why) = (spec.enabled)(self) {
             return Err(CmdError::Disabled(format!("{id}: {why}")));
         }

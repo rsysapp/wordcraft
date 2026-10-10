@@ -12,6 +12,8 @@ pub mod io;
 mod io_ext;
 pub mod sample;
 mod session;
+// embed: view-only sessions for the embed build.
+pub mod view_only;
 
 use std::collections::HashMap;
 
