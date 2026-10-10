@@ -760,8 +760,8 @@ fn a_selection_drag_that_scrolls_the_view_drops_the_page_target() {
     frames(&mut h, 4);
     assert!(!h.state().session.sel.is_collapsed(), "the drag selected nothing");
     assert_eq!(page_target(&h), Some(2), "a drag that did not scroll dropped the target");
-    // One that starts near the bottom edge moves the view to keep the selection's end in sight: the
-    // person moved the view, so what is visible is reported from now on.
+    // One that starts near the bottom edge scrolls the caret it put there into view while the person
+    // drags: the person moved the view, so what is visible is reported from now on.
     let top_before = h.state().canvas.page_rects[2].min.y;
     let low = egui::pos2(middle.x, view.max.y - 40.0);
     h.event(egui::Event::PointerMoved(low));
@@ -1163,4 +1163,278 @@ fn passages_longer_than_the_raw_cap_are_skipped_and_not_found() {
     bridge.send(HostCommand::JumpTo(text_target(&at_cap, None, 0)));
     frames(&mut h, 4);
     assert_eq!(h.state().session.selected_text(), "Clause 2.");
+}
+
+// --- Selection events ---
+
+use egui::accesskit::Role;
+use egui_kittest::kittest::Queryable;
+
+fn assert_selection_at(h: &mut egui_kittest::Harness<'_, WordApp>, events: &[HostEvent], end: &Pos, expect_text: &str) {
+    let [HostEvent::Selection { text, x, y, .. }] = events else { panic!("expected one selection event: {events:?}") };
+    assert_eq!(text, expect_text);
+    let (ex, ey) = selection_end_on_screen(h, end);
+    assert!((x - ex).abs() < 1.0 && (y - ey).abs() < 6.0, "selection at ({x}, {y}), its end is at ({ex}, {ey})");
+}
+
+fn is_selection(event: &HostEvent) -> bool {
+    matches!(event, HostEvent::Selection { .. })
+}
+
+/// Drag-select "Clause" in the first clause drawn in the middle of the view (a press near an edge
+/// scrolls the caret into view, which would move the drag's end); asserts it was reported.
+fn select_a_visible_clause(h: &mut egui_kittest::Harness<'_, WordApp>, bridge: &HostBridge, clauses: usize) {
+    let view = h.state().canvas.canvas_rect.expect("canvas");
+    let band = view.center().y - 150.0..view.center().y + 150.0;
+    let clause = (0..clauses).find(|i| band.contains(&screen_of(h, &Pos::body(*i, 0)).y)).expect("a clause in view");
+    bridge.take_events();
+    let (_, after) = drag_select(h, bridge, &Pos::body(clause, 0), &Pos::body(clause, 6));
+    assert!(matches!(after.as_slice(), [HostEvent::Selection { text, .. }] if text == "Clause"), "{after:?}");
+}
+
+#[test]
+fn a_drag_sends_one_selection_when_released() {
+    let (mut h, bridge) = embed_app();
+    open_doc(&mut h, &bridge, &clauses(20));
+    let (during, after) = drag_select(&mut h, &bridge, &Pos::body(0, 0), &Pos::body(0, 9));
+    assert!(during.is_empty(), "selection sent before the pointer was released: {during:?}");
+    assert!(matches!(after.as_slice(), [HostEvent::Selection { copy_text, page: Some(1), .. }] if copy_text == "Clause 1."), "{after:?}");
+    assert_selection_at(&mut h, &after, &Pos::body(0, 9), "Clause 1.");
+    frames(&mut h, 3);
+    assert!(bridge.take_events().is_empty(), "selection re-sent without a change");
+}
+
+#[test]
+fn a_selection_across_paragraphs_keeps_line_breaks_in_copy_text_only() {
+    let (mut h, bridge) = embed_app();
+    open_doc(&mut h, &bridge, &clauses(20));
+    let (_, after) = drag_select(&mut h, &bridge, &Pos::body(0, 0), &Pos::body(1, 9));
+    let [HostEvent::Selection { text, copy_text, .. }] = after.as_slice() else { panic!("{after:?}") };
+    assert!(copy_text.contains('\n') && copy_text.ends_with("\nClause 2."), "{copy_text:?}");
+    assert!(!text.contains('\n') && text.ends_with(" Clause 2."), "{text:?}");
+}
+
+#[test]
+fn selection_coordinates_are_points_at_double_density() {
+    let (mut h, bridge) = view_app(Document::new(), 2.0);
+    open_doc(&mut h, &bridge, &clauses(20));
+    let (_, after) = drag_select(&mut h, &bridge, &Pos::body(0, 0), &Pos::body(0, 9));
+    assert_selection_at(&mut h, &after, &Pos::body(0, 9), "Clause 1.");
+}
+
+#[test]
+fn selection_coordinates_are_css_pixels_under_an_egui_zoom() {
+    let (mut h, bridge) = embed_app();
+    h.ctx.set_zoom_factor(1.5);
+    frames(&mut h, 2);
+    open_doc(&mut h, &bridge, &clauses(20));
+    let (_, after) = drag_select(&mut h, &bridge, &Pos::body(0, 0), &Pos::body(0, 9));
+    let [HostEvent::Selection { x, y, .. }] = after.as_slice() else { panic!("{after:?}") };
+    let (ex, ey) = selection_end_on_screen(&mut h, &Pos::body(0, 9));
+    // One egui point is `zoom` CSS pixels.
+    assert!((x - ex * 1.5).abs() < 1.5 && (y - ey * 1.5).abs() < 9.0, "selection at ({x}, {y}), its end in points ({ex}, {ey})");
+}
+
+#[test]
+fn scrolled_selection_coordinates_follow_the_page() {
+    let (mut h, bridge) = embed_app();
+    open_doc(&mut h, &bridge, &clauses(120));
+    bridge.send(HostCommand::JumpTo(JumpTarget::Page { page: 3 }));
+    frames(&mut h, 4);
+    let clause = {
+        let app = h.state_mut();
+        let layout = app.session.layout();
+        (0..120).find(|i| layout.page_of(&Pos::body(*i, 0)) == Some(2)).expect("a clause starts on page 3")
+    };
+    bridge.take_events();
+    let (_, after) = drag_select(&mut h, &bridge, &Pos::body(clause, 0), &Pos::body(clause, 6));
+    assert_selection_at(&mut h, &after, &Pos::body(clause, 6), "Clause");
+    let [HostEvent::Selection { y, page, .. }] = after.as_slice() else { panic!("{after:?}") };
+    assert_eq!(*page, Some(3));
+    assert!(*y > 0.0 && *y < WINDOW.y, "y {y} is outside the canvas");
+}
+
+#[test]
+fn keyboard_selection_is_reported_and_a_click_clears_it() {
+    let (mut h, bridge) = embed_app();
+    open_doc(&mut h, &bridge, &clauses(20));
+    let start = screen_of(&mut h, &Pos::body(0, 0));
+    click(&mut h, start, egui::PointerButton::Primary);
+    bridge.take_events();
+    // A person's key presses arrive in frames of their own.
+    for _ in 0..3 {
+        h.key_press_modifiers(egui::Modifiers::SHIFT, egui::Key::ArrowRight);
+        frames(&mut h, 1);
+    }
+    frames(&mut h, 2);
+    let texts: Vec<String> = bridge
+        .take_events()
+        .into_iter()
+        .filter_map(|e| match e {
+            HostEvent::Selection { text, .. } => Some(text),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(texts, vec!["C", "Cl", "Cla"]);
+    let elsewhere = screen_of(&mut h, &Pos::body(1, 4));
+    click(&mut h, elsewhere, egui::PointerButton::Primary);
+    assert!(bridge.take_events().contains(&HostEvent::SelectionCleared));
+}
+
+#[test]
+fn jumps_and_finds_send_no_selection_but_clear_a_reported_one() {
+    let (mut h, bridge) = embed_app();
+    open_doc(&mut h, &bridge, &clauses(30));
+    drag_select(&mut h, &bridge, &Pos::body(0, 0), &Pos::body(0, 9));
+    bridge.send(HostCommand::JumpTo(text_target("Clause 5.", None, 0)));
+    frames(&mut h, 3);
+    let events = bridge.take_events();
+    assert!(events.contains(&HostEvent::SelectionCleared), "{events:?}");
+    assert!(!events.iter().any(is_selection), "{events:?}");
+    h.get_by_role(Role::TextInput).focus();
+    frames(&mut h, 2);
+    h.get_by_role(Role::TextInput).type_text("schedule 7");
+    frames(&mut h, 3);
+    assert_eq!(h.state().session.selected_text(), "Schedule 7");
+    assert!(!bridge.take_events().iter().any(is_selection));
+}
+
+#[test]
+fn every_selection_the_editor_makes_clears_a_reported_one_and_is_never_reported() {
+    let (mut h, bridge) = embed_app();
+    open_doc(&mut h, &bridge, &clauses(120));
+    for action in ["host page jump", "host text jump", "next page button", "find", "open"] {
+        select_a_visible_clause(&mut h, &bridge, 120);
+        match action {
+            "host page jump" => bridge.send(HostCommand::JumpTo(JumpTarget::Page { page: 2 })),
+            "host text jump" => bridge.send(HostCommand::JumpTo(text_target("Clause 9.", None, 0))),
+            "next page button" => h.get_by_label("Next page").click(),
+            "find" => {
+                h.get_by_role(Role::TextInput).focus();
+                frames(&mut h, 2);
+                h.get_by_role(Role::TextInput).type_text("goods listed");
+            }
+            _ => bridge.send(HostCommand::Open { name: "next.docx".into(), bytes: docx(&clauses(120)) }),
+        }
+        frames(&mut h, 4);
+        let events = bridge.take_events();
+        assert_eq!(events.iter().filter(|e| **e == HostEvent::SelectionCleared).count(), 1, "{action}: {events:?}");
+        assert!(!events.iter().any(is_selection), "{action}: {events:?}");
+        assert!(!h.state().session.sel.is_collapsed() || action != "host text jump", "{action}: the passage is selected");
+        if action == "open" {
+            let cleared = events.iter().position(|e| *e == HostEvent::SelectionCleared);
+            let opened = events.iter().position(|e| matches!(e, HostEvent::Opened { .. }));
+            assert!(cleared < opened && opened.is_some(), "{events:?}");
+        }
+        frames(&mut h, 3);
+        assert!(bridge.take_events().iter().all(|e| !is_selection(e) && *e != HostEvent::SelectionCleared), "{action}: sent later");
+    }
+}
+
+#[test]
+fn a_jump_that_finds_nothing_keeps_a_reported_selection() {
+    let (mut h, bridge) = embed_app();
+    open_doc(&mut h, &bridge, &clauses(30));
+    drag_select(&mut h, &bridge, &Pos::body(0, 0), &Pos::body(0, 9));
+    let missing = text_target("no such passage", None, 0);
+    bridge.send(HostCommand::JumpTo(missing.clone()));
+    frames(&mut h, 3);
+    assert_eq!(bridge.take_events(), vec![HostEvent::JumpNotFound { target: missing }]);
+    assert_eq!(h.state().session.selected_text(), "Clause 1.");
+}
+
+#[test]
+fn a_newer_jump_that_finds_nothing_puts_back_the_selection_the_replaced_jump_made() {
+    let (mut h, bridge) = embed_app();
+    open_doc(&mut h, &bridge, &clauses(120));
+    drag_select(&mut h, &bridge, &Pos::body(0, 0), &Pos::body(0, 9));
+    let (sel, hint) = (h.state().session.sel.clone(), h.state().session.page_hint);
+    let before = h.state().canvas.page_rects.clone();
+    for first in [text_target("Clause 90.", None, 0), JumpTarget::Page { page: 5 }] {
+        let missing = text_target("no such passage", None, 0);
+        bridge.send(HostCommand::JumpTo(first.clone()));
+        bridge.send(HostCommand::JumpTo(missing.clone()));
+        frames(&mut h, 4);
+        // The replaced jump changed nothing: the person's selection is still the one the host knows.
+        assert_eq!(bridge.take_events(), vec![HostEvent::JumpNotFound { target: missing }], "{first:?}");
+        assert_eq!(h.state().session.sel, sel, "{first:?}: the selection was not put back");
+        assert_eq!(h.state().session.page_hint, hint, "{first:?}: the page hint was not put back");
+        assert_eq!(h.state().canvas.page_rects, before, "{first:?}: the view moved");
+    }
+    // It is still the reported one: a click clears it.
+    let elsewhere = screen_of(&mut h, &Pos::body(1, 4));
+    click(&mut h, elsewhere, egui::PointerButton::Primary);
+    assert_eq!(bridge.take_events(), vec![HostEvent::SelectionCleared]);
+}
+
+#[test]
+fn a_whitespace_only_selection_counts_as_cleared() {
+    let (mut h, bridge) = embed_app();
+    open_doc(&mut h, &bridge, &Document::from_text("Alpha     beta\nGamma"));
+    let (_, after) = drag_select(&mut h, &bridge, &Pos::body(0, 0), &Pos::body(0, 5));
+    assert!(matches!(after.as_slice(), [HostEvent::Selection { text, .. }] if text == "Alpha"), "{after:?}");
+    for (from, to) in [(Pos::body(0, 5), Pos::body(0, 10)), (Pos::body(0, 6), Pos::body(0, 8)), (Pos::body(0, 14), Pos::body(1, 0))] {
+        h.state_mut().session.sel = Selection { anchor: from, focus: to };
+        frames(&mut h, 2);
+    }
+    assert_eq!(bridge.take_events(), vec![HostEvent::SelectionCleared], "cleared once");
+}
+
+#[test]
+fn holding_the_button_without_moving_keeps_the_page_target() {
+    let (mut h, bridge) = embed_app();
+    open_doc(&mut h, &bridge, &clauses(120));
+    bridge.send(HostCommand::JumpTo(JumpTarget::Page { page: 3 }));
+    frames(&mut h, 4);
+    assert_eq!(page_target(&h), Some(2));
+    let view = h.state().canvas.canvas_rect.expect("canvas");
+    // A press near the bottom edge puts the caret there, and the canvas scrolls to keep it in sight.
+    let low = egui::pos2(view.center().x, view.max.y - 40.0);
+    let top_before = h.state().canvas.page_rects[2].min.y;
+    h.event(egui::Event::PointerMoved(low));
+    h.event(press(low, egui::PointerButton::Primary));
+    frames(&mut h, 8);
+    assert_ne!(h.state().canvas.page_rects[2].min.y, top_before, "the press did not scroll, so this proves nothing");
+    assert_eq!(page_target(&h), Some(2), "a press without a drag is not a person scrolling");
+    h.event(release(low, egui::PointerButton::Primary));
+    frames(&mut h, 2);
+}
+
+#[test]
+fn text_jump_occurrences_count_only_laid_out_matches_with_or_without_a_page() {
+    use std::sync::Arc;
+    use wordcraft_doc::props::{CharProps, VMerge};
+    use wordcraft_doc::{Block, Paragraph, StoryRef, Table, para_block};
+    let line = |text: &str| Paragraph::with_text(text, CharProps::default());
+    // The second match sits in a cell that continues a vertical merge: it is never laid out.
+    let mut table = Table::new(2, 1, 300.0);
+    table.rows[0].cells[0].blocks = vec![para_block(line("Merged"))];
+    table.rows[0].cells[0].props.vmerge = VMerge::Restart;
+    table.rows[1].cells[0].blocks = vec![para_block(line("Notice period"))];
+    table.rows[1].cells[0].props.vmerge = VMerge::Continue;
+    let mut doc = Document::new();
+    doc.body = vec![para_block(line("Notice period")), Arc::new(Block::Table(table)), para_block(line("Notice period"))];
+    let (mut h, bridge) = embed_app();
+    open_doc(&mut h, &bridge, &doc);
+    let unplaced = {
+        let app = h.state_mut();
+        let layout = app.session.layout();
+        let doc = &app.session.doc;
+        doc.para_paths(StoryRef::Body)
+            .into_iter()
+            .filter(|path| doc.para(StoryRef::Body, path).is_some_and(|p| p.text == "Notice period"))
+            .filter(|path| layout.page_of(&Pos { story: StoryRef::Body, path: path.clone(), off: 0 }).is_none())
+            .count()
+    };
+    assert_eq!(unplaced, 1, "the fixture has no unplaced match, so this proves nothing");
+    for page in [None, Some(1)] {
+        bridge.send(HostCommand::JumpTo(text_target("notice period", page, 1)));
+        frames(&mut h, 4);
+        assert_eq!(h.state().session.sel.ordered().0, Pos::body(2, 0), "page {page:?}");
+        bridge.take_events();
+        let past = text_target("notice period", page, 2);
+        bridge.send(HostCommand::JumpTo(past.clone()));
+        frames(&mut h, 4);
+        assert!(bridge.take_events().contains(&HostEvent::JumpNotFound { target: past }), "page {page:?}");
+    }
 }

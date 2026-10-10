@@ -168,3 +168,26 @@ pub fn open_doc(h: &mut Harness<'_, WordApp>, bridge: &HostBridge, doc: &Documen
 pub fn pages(h: &mut Harness<'_, WordApp>) -> usize {
     h.state_mut().session.layout().pages.len()
 }
+
+/// Where a selection ending at `end` should report itself: the bottom of its line, at its x.
+pub fn selection_end_on_screen(h: &mut Harness<'_, WordApp>, end: &Pos) -> (f32, f32) {
+    let app = h.state_mut();
+    let layout = app.session.layout();
+    let caret = layout.caret_on(end, app.session.page_hint).expect("end is laid out");
+    let at = wordcraft_ui_egui::canvas::page_to_screen(app, caret.page, caret.x, caret.top + caret.height).expect("page is on screen");
+    (at.x, at.y)
+}
+
+/// Drag from `from` to `to`; returns the events sent while the pointer was down and after release.
+pub fn drag_select(h: &mut Harness<'_, WordApp>, bridge: &HostBridge, from: &Pos, to: &Pos) -> (Vec<HostEvent>, Vec<HostEvent>) {
+    let (a, b) = (screen_of(h, from), screen_of(h, to));
+    h.event(egui::Event::PointerMoved(a));
+    h.event(press(a, egui::PointerButton::Primary));
+    h.event(egui::Event::PointerMoved(b));
+    h.step();
+    frames(h, 2);
+    let during = bridge.take_events();
+    h.event(release(b, egui::PointerButton::Primary));
+    h.step();
+    (during, bridge.take_events())
+}

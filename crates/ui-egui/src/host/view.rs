@@ -167,8 +167,21 @@ fn body_anchor(app: &WordApp) -> Pos {
 }
 
 /// Find `query` and select the match; the canvas scrolls to it. An empty query clears the search and
-/// the highlight (the selected match).
+/// the highlight (the selected match). The selection is the editor's own, never reported to the host.
 pub fn run_find(app: &mut WordApp, query: &str, step: FindStep) {
+    find(app, query, step);
+    note_programmatic_selection(app);
+}
+
+/// The selection is the editor's doing (find, the page buttons): see
+/// [`HostState::note_programmatic_selection`](super::state::HostState::note_programmatic_selection).
+fn note_programmatic_selection(app: &mut WordApp) {
+    if let Some(host) = app.host.as_mut() {
+        host.note_programmatic_selection(&app.session.sel);
+    }
+}
+
+fn find(app: &mut WordApp, query: &str, step: FindStep) {
     if query.is_empty() {
         let (start, end) = app.session.sel.ordered();
         let was_match = app.session.find.results.iter().any(|(a, b)| *a == start && *b == end);
@@ -220,7 +233,8 @@ fn forget_page_target(app: &mut WordApp) {
     }
 }
 
-/// Show page `index` (0-based) at the top of the view, with the caret on its first line.
+/// Show page `index` (0-based) at the top of the view, with the caret on its first line. The caret
+/// is the editor's own selection, never reported to the host.
 pub fn go_to_page(app: &mut WordApp, index: usize) {
     let pages = app.session.layout().pages.len();
     if pages == 0 {
@@ -233,6 +247,7 @@ pub fn go_to_page(app: &mut WordApp, index: usize) {
     if let Some(host) = app.host.as_mut() {
         host.jump_to(index);
     }
+    note_programmatic_selection(app);
 }
 
 /// An icon button that screen readers and UI tests know by `label`.

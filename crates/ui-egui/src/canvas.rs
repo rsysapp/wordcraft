@@ -573,7 +573,8 @@ fn mouse(app: &mut WordApp, ui: &Ui, resp: &egui::Response, rects: &[Rect], layo
             app.session.page_hint = page;
             app.canvas.caret_visible_since = crate::now_ms();
         }
-        // Auto-scroll near the edges is handled by egui's scroll area drag.
+        // embed: nothing scrolls the view during a drag: egui 0.36's scroll area does not follow a drag
+        // near its edges, and no command runs here to set `scroll_to_caret`.
     } else if app.canvas.dragging && ui.input(|i| i.pointer.primary_released()) {
         app.canvas.dragging = false;
         if app.session.painter.is_some() && !app.session.sel.is_collapsed() {

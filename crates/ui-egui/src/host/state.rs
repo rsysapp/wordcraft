@@ -21,6 +21,17 @@ struct PendingJump {
     target: JumpTarget,
     /// The scroll it replaced, put back when a newer jump finds nothing.
     displaced: Option<(usize, f32)>,
+    /// The selection it replaced, put back with the scroll.
+    replaced: SelectionBefore,
+}
+
+/// What a jump's selection replaced: the session's selection and page hint, and what the host
+/// state knew of them, so a replaced jump that a newer, failed one undoes leaves no trace.
+struct SelectionBefore {
+    sel: Selection,
+    page_hint: usize,
+    settled: Selection,
+    clear_reported: bool,
 }
 
 /// What places the pages on screen: the canvas's scale and size, and where the first page sits.
@@ -58,6 +69,13 @@ pub struct HostState {
     index: TextIndex,
     /// The host's marks, and where they were found and painted.
     pub(crate) marks: Marks,
+    /// The selection as it last settled: a person's (told to the host or not) or one the editor
+    /// made itself. A selection that differs from it is a person's new one.
+    settled: Selection,
+    /// The host was told of a selection (`selection`) and not yet that it is gone (`selectionCleared`).
+    reported: bool,
+    /// The editor replaced the selection this frame, so a reported one is cleared when it ends.
+    clear_reported: bool,
 }
 
 impl HostState {
@@ -106,6 +124,14 @@ impl HostState {
     }
 
     /// Look for the marks not yet found in this document and layout; `true` while some remain.
+    /// The editor moved the selection itself (open, jump, find, page buttons): not a person's
+    /// selection, so it is never reported, and a reported one is cleared at the end of the frame (its
+    /// toolbar would otherwise stay on text the view may have scrolled away).
+    pub(crate) fn note_programmatic_selection(&mut self, sel: &Selection) {
+        self.settled = sel.clone();
+        self.clear_reported = true;
+    }
+
     pub(crate) fn resolve_marks(&mut self, doc: &wordcraft_doc::Document, rev: u64, layout: &std::sync::Arc<wordcraft_layout::DocLayout>) -> bool {
         self.marks.resolve(&mut self.index, doc, rev, layout)
     }
@@ -124,6 +150,9 @@ impl HostState {
             last_page: None,
             index: TextIndex::default(),
             marks: Marks::default(),
+            settled: Selection::default(),
+            reported: false,
+            clear_reported: false,
         }
     }
 }
@@ -161,15 +190,83 @@ pub(crate) fn after_frame(app: &mut WordApp, ctx: &egui::Context) {
         host.last_page = Some(page);
         host.bridge.emit(HostEvent::PageChanged { page: page_number(page) });
     }
+    settle_selection(app, &mut host, ctx);
     app.host = Some(host);
+}
+
+/// Tell the host of a person's selection once it settles (no button held: a drag reports on
+/// release, keys at once), never on every frame; and that it is gone when it is.
+fn settle_selection(app: &mut WordApp, host: &mut HostState, ctx: &egui::Context) {
+    if std::mem::take(&mut host.clear_reported) && std::mem::take(&mut host.reported) {
+        host.bridge.emit(HostEvent::SelectionCleared);
+    }
+    if app.session.sel == host.settled || ctx.input(|input| input.pointer.any_down()) {
+        return;
+    }
+    let reading = if app.session.sel.is_collapsed() { Reading::Blank } else { read_selection(app, ctx.zoom_factor()) };
+    match reading {
+        // Its page is not drawn yet: try again next frame.
+        Reading::NotReady => return,
+        // Nothing for the host to act on, so a selection it was told of is cleared (once), or its
+        // toolbar would stay on stale text.
+        Reading::Blank => {
+            if std::mem::take(&mut host.reported) {
+                host.bridge.emit(HostEvent::SelectionCleared);
+            }
+        }
+        Reading::Text(event) => {
+            host.bridge.emit(event);
+            host.reported = true;
+        }
+    }
+    host.settled = app.session.sel.clone();
+}
+
+/// A settled selection as the host would hear of it.
+enum Reading {
+    Text(HostEvent),
+    /// Nothing but whitespace (or object placeholders) is selected.
+    Blank,
+    /// The selection's end is not on a drawn page.
+    NotReady,
+}
+
+/// The selection as the host hears it, placed at the end of its last line: egui points times the
+/// zoom factor are CSS pixels from the canvas's top-left (eframe's web backend draws one point per
+/// CSS pixel at zoom 1). The PDF editor's embed build places its selections alike.
+fn read_selection(app: &mut WordApp, zoom: f32) -> Reading {
+    let Some((text, copy_text)) = host_texts(&app.session.selected_text()) else { return Reading::Blank };
+    let (start, end) = app.session.sel.ordered();
+    let layout = app.session.layout();
+    let rects = layout.selection_rects(&app.session.doc, &start, &end, app.session.page_hint);
+    let Some((page, last)) = rects.last() else { return Reading::NotReady };
+    let Some(page_rect) = app.canvas.page_rects.get(*page) else { return Reading::NotReady };
+    let scale = app.canvas.scale;
+    let x = (page_rect.min.x + (last.x + last.w) * scale) * zoom;
+    let y = (page_rect.min.y + (last.y + last.h) * scale) * zoom;
+    if !(x.is_finite() && y.is_finite()) {
+        return Reading::NotReady;
+    }
+    let page = layout.page_of(&start).map(page_number);
+    Reading::Text(HostEvent::Selection { text, copy_text, page, x, y })
+}
+
+/// The selection's texts for the host, `(text, copy_text)`: `copy_text` keeps line breaks, `text`
+/// has its whitespace collapsed, and neither has the placeholder (U+FFFC) an inline object leaves
+/// in the text. `None` when nothing else is selected.
+fn host_texts(selected: &str) -> Option<(String, String)> {
+    let copy_text: String = selected.chars().filter(|c| *c != '\u{FFFC}').collect();
+    let text = copy_text.split_whitespace().collect::<Vec<_>>().join(" ");
+    (!text.is_empty()).then_some((text, copy_text))
 }
 
 /// Width of the strip along the canvas's right and bottom edges where the scroll bars sit.
 const SCROLL_BAR_STRIP: f32 = 20.0;
 
 /// When the pages moved on screen this frame: a resize or a fitted zoom puts the target back at the
-/// top of the view (it is not a person scrolling, so the target stays); a selection drag that moved
-/// the view (the canvas keeps the selection's end in sight) is a person scrolling and drops it.
+/// top of the view (it is not a person scrolling, so the target stays); a selection drag during which
+/// the view moved (the caret scroll a press near the view's edge starts) is a person scrolling and
+/// drops it.
 fn follow_the_view(app: &mut WordApp, host: &mut HostState, ctx: &egui::Context) {
     let ours = std::mem::take(&mut host.scroll_queued);
     let Some(canvas) = app.canvas.canvas_rect else { return };
@@ -190,11 +287,13 @@ fn follow_the_view(app: &mut WordApp, host: &mut HostState, ctx: &egui::Context)
     }
 }
 
-/// Whether the primary button is held after a press on the document (not on a scroll bar, which
-/// `scrolled_by_person` counts): a person selecting text.
+/// Whether the primary button is held and dragged after a press on the document (not on a scroll
+/// bar, which `scrolled_by_person` counts): a person selecting text. A press held without moving
+/// is not: the caret scroll from the press itself is no reason to drop the target.
 fn selecting_by_drag(ctx: &egui::Context, canvas: Rect) -> bool {
     ctx.input(|input| {
         input.pointer.primary_down()
+            && input.pointer.is_decidedly_dragging()
             && input
                 .pointer
                 .press_origin()
@@ -228,19 +327,40 @@ fn scrolled_by_person(ctx: &egui::Context, canvas: Option<egui::Rect>, canvas_fo
 
 /// Show the host's page or passage; `jumpNotFound` when there is none. A newer jump replaces one
 /// whose scroll has not landed yet, found or not, as in the PDF editor's embed build.
+///
+/// A found jump's selection (the passage, or the caret at the page's top) is the editor's own: it
+/// is never reported and clears a reported one. A jump that finds nothing leaves the selection be,
+/// and one that replaces a waiting jump puts back the selection that jump replaced, with its scroll.
 fn jump(app: &mut WordApp, host: &mut HostState, target: JumpTarget) {
-    let displaced = match host.pending_jump.take() {
-        Some(waiting) => waiting.displaced,
-        None => app.canvas.scroll_to_doc,
+    let waiting = host.pending_jump.take();
+    let superseded = waiting.is_some();
+    let (displaced, replaced) = match waiting {
+        Some(waiting) => (waiting.displaced, waiting.replaced),
+        None => (
+            app.canvas.scroll_to_doc,
+            SelectionBefore {
+                sel: app.session.sel.clone(),
+                page_hint: app.session.page_hint,
+                settled: host.settled.clone(),
+                clear_reported: host.clear_reported,
+            },
+        ),
     };
     match find_target(app, host, &target) {
         Some((page, y)) => {
             app.canvas.scroll_to_doc = Some((page, y));
             host.aim(page, y);
-            host.pending_jump = Some(PendingJump { target, displaced });
+            host.note_programmatic_selection(&app.session.sel);
+            host.pending_jump = Some(PendingJump { target, displaced, replaced });
         }
         None => {
             app.canvas.scroll_to_doc = displaced;
+            if superseded {
+                app.session.sel = replaced.sel;
+                app.session.page_hint = replaced.page_hint;
+                host.settled = replaced.settled;
+                host.clear_reported = replaced.clear_reported;
+            }
             host.page_target = None;
             host.bridge.emit(HostEvent::JumpNotFound { target });
         }
@@ -266,7 +386,9 @@ fn find_target(app: &mut WordApp, host: &mut HostState, target: &JumpTarget) -> 
             };
             let nth = occurrence_index(*occurrence)?;
             host.index.refresh(&app.session.doc, app.session.rev());
-            let (start, end) = host.index.find_where(text, |start, _| on_page.is_none_or(|p| layout.page_of(start) == Some(p)), nth)?;
+            // Only a match that is laid out counts, with a page or without: one the layout never
+            // placed (a cell that continues a vertical merge) cannot be shown.
+            let (start, end) = host.index.find_where(text, |start, _| layout.page_of(start).is_some_and(|q| on_page.is_none_or(|p| p == q)), nth)?;
             let hint = on_page.or_else(|| layout.page_of(&start)).unwrap_or(0);
             let caret = layout.caret_on(&start, hint)?;
             app.session.sel = Selection { anchor: start, focus: end };
@@ -285,6 +407,10 @@ fn open(app: &mut WordApp, host: &mut HostState, name: &str, bytes: &[u8]) {
             if let Some(waiting) = host.pending_jump.take() {
                 host.bridge.emit(HostEvent::JumpNotFound { target: waiting.target });
             }
+            // The reported selection belonged to the document being replaced.
+            if std::mem::take(&mut host.reported) {
+                host.bridge.emit(HostEvent::SelectionCleared);
+            }
             app.session.set_document(doc);
             app.session.page_hint = 0;
             app.session.find = Default::default();
@@ -295,6 +421,8 @@ fn open(app: &mut WordApp, host: &mut HostState, name: &str, bytes: &[u8]) {
             host.find_anchor = None;
             // Marks belong to the document they were set on.
             host.marks.clear();
+            host.settled = app.session.sel.clone();
+            host.clear_reported = false;
             host.page_target = None;
             host.scroll_queued = true;
             let pages = app.session.layout().pages.len();
@@ -311,7 +439,7 @@ pub(crate) fn page_number(index: usize) -> u32 {
 
 #[cfg(test)]
 mod tests {
-    use super::{HostState, page_number};
+    use super::{HostState, host_texts, page_number};
     use crate::host::HostBridge;
 
     #[test]
@@ -335,6 +463,16 @@ mod tests {
         assert_eq!(host.target_scroll(), Some((5, 0.0)), "a page jump shows the page's top");
         host.page_target = None;
         assert_eq!(host.target_scroll(), None);
+    }
+
+    #[test]
+    fn selection_texts_collapse_whitespace_and_drop_object_placeholders() {
+        assert_eq!(host_texts("Pay\u{FFFC} the\n  goods"), Some(("Pay the goods".to_string(), "Pay the\n  goods".to_string())));
+        assert_eq!(host_texts("\u{FFFC}a\u{FFFC}"), Some(("a".to_string(), "a".to_string())));
+        // Nothing but whitespace or placeholders is nothing for the host to act on.
+        for blank in ["", " ", "\n\t ", "\u{FFFC}", " \u{FFFC}\n\u{FFFC} ", "\u{00A0}\u{2003}"] {
+            assert_eq!(host_texts(blank), None, "{blank:?}");
+        }
     }
 
     #[test]
