@@ -185,11 +185,22 @@ fn dropped_files_open_nothing() {
     let dir = scratch_dir("drop");
     let file = dir.join("other.docx");
     std::fs::write(&file, wordcraft_engine::io::save_bytes("other.docx", &clauses(1)).unwrap()).unwrap();
+    let drop_file = |h: &mut Harness<'static, WordApp>| {
+        let before = doc_json(h);
+        h.input_mut().dropped_files.push(std::sync::Arc::new(FileOnDisk(file.clone())));
+        frames(h, 3);
+        (before, doc_json(h))
+    };
+    // The same drop opens the file in the full app, so the view-mode assertion is not vacuous.
+    let mut full = full_app(clauses(5));
+    let (before, after) = drop_file(&mut full);
+    assert_ne!(after, before, "the full app did not open the dropped file");
+    assert_eq!(full.state().session.path.as_deref(), Some(file.as_path()));
+
     let (mut h, _bridge) = view_app(clauses(5), 1.0);
-    let before = doc_json(&h);
-    h.input_mut().dropped_files.push(std::sync::Arc::new(FileOnDisk(file)));
-    frames(&mut h, 3);
-    assert_eq!(doc_json(&h), before);
+    let (before, after) = drop_file(&mut h);
+    assert_eq!(after, before, "view mode opened the dropped file");
+    assert_ne!(h.state().session.path.as_deref(), Some(file.as_path()));
     let _ = std::fs::remove_dir_all(dir);
 }
 
@@ -211,36 +222,71 @@ fn the_comments_pane_cannot_rewrite_a_comment() {
     let mut editing = Session::new(clauses(3));
     editing.run("select.text", &json!({"text": "Supplier", "occurrence": 2})).unwrap();
     editing.run("review.newComment", &json!({"text": "Original remark"})).unwrap();
-    // A full engine under a view-mode UI: the pane lists the comment, so its editor is reachable
-    // and only the UI guard stands between it and the document.
-    let mut app = WordApp::new(Session::new(editing.doc.clone()), Services::default());
-    app.profile = EmbedProfile::View;
-    app.session.view.comments_pane = true;
-    let mut h = panes_harness(app);
-    let before = doc_json(&h);
-    h.get_by_role(Role::MultilineTextInput).focus();
-    frames(&mut h, 2);
-    h.get_by_role(Role::MultilineTextInput).type_text(" changed");
-    frames(&mut h, 2);
-    h.key_press(egui::Key::Escape);
-    frames(&mut h, 3);
-    assert_eq!(doc_json(&h), before, "the Comments pane wrote to the document");
+    // A full engine under each profile: the pane lists the comment, so its editor is reachable and
+    // only the UI guard stands between it and the document.
+    let edit_the_comment = |profile: EmbedProfile| {
+        let mut app = WordApp::new(Session::new(editing.doc.clone()), Services::default());
+        app.profile = profile;
+        app.session.view.comments_pane = true;
+        let mut h = panes_harness(app);
+        let before = doc_json(&h);
+        h.get_by_role(Role::MultilineTextInput).focus();
+        frames(&mut h, 2);
+        h.get_by_role(Role::MultilineTextInput).type_text(" changed");
+        frames(&mut h, 2);
+        h.key_press(egui::Key::Escape);
+        frames(&mut h, 3);
+        (before, doc_json(&h))
+    };
+    let (before, after) = edit_the_comment(EmbedProfile::Full);
+    assert!(!before.contains("Original remark changed") && after.contains("Original remark changed"), "the full app's pane did not edit the comment");
+    let (before, after) = edit_the_comment(EmbedProfile::View);
+    assert_eq!(after, before, "the Comments pane wrote to the document");
 }
 
 #[test]
 fn a_right_click_on_selected_text_opens_no_menu() {
-    let (mut h, _bridge) = view_app(clauses(5), 1.0);
     let selected = Selection { anchor: Pos::body(0, 0), focus: Pos::body(0, 9) };
-    h.state_mut().session.sel = selected.clone();
+    let right_click = |h: &mut Harness<'static, WordApp>, on: Pos| {
+        h.state_mut().session.sel = selected.clone();
+        let at = screen_of(h, &on);
+        click(h, at, egui::PointerButton::Secondary);
+        drawn_text(h)
+    };
+    // The same right-click opens the menu in the full app, so the view-mode assertion is not vacuous.
+    let mut full = full_app(clauses(5));
+    let text = right_click(&mut full, Pos::body(0, 3));
+    assert!(
+        text.contains("Copy") && text.contains("Cut"),
+        "the full app showed no context menu:
+{text}"
+    );
+
+    let (mut h, _bridge) = view_app(clauses(5), 1.0);
     let before = doc_json(&h);
-    let at = screen_of(&mut h, &Pos::body(0, 3));
-    click(&mut h, at, egui::PointerButton::Secondary);
-    let text = drawn_text(&h);
+    let text = right_click(&mut h, Pos::body(0, 3));
     for item in ["Copy", "Cut", "Paste", "Font"] {
         assert!(!text.contains(item), "a menu offered {item} in view mode:\n{text}");
     }
     assert_eq!(h.state().session.sel, selected, "a right-click inside the selection keeps it");
     assert_eq!(doc_json(&h), before);
+}
+
+#[test]
+fn a_right_click_outside_the_selection_runs_no_menu_preparation() {
+    // A right-click outside the selection moves the caret only to prepare the context menu; view
+    // mode has none, so the selection stays (and the menu's spelling and thesaurus lookups never run).
+    let selected = Selection { anchor: Pos::body(0, 0), focus: Pos::body(0, 9) };
+    let right_click_outside = |h: &mut Harness<'static, WordApp>| {
+        h.state_mut().session.sel = selected.clone();
+        let at = screen_of(h, &Pos::body(2, 20));
+        click(h, at, egui::PointerButton::Secondary);
+        h.state().session.sel.clone()
+    };
+    let mut full = full_app(clauses(5));
+    assert_ne!(right_click_outside(&mut full), selected, "the full app did not move the caret for its menu");
+    let (mut h, _bridge) = view_app(clauses(5), 1.0);
+    assert_eq!(right_click_outside(&mut h), selected);
 }
 
 #[test]
@@ -250,6 +296,21 @@ fn a_click_never_asks_for_a_text_input_cursor() {
     click(&mut h, at, egui::PointerButton::Primary);
     assert!(h.state().canvas.focused);
     assert!(h.output().platform_output.ime.is_none(), "an IME cursor focuses the text input and raises the on-screen keyboard");
+}
+
+#[test]
+fn focus_without_a_click_never_asks_for_a_text_input_cursor_either() {
+    // Focus can also come from the host page or Tab, through `want_focus`, with no pointer event.
+    let focus_without_a_click = |h: &mut Harness<'static, WordApp>| {
+        h.state_mut().canvas.want_focus = true;
+        frames(h, 3);
+        assert!(h.state().canvas.focused, "the canvas did not take focus");
+        h.output().platform_output.ime.is_some()
+    };
+    let mut full = full_app(clauses(5));
+    assert!(focus_without_a_click(&mut full), "the full app published no IME cursor, so this proves nothing");
+    let (mut h, _bridge) = view_app(clauses(5), 1.0);
+    assert!(!focus_without_a_click(&mut h), "an IME cursor focuses the text input and raises the on-screen keyboard");
 }
 
 #[test]
@@ -278,6 +339,11 @@ fn double_click_in_the_header_does_not_start_header_editing() {
 fn go_to_without_a_target_opens_no_dialog() {
     // Go To is navigation, so the gate lets it through; without a page or bookmark the engine asks
     // the UI to open the Go To dialog, which view mode must swallow.
+    let mut full = full_app(clauses(3));
+    let app = full.state_mut();
+    assert!(app.run("edit.goto", json!({})).is_ok());
+    assert_eq!(app.dialog.as_ref().map(|d| d.name()), Some("goto"), "the full app opened no Go To dialog, so this proves nothing");
+
     let (mut h, _bridge) = view_app(clauses(3), 1.0);
     let app = h.state_mut();
     assert!(app.run("edit.goto", json!({})).is_ok());
