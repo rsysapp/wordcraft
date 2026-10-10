@@ -8,9 +8,15 @@ const FAMILY: &str = "Sysfont Sans3";
 
 /// A bundled Source Sans 3 file renamed [`FAMILY`] (as long as the original name).
 fn renamed(file: &str) -> Vec<u8> {
+    renamed_as(file, FAMILY)
+}
+
+/// A bundled Source Sans 3 file renamed `family`, which must be as long as "Source Sans 3".
+fn renamed_as(file: &str, family: &str) -> Vec<u8> {
+    assert_eq!(family.len(), "Source Sans 3".len());
     let mut data = std::fs::read(Path::new(env!("CARGO_MANIFEST_DIR")).join("../../assets/fonts").join(file)).unwrap();
     let utf16 = |s: &str| s.encode_utf16().flat_map(u16::to_be_bytes).collect::<Vec<u8>>();
-    for (from, to) in [(utf16("Source Sans 3"), utf16(FAMILY)), (b"Source Sans 3".to_vec(), FAMILY.as_bytes().to_vec())] {
+    for (from, to) in [(utf16("Source Sans 3"), utf16(family)), (b"Source Sans 3".to_vec(), family.as_bytes().to_vec())] {
         let mut i = 0;
         while let Some(at) = data[i..].windows(from.len()).position(|w| w == from) {
             data[i + at..i + at + to.len()].copy_from_slice(&to);
@@ -155,5 +161,72 @@ fn lookups_racing_to_load_an_installed_font_all_find_it() {
         });
         assert!(found.iter().all(|f| f == FAMILY), "round {round}: {found:?}");
         assert_eq!(db.read_faces().iter().filter(|f| f.family == FAMILY).count(), 2, "round {round}: each face loads once");
+    }
+}
+
+#[test]
+fn a_fallback_family_another_lookup_loaded_serves_the_character() {
+    // "Apple Symbols" is a preferred fallback family as long as the file's own name.
+    let dir = std::env::temp_dir().join(format!("dc-sysfonts-{}-fallback-loaded", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let file = dir.join("Fallback.ttf");
+    std::fs::write(&file, renamed_as("SourceSans3-Regular.ttf", "Apple Symbols")).unwrap();
+    let db = FontDb::with_font_dirs(vec![dir]);
+    // Another lookup has loaded the family; then its file goes, so a scan can't find it again.
+    db.load_cataloged("Apple Symbols");
+    assert!(db.is_loaded("Apple Symbols"));
+    std::fs::remove_file(&file).unwrap();
+    assert!(db.system_fallback('A'), "a loaded face covers the character");
+    assert!(!db.sys.lock().unwrap().misses.contains(&'A'), "no miss is remembered");
+}
+
+#[test]
+fn an_installed_family_that_fails_to_load_is_retried() {
+    let dir = font_dir("unloadable");
+    let db = FontDb::with_font_dirs(vec![dir.clone()]);
+    assert!(db.has_family(FAMILY));
+    // Cataloged, then its files go before they load.
+    let moved = dir.with_extension("moved");
+    let _ = std::fs::remove_dir_all(&moved);
+    std::fs::rename(&dir, &moved).unwrap();
+    let (r, cache) = crate::word::resolve_in(&db, FAMILY, false, false);
+    assert_eq!(r.face.family, FALLBACK_FAMILY);
+    assert!(r.substituted && !cache, "the stand-in is marked and not kept");
+    // Back again: the next lookup finds the installed family.
+    std::fs::rename(&moved, &dir).unwrap();
+    let (r, cache) = crate::word::resolve_in(&db, FAMILY, false, false);
+    assert_eq!(r.face.family, FAMILY);
+    assert!(!r.substituted && cache);
+}
+
+#[test]
+fn lookups_racing_to_make_a_variable_instance_make_it_once() {
+    // Uses a variable system font when one is installed (no bundled font is variable).
+    let Some(data) = ["/System/Library/Fonts/Supplemental/Skia.ttf", "/System/Library/Fonts/NewYork.ttf"].iter().find_map(|p| std::fs::read(p).ok())
+    else {
+        eprintln!("no variable system font installed: nothing to check");
+        return;
+    };
+    for round in 0..20 {
+        let db = FontDb::with_font_dirs(vec![]);
+        db.add_font(data.clone());
+        let family = db.families().into_iter().find(|f| !FontDb::with_font_dirs(vec![]).has_family(f)).unwrap();
+        let base = db.styles(&family)[0].clone();
+        let style = format!("{base} {{wght:{}}}", 500 + round);
+        let start = std::sync::Barrier::new(8);
+        let ids: Vec<u32> = std::thread::scope(|s| {
+            let lookups: Vec<_> = (0..8)
+                .map(|_| {
+                    s.spawn(|| {
+                        start.wait();
+                        db.face(&family, &style).id()
+                    })
+                })
+                .collect();
+            lookups.into_iter().map(|l| l.join().unwrap()).collect()
+        });
+        assert!(ids.iter().all(|id| *id == ids[0]), "round {round}: {ids:?}");
+        assert_eq!(db.read_faces().iter().filter(|f| f.style == style).count(), 1, "round {round}");
     }
 }

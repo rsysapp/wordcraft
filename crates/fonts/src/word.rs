@@ -74,7 +74,17 @@ pub fn resolve(family: &str, bold: bool, italic: bool) -> Resolved {
     if let Some(r) = cache.lock().unwrap_or_else(|e| e.into_inner()).get(&key) {
         return *r;
     }
-    let db = FontDb::global();
+    let (r, keep) = resolve_in(FontDb::global(), family, bold, italic);
+    if keep {
+        cache.lock().unwrap_or_else(|e| e.into_inner()).insert(key, r);
+    }
+    r
+}
+
+/// Resolve `family` in `db`, and whether the answer may be kept for the process: not when the
+/// chosen family is installed but failed to load (its file changed or went since the scan), so
+/// a later lookup tries it again instead of using the stand-in for good.
+pub(crate) fn resolve_in(db: &FontDb, family: &str, bold: bool, italic: bool) -> (Resolved, bool) {
     let (fam, substituted) = if db.has_family(family) {
         (family.to_string(), false)
     } else {
@@ -82,9 +92,14 @@ pub fn resolve(family: &str, bold: bool, italic: bool) -> Resolved {
         (s.to_string(), true)
     };
     let face = db.face(&fam, style_name(bold, italic));
-    let r = Resolved { synth_bold: bold && face.weight < 600.0, synth_italic: italic && !face.italic, substituted, face: FaceRef::of(&face) };
-    cache.lock().unwrap_or_else(|e| e.into_inner()).insert(key, r);
-    r
+    let loaded = face.family.eq_ignore_ascii_case(&fam);
+    let r = Resolved {
+        synth_bold: bold && face.weight < 600.0,
+        synth_italic: italic && !face.italic,
+        substituted: substituted || !loaded,
+        face: FaceRef::of(&face),
+    };
+    (r, loaded)
 }
 
 /// Line metrics for a face in font units: (ascent, descent), both positive, the way word

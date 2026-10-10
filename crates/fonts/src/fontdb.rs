@@ -667,9 +667,11 @@ impl FontDb {
         n
     }
 
-    /// Load the files of the installed `family`. Returns whether any face was added.
+    /// Load the files of the installed `family`. Returns nothing on purpose: whether this call
+    /// added a face says nothing about whether the family is loaded (a racing lookup may have
+    /// added it first), so callers look it up again.
     #[cfg(not(target_arch = "wasm32"))]
-    fn load_cataloged(&self, family: &str) -> bool {
+    fn load_cataloged(&self, family: &str) {
         let paths: Vec<std::path::PathBuf> = {
             let cat = self.read_catalog();
             let mut p: Vec<_> = cat.iter().filter(|c| c.family.eq_ignore_ascii_case(family)).map(|c| c.path.clone()).collect();
@@ -677,13 +679,11 @@ impl FontDb {
             p.dedup();
             p
         };
-        let mut any = false;
         for p in paths {
             if let Ok(data) = std::fs::read(&p) {
-                any |= self.add_font(data) > 0;
+                self.add_font(data);
             }
         }
-        any
     }
 
     /// Resolve a family + style to a face, falling back to the closest style of the family, then to
@@ -759,8 +759,14 @@ impl FontDb {
             }
         }
         let f = make_face(base.bytes.clone(), base.index, base.family.clone(), style.to_string(), coords)?;
+        // Check again under the write lock: lookups racing to make the same instance add it
+        // once, since a duplicate gets its own id and splits the per-face caches.
+        let mut faces = self.faces.write().unwrap_or_else(|e| e.into_inner());
+        if let Some(made) = faces.iter().find(|g| g.family.eq_ignore_ascii_case(family) && g.style == style) {
+            return Some(made.clone());
+        }
         let f = Arc::new(f);
-        self.faces.write().unwrap_or_else(|e| e.into_inner()).push(f.clone());
+        faces.push(f.clone());
         Some(f)
     }
 
@@ -830,30 +836,44 @@ impl FontDb {
         let covered = |db: &FontDb| db.read_faces().iter().any(|f| f.covers(c));
         let cataloged: Vec<String> = self.read_catalog().iter().map(|e| e.family.clone()).collect();
         for fam in SYSTEM_FALLBACKS {
-            if !self.is_loaded(fam) && cataloged.iter().any(|f| f.eq_ignore_ascii_case(fam)) {
+            if !cataloged.iter().any(|f| f.eq_ignore_ascii_case(fam)) {
+                continue;
+            }
+            // A racing fallback may have loaded this family already: what counts is whether a
+            // loaded face covers `c` now, not who loaded it.
+            if !self.is_loaded(fam) {
                 self.load_cataloged(fam);
-                if covered(self) {
-                    return true;
-                }
+            }
+            if covered(self) {
+                return true;
             }
         }
         let mut paths: Vec<std::path::PathBuf> = self.catalog.read().unwrap_or_else(|e| e.into_inner()).iter().map(|e| e.path.clone()).collect();
         paths.sort();
         paths.dedup();
         for p in paths {
+            // Stop reading files once a racing fallback has loaded a face covering `c`.
+            if covered(self) {
+                return true;
+            }
             if std::fs::metadata(&p).map(|m| m.len() > 40 << 20).unwrap_or(true) {
                 continue;
             }
             let Ok(data) = std::fs::read(&p) else { continue };
             let hit =
                 enumerate_faces(&data).iter().any(|(i, _, _, _)| skrifa::FontRef::from_index(&data, *i).is_ok_and(|f| f.charmap().map(c).is_some()));
-            // As in `face`: a racing fallback may have added this file first.
+            // A racing fallback may have added this file first, and then this call adds nothing.
             if hit {
                 self.add_font(data);
                 if covered(self) {
                     return true;
                 }
             }
+        }
+        // A miss is remembered for good: never record one for a character a racing fallback
+        // has just covered.
+        if covered(self) {
+            return true;
         }
         self.sys.lock().unwrap_or_else(|e| e.into_inner()).misses.insert(c);
         false

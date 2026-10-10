@@ -166,6 +166,17 @@ fn tall_first_page_header_pushes_body_down() {
     let l = lay(&d);
     let first = l.caret(&Pos::body(0, 0)).unwrap();
     assert!(first.top > d.last_section.margin_top + 50.0, "{first:?}");
+    // Below the whole header block, not merely below the margin.
+    let header_bottom = l.pages[0]
+        .header
+        .iter()
+        .filter_map(|it| {
+            let Placed::Lines { para, l0, l1, y, .. } = it else { return None };
+            let (top, last) = (para.lines.get(*l0)?, para.lines.get(l1.checked_sub(1)?)?);
+            Some(y + last.top + last.height - top.top)
+        })
+        .fold(f32::MIN, f32::max);
+    assert!(header_bottom > d.last_section.margin_top && first.top >= header_bottom, "header ends {header_bottom}, body {first:?}");
     assert!(l.pages.len() > 1);
     // Page 1 only: every later page has no header and its body starts at the top margin. Asked
     // of each page's first line, not of a fixed paragraph: which paragraph lands where depends
