@@ -7,12 +7,15 @@ use crate::WordApp;
 
 pub struct HostState {
     pub bridge: HostBridge,
+    /// Set by Ctrl/⌘+F; the view bar focuses its find field on the next frame.
+    pub(crate) focus_find: bool,
+    pub(crate) find_query: String,
     last_page: Option<usize>,
 }
 
 impl HostState {
     pub fn new(bridge: HostBridge) -> Self {
-        HostState { bridge, last_page: None }
+        HostState { bridge, focus_find: false, find_query: String::new(), last_page: None }
     }
 }
 
@@ -48,6 +51,7 @@ fn open(app: &mut WordApp, host: &mut HostState, name: &str, bytes: &[u8]) {
             app.canvas.scroll_to_doc = Some((0, 0.0));
             app.canvas.visible_page = None;
             host.last_page = None;
+            host.find_query.clear();
             let pages = app.session.layout().pages.len();
             host.bridge.emit(HostEvent::Opened { pages: u32::try_from(pages).unwrap_or(u32::MAX) });
         }

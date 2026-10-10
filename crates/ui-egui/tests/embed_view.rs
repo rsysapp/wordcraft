@@ -9,7 +9,7 @@ use std::rc::Rc;
 use common::*;
 use egui::accesskit::Role;
 use egui_kittest::Harness;
-use egui_kittest::kittest::Queryable;
+use egui_kittest::kittest::{NodeT, Queryable};
 use serde_json::json;
 use wordcraft_doc::{Pos, StoryRef};
 use wordcraft_engine::{Selection, Session};
@@ -432,4 +432,140 @@ fn replace_is_refused_and_its_controls_are_never_drawn() {
     assert!(show_replace(&mut full).contains("Replace"), "the full app has no Replace controls to compare with");
     let text = show_replace(&mut h);
     assert!(!text.contains("Replace"), "view mode drew Replace controls:\n{text}");
+}
+
+#[test]
+fn the_view_bar_shows_the_page_and_moves_between_pages() {
+    let (mut h, _bridge) = view_app(clauses(120), 1.0);
+    let count = pages(&mut h);
+    assert!(drawn_text(&h).contains(&format!("Page 1 of {count}")), "{}", drawn_text(&h));
+    h.get_by_label("Next page").click();
+    frames(&mut h, 4);
+    assert_eq!(h.state().canvas.visible_page, Some(1));
+    h.get_by_label("Previous page").click();
+    frames(&mut h, 4);
+    assert_eq!(h.state().canvas.visible_page, Some(0));
+}
+
+#[test]
+fn the_view_bar_zooms_and_fits_the_page_width() {
+    let (mut h, _bridge) = view_app(clauses(10), 1.0);
+    let fitted = h.state().canvas.scale;
+    h.get_by_label("Zoom in").click();
+    frames(&mut h, 3);
+    let zoomed = h.state().canvas.scale;
+    assert!((zoomed - 1.1 * wordcraft_ui_egui::canvas::PX_PER_PT).abs() < 0.01, "{fitted} -> {zoomed}");
+    h.get_by_label("Fit page width").click();
+    frames(&mut h, 3);
+    assert!((h.state().canvas.scale - fitted).abs() < 0.01);
+}
+
+#[test]
+fn find_selects_matches_and_steps_through_them() {
+    let (mut h, _bridge) = view_app(clauses(30), 1.0);
+    h.get_by_role(Role::TextInput).focus();
+    frames(&mut h, 2);
+    h.get_by_role(Role::TextInput).type_text("schedule 2");
+    frames(&mut h, 3);
+    assert_eq!(h.state().session.selected_text(), "Schedule 2");
+    let first = h.state().session.sel.clone();
+    h.get_by_label("Next match").click();
+    frames(&mut h, 3);
+    assert_ne!(h.state().session.sel, first);
+    assert!(h.state().session.selected_text().eq_ignore_ascii_case("schedule 2"));
+    assert!(drawn_text(&h).contains("2 of "), "{}", drawn_text(&h));
+}
+
+#[test]
+fn ctrl_f_focuses_the_find_field() {
+    let (mut h, _bridge) = view_app(clauses(5), 1.0);
+    h.key_press_modifiers(egui::Modifiers::COMMAND, egui::Key::F);
+    frames(&mut h, 3);
+    assert!(h.get_by_role(Role::TextInput).is_focused());
+    assert!(h.state().dialog.is_none());
+}
+
+#[test]
+fn the_page_buttons_stop_at_the_ends_instead_of_wrapping() {
+    let (mut h, _bridge) = view_app(clauses(120), 1.0);
+    let count = pages(&mut h);
+    assert!(h.get_by_label("Previous page").accesskit_node().is_disabled(), "Previous is live on page 1");
+    assert!(!h.get_by_label("Next page").accesskit_node().is_disabled());
+    h.state_mut().canvas.visible_page = Some(count - 1);
+    frames(&mut h, 1);
+    assert!(h.get_by_label("Next page").accesskit_node().is_disabled(), "Next is live on the last page");
+    assert!(!h.get_by_label("Previous page").accesskit_node().is_disabled());
+}
+
+#[test]
+fn an_empty_document_shows_a_bar_that_cannot_navigate() {
+    let (mut h, _bridge) = embed_app();
+    frames(&mut h, 3);
+    assert!(drawn_text(&h).contains("Page 1 of 1"), "{}", drawn_text(&h));
+    assert!(h.get_by_label("Previous page").accesskit_node().is_disabled());
+    assert!(h.get_by_label("Next page").accesskit_node().is_disabled());
+    // A bar over no pages at all must not index into them.
+    let before = doc_json(&h);
+    wordcraft_ui_egui::host::view::go_to_page(h.state_mut(), 7);
+    wordcraft_ui_egui::host::view::go_to_page(h.state_mut(), usize::MAX);
+    frames(&mut h, 3);
+    assert_eq!(doc_json(&h), before);
+}
+
+#[test]
+fn find_reports_no_matches_and_an_empty_query_clears_the_highlight() {
+    let (mut h, _bridge) = view_app(clauses(30), 1.0);
+    h.get_by_role(Role::TextInput).focus();
+    frames(&mut h, 2);
+    h.get_by_role(Role::TextInput).type_text("zzz-nothing");
+    frames(&mut h, 3);
+    assert!(drawn_text(&h).contains("No matches"), "{}", drawn_text(&h));
+    assert!(!h.get_by_label("Next match").accesskit_node().is_disabled());
+    h.get_by_role(Role::TextInput).focus();
+    frames(&mut h, 1);
+    h.key_press_modifiers(egui::Modifiers::COMMAND, egui::Key::A);
+    h.key_press(egui::Key::Backspace);
+    frames(&mut h, 1);
+    h.get_by_role(Role::TextInput).type_text("Schedule 2");
+    frames(&mut h, 3);
+    assert_eq!(h.state().session.selected_text(), "Schedule 2");
+    h.key_press_modifiers(egui::Modifiers::COMMAND, egui::Key::A);
+    h.key_press(egui::Key::Backspace);
+    frames(&mut h, 3);
+    let app = h.state();
+    assert!(app.session.find.results.is_empty());
+    assert_eq!(app.session.selected_text(), "", "the match stayed highlighted");
+    assert!(h.get_by_label("Next match").accesskit_node().is_disabled());
+}
+
+#[test]
+fn enter_shift_enter_and_escape_work_in_the_find_field() {
+    let (mut h, _bridge) = view_app(clauses(30), 1.0);
+    h.get_by_role(Role::TextInput).focus();
+    frames(&mut h, 2);
+    h.get_by_role(Role::TextInput).type_text("schedule 2");
+    frames(&mut h, 3);
+    let first = h.state().session.sel.clone();
+    h.key_press(egui::Key::Enter);
+    frames(&mut h, 3);
+    let second = h.state().session.sel.clone();
+    assert_ne!(second, first, "Enter did not step to the next match");
+    assert!(h.get_by_role(Role::TextInput).is_focused(), "Enter left the field");
+    h.key_press_modifiers(egui::Modifiers::SHIFT, egui::Key::Enter);
+    frames(&mut h, 3);
+    assert_eq!(h.state().session.sel, first, "Shift+Enter did not step back");
+    h.key_press(egui::Key::Escape);
+    frames(&mut h, 3);
+    assert!(!h.get_by_role(Role::TextInput).is_focused());
+    assert!(h.get_by_role(Role::TextInput).value().unwrap_or_default().is_empty(), "Escape left the query");
+    assert_eq!(h.state().session.selected_text(), "");
+}
+
+#[test]
+fn the_view_bar_draws_no_replace_control() {
+    let (mut h, _bridge) = view_app(clauses(5), 1.0);
+    h.key_press_modifiers(egui::Modifiers::COMMAND, egui::Key::F);
+    frames(&mut h, 3);
+    let text = drawn_text(&h);
+    assert!(!text.contains("Replace"), "{text}");
 }
