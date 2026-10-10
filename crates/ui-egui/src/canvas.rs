@@ -327,7 +327,8 @@ pub fn show(app: &mut WordApp, ui: &mut Ui) {
     app.canvas.focused = resp.has_focus();
     mouse(app, ui, &resp, &rects, &layout, geo.scale);
     // Right-click: move the caret there (unless inside the selection) and look up what the
-    // context menu offers. embed: view mode has no context menu, so a right-click does neither.
+    // context menu offers.
+    // embed: view mode has no context menu, so a right-click does neither.
     if resp.secondary_clicked()
         && !app.profile.is_view()
         && let Some(p) = resp.interact_pointer_pos()
