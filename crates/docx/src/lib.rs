@@ -13,6 +13,7 @@ mod units;
 mod write;
 mod xml;
 
+// embed: a caller with less memory or stack than the desktop reads within tighter limits.
 pub use package::ReadLimits;
 pub use read::{read, read_with_limits};
 pub use write::write;

@@ -51,21 +51,27 @@ pub struct ReadLimits {
     /// Most XML elements parsed across every part of the package (each part also stays within the
     /// parser's own per-part limit). Every parse counts, so a part read twice counts twice.
     pub max_elements: usize,
+    /// Deepest XML element nesting in any part, at most the parser's own limit. The reader recurses
+    /// once per level, so this bounds its stack use: a caller with a small stack (WebAssembly's
+    /// 1 MiB) passes less than the default.
+    pub max_depth: usize,
 }
 
 impl Default for ReadLimits {
     fn default() -> Self {
-        ReadLimits { max_part_bytes: MAX_PART, max_total_bytes: MAX_TOTAL, max_elements: usize::MAX }
+        ReadLimits { max_part_bytes: MAX_PART, max_total_bytes: MAX_TOTAL, max_elements: usize::MAX, max_depth: xml::MAX_DEPTH }
     }
 }
 
 /// The decompressed parts of a package (bounded).
 pub struct Package {
     files: BTreeMap<String, Vec<u8>>,
-    /// embed: elements `xml` may still parse, and whether a parse ran out of them. The reader skips
-    /// a broken secondary part, so a spent budget is recorded here and refused at the end.
+    /// embed: elements `xml` may still parse, how deep they may nest, and whether a parse went past
+    /// either limit. The reader skips a broken secondary part, so a limit reached is recorded here
+    /// and refused at the end.
     elements_left: Cell<usize>,
-    budget_spent: Cell<bool>,
+    max_depth: usize,
+    limit_reached: Cell<bool>,
 }
 
 impl Package {
@@ -117,12 +123,13 @@ impl Package {
             total = total.saturating_add(buf.len() as u64);
             files.insert(name, buf);
         }
-        Ok(Package { files, elements_left: Cell::new(limits.max_elements), budget_spent: Cell::new(false) })
+        Ok(Package { files, elements_left: Cell::new(limits.max_elements), max_depth: limits.max_depth, limit_reached: Cell::new(false) })
     }
 
-    /// embed: whether a part was refused because the package's element budget ran out.
-    pub fn budget_spent(&self) -> bool {
-        self.budget_spent.get()
+    /// embed: whether a part was refused because the package's element budget ran out or it nested
+    /// deeper than a caller's tighter depth limit.
+    pub fn limit_reached(&self) -> bool {
+        self.limit_reached.get()
     }
 
     /// Part bytes by name (leading `/` ignored; case-insensitive fallback).
@@ -138,14 +145,18 @@ impl Package {
         let Some(b) = self.get(name) else { return Ok(None) };
         // embed: one element budget across the package, so many parts cannot each fill the per-part limit.
         let left = self.elements_left.get();
-        match xml::parse_limited(b, left.min(xml::MAX_ELEMENTS)) {
+        match xml::parse_limited(b, left.min(xml::MAX_ELEMENTS), self.max_depth) {
             Ok((root, used)) => {
                 self.elements_left.set(left.saturating_sub(used));
                 Ok(Some(root))
             }
             Err(e) => {
-                if left < xml::MAX_ELEMENTS && matches!(&e, DocxError::Limit(m) if m == xml::TOO_MANY_ELEMENTS) {
-                    self.budget_spent.set(true);
+                // Only the caller's tighter limits refuse the file; past the parser's own, a
+                // secondary part is skipped as before.
+                let spent = left < xml::MAX_ELEMENTS && matches!(&e, DocxError::Limit(m) if m == xml::TOO_MANY_ELEMENTS);
+                let too_deep = self.max_depth < xml::MAX_DEPTH && matches!(&e, DocxError::Limit(m) if m == xml::TOO_DEEP);
+                if spent || too_deep {
+                    self.limit_reached.set(true);
                 }
                 Err(e)
             }

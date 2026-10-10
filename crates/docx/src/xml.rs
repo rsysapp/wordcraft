@@ -162,15 +162,19 @@ impl El {
 
 /// The error `parse_limited` answers when a part holds more elements than it may.
 pub const TOO_MANY_ELEMENTS: &str = "too many XML elements";
+/// embed: the error `parse_limited` answers when elements nest deeper than it may.
+pub const TOO_DEEP: &str = "XML nesting too deep";
 
 /// Parse XML bytes into the root element.
 pub fn parse(bytes: &[u8]) -> Result<El, DocxError> {
-    parse_limited(bytes, MAX_ELEMENTS).map(|(root, _)| root)
+    parse_limited(bytes, MAX_ELEMENTS, MAX_DEPTH).map(|(root, _)| root)
 }
 
-/// embed: [`parse`] with at most `max_elements` elements; also answers how many it read, so a
-/// package can spend one budget across its parts.
-pub fn parse_limited(bytes: &[u8], max_elements: usize) -> Result<(El, usize), DocxError> {
+/// embed: [`parse`] with at most `max_elements` elements, nested at most `max_depth` deep (never
+/// deeper than [`MAX_DEPTH`]); also answers how many elements it read, so a package can spend one
+/// budget across its parts.
+pub fn parse_limited(bytes: &[u8], max_elements: usize, max_depth: usize) -> Result<(El, usize), DocxError> {
+    let max_depth = max_depth.min(MAX_DEPTH);
     // Strip a UTF-8 BOM; UTF-16 parts are rare in OOXML and rejected.
     let bytes = bytes.strip_prefix(&[0xEF, 0xBB, 0xBF][..]).unwrap_or(bytes);
     if bytes.starts_with(&[0xFF, 0xFE]) || bytes.starts_with(&[0xFE, 0xFF]) {
@@ -227,8 +231,9 @@ pub fn parse_limited(bytes: &[u8], max_elements: usize) -> Result<(El, usize), D
                     el.attrs.push((aname, val));
                 }
                 if matches!(ev, Event::Start(_)) {
-                    if stack.len() >= MAX_DEPTH {
-                        return Err(DocxError::Limit("XML nesting too deep".into()));
+                    // embed: the caller's depth (at most MAX_DEPTH).
+                    if stack.len() >= max_depth {
+                        return Err(DocxError::Limit(TOO_DEEP.into()));
                     }
                     stack.push(el);
                 } else {

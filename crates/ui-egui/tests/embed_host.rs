@@ -53,6 +53,30 @@ fn no_page_changed_comes_before_the_first_opened() {
     bridge.send(HostCommand::JumpTo(JumpTarget::Page { page: 2 }));
     frames(&mut h, 4);
     assert_eq!(bridge.take_events(), vec![HostEvent::PageChanged { page: 2 }]);
+    // A second open: its `opened` comes before its page, which is reported again even though the
+    // previous document was on another one.
+    let events = open_doc(&mut h, &bridge, &clauses(120));
+    assert_eq!(events, vec![HostEvent::Opened { pages: count }, HostEvent::PageChanged { page: 1 }]);
+}
+
+/// The same for a one-page document, whose page 1 is also the empty starting document's only page.
+#[test]
+fn a_one_page_document_reports_its_page_only_after_opened() {
+    let bridge = HostBridge::new();
+    let app = WordApp::new(Session::new(Document::new()), Services::default()).with_host(bridge.clone(), EmbedProfile::View);
+    let mut h = harness(app, 1.0);
+    bridge.set_context(h.ctx.clone());
+    wordcraft_ui_egui::host::prepare_context(&h.ctx);
+    frames(&mut h, 3);
+    bridge.send(HostCommand::JumpTo(JumpTarget::Page { page: 1 }));
+    frames(&mut h, 3);
+    assert!(!bridge.take_events().iter().any(|e| matches!(e, HostEvent::PageChanged { .. })));
+    let events = open_doc(&mut h, &bridge, &clauses(1));
+    assert_eq!(pages(&mut h), 1);
+    assert_eq!(events, vec![HostEvent::Opened { pages: 1 }, HostEvent::PageChanged { page: 1 }]);
+    // Opening it again reports its page again, after `opened`.
+    let events = open_doc(&mut h, &bridge, &clauses(1));
+    assert_eq!(events, vec![HostEvent::Opened { pages: 1 }, HostEvent::PageChanged { page: 1 }]);
 }
 
 #[test]
@@ -130,7 +154,9 @@ fn a_second_open_replaces_the_document_and_reports_page_one_again() {
     open_doc(&mut h, &bridge, &clauses(120));
     h.state_mut().canvas.scroll_to_doc = Some((2, 0.0));
     frames(&mut h, 4);
-    bridge.take_events();
+    // The view really was on page 3, so page 1 below is the open's doing.
+    assert_eq!(bridge.take_events(), vec![HostEvent::PageChanged { page: 3 }]);
+    assert_eq!(h.state().canvas.visible_page, Some(2));
     // Several pages, so the previous document's scroll position still lands on a page of this one.
     let events = open_doc(&mut h, &bridge, &clauses(120));
     let count = pages(&mut h) as u32;
@@ -482,6 +508,45 @@ fn elements_just_over_the_embed_budget_are_too_large_and_at_it_open() {
     let budget = EMBED_LIMITS.max_elements;
     assert_eq!(open_document("dense.docx", &document_with_elements(budget - 2 + 1)).err().as_deref(), Some(TOO_LARGE));
     assert!(open_document("dense.docx", &document_with_elements(budget - 2)).is_ok());
+}
+
+/// A document whose paragraph sits inside `levels` nested block-level `w:customXml` elements, the
+/// reader's deepest path per level: document, body, the levels, then paragraph, run and text.
+fn document_nested(levels: usize) -> Vec<u8> {
+    let mut xml = br#"<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:body>"#.to_vec();
+    xml.extend(b"<w:customXml>".repeat(levels));
+    xml.extend(b"<w:p><w:r><w:t>deep</w:t></w:r></w:p>");
+    xml.extend(b"</w:customXml>".repeat(levels));
+    xml.extend(b"</w:body></w:document>");
+    zip(&[content_types(), Entry::stored("word/document.xml", &xml)])
+}
+
+#[test]
+fn hostile_nesting_is_refused_as_too_complex_without_recursing() {
+    use wordcraft_ui_egui::host::open::{EMBED_LIMITS, TOO_LARGE, open_document};
+    // 10,000 levels: the parser stops at the limit, long before the reader could recurse that deep.
+    assert_eq!(open_document("nested.docx", &document_nested(10_000)).err().as_deref(), Some(TOO_LARGE));
+    // At the limit (document, body and the paragraph's three levels around the nesting) it opens.
+    let at_limit = EMBED_LIMITS.max_depth - 5;
+    let doc = open_document("nested.docx", &document_nested(at_limit)).expect("nesting at the limit opens");
+    assert_eq!(doc.plain_text(wordcraft_doc::StoryRef::Body), "deep");
+    assert_eq!(open_document("nested.docx", &document_nested(at_limit + 1)).err().as_deref(), Some(TOO_LARGE));
+    // Through the host, on a thread with WebAssembly's 1 MiB of stack: a clean `openFailed`, and the
+    // open document stays.
+    let (events, kept) = std::thread::Builder::new()
+        .stack_size(1 << 20)
+        .spawn(|| {
+            let (mut h, bridge) = embed_app();
+            open_doc(&mut h, &bridge, &clauses(3));
+            bridge.send(HostCommand::Open { name: "nested.docx".into(), bytes: document_nested(10_000) });
+            frames(&mut h, 3);
+            (bridge.take_events(), h.state().session.doc.plain_text(wordcraft_doc::StoryRef::Body).starts_with("Clause 1."))
+        })
+        .expect("thread starts")
+        .join()
+        .expect("no stack overflow");
+    assert_eq!(events, vec![HostEvent::OpenFailed { message: TOO_LARGE.to_string() }]);
+    assert!(kept, "the open document stays");
 }
 
 #[test]

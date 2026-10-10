@@ -214,7 +214,55 @@ fn default_limits_are_unchanged() {
     let (z, _) = counted_package(1_000, 10);
     assert_eq!(read_with_limits(&z, &ReadLimits::default()).map(|d| d.body.len()), read(&z).map(|d| d.body.len()));
     let limits = ReadLimits::default();
-    assert_eq!((limits.max_part_bytes, limits.max_total_bytes, limits.max_elements), (256 << 20, 512 << 20, usize::MAX));
+    assert_eq!((limits.max_part_bytes, limits.max_total_bytes, limits.max_elements, limits.max_depth), (256 << 20, 512 << 20, usize::MAX, 256));
+}
+
+/// A document whose paragraph sits inside `levels` nested `w:customXml` elements: document, body,
+/// the levels, paragraph, run and text.
+fn nested_document(levels: usize) -> String {
+    format!(
+        "<w:document {W_NS}><w:body>{}<w:p><w:r><w:t>deep</w:t></w:r></w:p>{}</w:body></w:document>",
+        "<w:customXml>".repeat(levels),
+        "</w:customXml>".repeat(levels)
+    )
+}
+
+#[test]
+fn a_caller_can_cap_the_nesting_depth() {
+    let depth = |max_depth| ReadLimits { max_depth, ..ReadLimits::default() };
+    let at = |levels| doc_zip(nested_document(levels).as_bytes());
+    // Five levels besides the nesting: 64 in all fit exactly.
+    assert!(read_with_limits(&at(59), &depth(64)).is_ok());
+    assert!(matches!(read_with_limits(&at(60), &depth(64)), Err(DocxError::Limit(_))));
+    assert!(matches!(read_with_limits(&at(10_000), &depth(64)), Err(DocxError::Limit(_))));
+    // The default reads what the parser's own limit allows, as before.
+    assert!(read(&at(200)).is_ok());
+    assert!(matches!(read(&at(10_000)), Err(DocxError::Limit(_))));
+    // A depth above the parser's own limit is the parser's limit.
+    assert!(matches!(read_with_limits(&at(300), &depth(usize::MAX)), Err(DocxError::Limit(_))));
+}
+
+#[test]
+fn a_secondary_part_too_deep_for_the_caller_refuses_the_file() {
+    // The reader skips a broken secondary part, but one refused for the caller's tighter depth must
+    // not leave a document shown without it. Past the parser's own limit it is skipped, as before.
+    let rels = r#"<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="c" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/comments" Target="comments.xml"/></Relationships>"#;
+    let comments = |levels: usize| format!("<w:comments {W_NS}>{}{}</w:comments>", "<w:x>".repeat(levels), "</w:x>".repeat(levels));
+    let package = |levels| {
+        let doc = nested_document(1);
+        let comments = comments(levels);
+        zip(&[
+            ("_rels/.rels", ROOT_RELS.as_bytes()),
+            ("word/document.xml", doc.as_bytes()),
+            ("word/_rels/document.xml.rels", rels.as_bytes()),
+            ("word/comments.xml", comments.as_bytes()),
+        ])
+    };
+    let tight = ReadLimits { max_depth: 64, ..ReadLimits::default() };
+    assert!(read_with_limits(&package(60), &tight).is_ok());
+    assert!(matches!(read_with_limits(&package(100), &tight), Err(DocxError::Limit(_))));
+    assert!(read(&package(100)).is_ok());
+    assert!(read(&package(10_000)).is_ok(), "past the parser's own limit the part is skipped");
 }
 
 #[test]

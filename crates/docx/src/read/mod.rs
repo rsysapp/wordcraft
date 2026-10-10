@@ -13,6 +13,7 @@ use wordcraft_doc::styles::{Style, StyleKind, StyleSheet, TableStyleParts};
 use wordcraft_doc::{Blocks, Comment, Document, PartKind, Revision, RevisionKind};
 
 use crate::DocxError;
+// embed: ReadLimits for `read_with_limits`.
 use crate::package::{Package, ReadLimits, Rels, rt};
 use crate::units::{flag, int, on_off, tw, u32_of};
 use crate::xml::El;
@@ -122,9 +123,9 @@ pub fn read_with_limits(bytes: &[u8], limits: &ReadLimits) -> Result<Document, D
     {
         r.doc.passthrough.insert("docProps/custom.xml".into(), Arc::new(b.to_vec()));
     }
-    // embed: a skipped part must not pass for a whole document when the budget ran out.
-    if pkg.budget_spent() {
-        return Err(DocxError::Limit("too many XML elements in the package".into()));
+    // embed: a skipped part must not pass for a whole document when a caller's limit was reached.
+    if pkg.limit_reached() {
+        return Err(DocxError::Limit("a part is past the read limits (elements or nesting)".into()));
     }
     let mut doc = r.doc;
     doc.ensure_nonempty();

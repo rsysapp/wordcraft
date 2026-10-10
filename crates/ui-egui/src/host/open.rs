@@ -20,7 +20,14 @@ pub const MAX_OPEN_BYTES: usize = 100 * 1024 * 1024;
 /// formatted page holds roughly a thousand elements, so real documents of a couple of thousand
 /// pages fit. Pictures make up most of a package's bytes: 64 MiB for one is generous, and 192 MiB
 /// in all leaves room beside the up-to-100 MB file itself.
-pub const EMBED_LIMITS: ReadLimits = ReadLimits { max_part_bytes: 64 << 20, max_total_bytes: 192 << 20, max_elements: 2_000_000 };
+///
+/// Elements nest at most 64 deep (the desktop allows 256). The reader recurses once per level, and a
+/// stack overflow traps the module just as a panic does. Measured in Chromium on WebAssembly's
+/// 1 MiB stack, the deepest reading path (block-level `w:customXml` or `w:ins`, nested) peaks at
+/// about 2 KiB a level with the frame around it: 132 KiB at 60 levels, 503 KiB at 250. So 64 levels
+/// stay near 140 KiB. Real documents nest far less: text in a shape's text box inside a table cell
+/// inside a content control is 21 levels, and each further nested table adds 3.
+pub const EMBED_LIMITS: ReadLimits = ReadLimits { max_part_bytes: 64 << 20, max_total_bytes: 192 << 20, max_elements: 2_000_000, max_depth: 64 };
 const WORD_EXTENSIONS: &[&str] = &["docx", "docm", "dotx"];
 /// OLE compound files: password-protected Word packages (and legacy binary files) start with this.
 const COMPOUND_FILE: [u8; 8] = [0xD0, 0xCF, 0x11, 0xE0, 0xA1, 0xB1, 0x1A, 0xE1];
