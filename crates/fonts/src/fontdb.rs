@@ -230,6 +230,31 @@ pub struct FontDb {
     /// System fallback state: enabled, and characters no system font covers.
     #[cfg(not(target_arch = "wasm32"))]
     sys: Mutex<SysFallback>,
+    /// Installed families whose files failed to load since the last scan, so lookups don't read
+    /// them again on every call. Cleared by each scan.
+    #[cfg(not(target_arch = "wasm32"))]
+    failed: Mutex<FailedLoads>,
+    /// Times `load_cataloged` read a family's files (tests check that a failure isn't retried).
+    #[cfg(test)]
+    load_attempts: std::sync::atomic::AtomicUsize,
+    /// Waited on by `instance` between making a face and adding it, so a test can make two
+    /// lookups overlap there.
+    #[cfg(test)]
+    instance_gate: Mutex<Option<Arc<std::sync::Barrier>>>,
+    /// Waited on twice by `load_cataloged` after reading a family's files and before recording
+    /// a failure ("reads done", then "go on"), so a test can rescan in between.
+    #[cfg(test)]
+    load_gate: Mutex<Option<Arc<std::sync::Barrier>>>,
+}
+
+/// Families that failed to load, and the scan they were recorded against.
+#[cfg(not(target_arch = "wasm32"))]
+#[derive(Default)]
+struct FailedLoads {
+    /// Bumped by every scan: a load that began before a rescan must not record its failure
+    /// against the new catalog, where the file may be fixed.
+    scan: u64,
+    families: std::collections::HashSet<String>,
 }
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -521,6 +546,14 @@ impl FontDb {
             cataloged: std::sync::OnceLock::new(),
             #[cfg(not(target_arch = "wasm32"))]
             sys: Mutex::new(SysFallback { enabled: true, ..Default::default() }),
+            #[cfg(not(target_arch = "wasm32"))]
+            failed: Mutex::new(FailedLoads::default()),
+            #[cfg(test)]
+            load_attempts: std::sync::atomic::AtomicUsize::new(0),
+            #[cfg(test)]
+            instance_gate: Mutex::new(None),
+            #[cfg(test)]
+            load_gate: Mutex::new(None),
         }
     }
 
@@ -664,12 +697,17 @@ impl FontDb {
         let n = found.len();
         log::debug!("cataloged {n} system font faces");
         *self.catalog.write().unwrap_or_else(|e| e.into_inner()) = found;
+        // The new catalog may list fixed files: let failed families load again.
+        let mut failed = self.failed.lock().unwrap_or_else(|e| e.into_inner());
+        failed.scan += 1;
+        failed.families.clear();
         n
     }
 
     /// Load the files of the installed `family`. Returns nothing on purpose: whether this call
     /// added a face says nothing about whether the family is loaded (a racing lookup may have
-    /// added it first), so callers look it up again.
+    /// added it first), so callers look it up again. A family whose files failed to load is not
+    /// read again until the next scan.
     #[cfg(not(target_arch = "wasm32"))]
     fn load_cataloged(&self, family: &str) {
         let paths: Vec<std::path::PathBuf> = {
@@ -679,10 +717,38 @@ impl FontDb {
             p.dedup();
             p
         };
+        if paths.is_empty() {
+            return;
+        }
+        let key = family.to_lowercase();
+        let scan = {
+            let failed = self.failed.lock().unwrap_or_else(|e| e.into_inner());
+            if failed.families.contains(&key) {
+                return;
+            }
+            failed.scan
+        };
+        #[cfg(test)]
+        self.load_attempts.fetch_add(1, Ordering::Relaxed);
         for p in paths {
             if let Ok(data) = std::fs::read(&p) {
                 self.add_font(data);
             }
+        }
+        #[cfg(test)]
+        {
+            let gate = self.load_gate.lock().unwrap_or_else(|e| e.into_inner()).clone();
+            if let Some(gate) = gate {
+                gate.wait();
+                gate.wait();
+            }
+        }
+        // Record a failure only while the family is still not loaded (a racing load may have
+        // succeeded; a success wins) and no rescan has happened since this load began. Lookups
+        // look for loaded faces before they consult this record, so it never hides one.
+        let mut failed = self.failed.lock().unwrap_or_else(|e| e.into_inner());
+        if failed.scan == scan && !self.is_loaded(family) {
+            failed.families.insert(key);
         }
     }
 
@@ -759,6 +825,14 @@ impl FontDb {
             }
         }
         let f = make_face(base.bytes.clone(), base.index, base.family.clone(), style.to_string(), coords)?;
+        #[cfg(test)]
+        {
+            // Cloned out first: waiting while holding the lock would block the other lookup.
+            let gate = self.instance_gate.lock().unwrap_or_else(|e| e.into_inner()).clone();
+            if let Some(gate) = gate {
+                gate.wait();
+            }
+        }
         // Check again under the write lock: lookups racing to make the same instance add it
         // once, since a duplicate gets its own id and splits the per-face caches.
         let mut faces = self.faces.write().unwrap_or_else(|e| e.into_inner());

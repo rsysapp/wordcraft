@@ -182,7 +182,7 @@ fn a_fallback_family_another_lookup_loaded_serves_the_character() {
 }
 
 #[test]
-fn an_installed_family_that_fails_to_load_is_retried() {
+fn a_family_that_fails_to_load_is_not_read_again_until_a_rescan() {
     let dir = font_dir("unloadable");
     let db = FontDb::with_font_dirs(vec![dir.clone()]);
     assert!(db.has_family(FAMILY));
@@ -190,22 +190,148 @@ fn an_installed_family_that_fails_to_load_is_retried() {
     let moved = dir.with_extension("moved");
     let _ = std::fs::remove_dir_all(&moved);
     std::fs::rename(&dir, &moved).unwrap();
-    let (r, cache) = crate::word::resolve_in(&db, FAMILY, false, false);
+    let attempts = || db.load_attempts.load(Ordering::Relaxed);
+    let (r, keep) = crate::word::resolve_in(&db, FAMILY, false, false);
     assert_eq!(r.face.family, FALLBACK_FAMILY);
-    assert!(r.substituted && !cache, "the stand-in is marked and not kept");
-    // Back again: the next lookup finds the installed family.
+    assert!(r.substituted && !keep, "the stand-in is marked and not kept");
+    assert_eq!(attempts(), 1);
+    // Later lookups go straight to the stand-in.
+    let (r, keep) = crate::word::resolve_in(&db, FAMILY, true, false);
+    assert!(r.substituted && !keep);
+    assert_eq!(db.face(FAMILY, "Regular").family, FALLBACK_FAMILY);
+    assert_eq!(attempts(), 1, "the failed family is not read again");
+    // Fixed on disk: still remembered until a rescan, which lets it load.
     std::fs::rename(&moved, &dir).unwrap();
-    let (r, cache) = crate::word::resolve_in(&db, FAMILY, false, false);
+    assert_eq!(db.face(FAMILY, "Regular").family, FALLBACK_FAMILY);
+    assert_eq!(attempts(), 1);
+    db.load_system_fonts();
+    let (r, keep) = crate::word::resolve_in(&db, FAMILY, false, false);
     assert_eq!(r.face.family, FAMILY);
-    assert!(!r.substituted && cache);
+    assert!(!r.substituted && keep);
+    assert_eq!(attempts(), 2);
+}
+
+#[test]
+fn a_recorded_failure_never_hides_a_loaded_face() {
+    let dir = font_dir("failed-then-added");
+    let db = FontDb::with_font_dirs(vec![dir.clone()]);
+    db.load_system_fonts();
+    let regular = std::fs::read(dir.join("Sysfont-Regular.ttf")).unwrap();
+    std::fs::remove_dir_all(&dir).unwrap();
+    assert_eq!(db.face(FAMILY, "Regular").family, FALLBACK_FAMILY);
+    assert!(db.failed.lock().unwrap().families.contains(&FAMILY.to_lowercase()));
+    // Another load adds the family after the failure was recorded: the face is found.
+    db.add_font(regular);
+    assert_eq!(db.face(FAMILY, "Regular").family, FAMILY);
+}
+
+#[test]
+fn a_failed_read_is_not_recorded_once_the_family_is_loaded() {
+    let dir = font_dir("loaded-then-failed");
+    let db = FontDb::with_font_dirs(vec![dir.clone()]);
+    db.load_system_fonts();
+    // A racing load succeeded; then this one's reads fail.
+    db.add_font(std::fs::read(dir.join("Sysfont-Regular.ttf")).unwrap());
+    std::fs::remove_dir_all(&dir).unwrap();
+    db.load_cataloged(FAMILY);
+    assert!(db.failed.lock().unwrap().families.is_empty(), "the success wins");
+}
+
+#[test]
+fn a_failure_found_before_a_rescan_is_not_recorded_after_it() {
+    let dir = font_dir("rescan-during-load");
+    let db = FontDb::with_font_dirs(vec![dir.clone()]);
+    db.load_system_fonts();
+    let moved = dir.with_extension("moved");
+    let _ = std::fs::remove_dir_all(&moved);
+    std::fs::rename(&dir, &moved).unwrap();
+    let gate = Arc::new(std::sync::Barrier::new(2));
+    *db.load_gate.lock().unwrap() = Some(gate.clone());
+    std::thread::scope(|s| {
+        // This lookup's reads fail; it waits before recording that.
+        let lookup = s.spawn(|| db.face(FAMILY, "Regular").family.clone());
+        gate.wait();
+        // Meanwhile the files come back and the folders are scanned again.
+        std::fs::rename(&moved, &dir).unwrap();
+        *db.load_gate.lock().unwrap() = None;
+        db.load_system_fonts();
+        gate.wait();
+        assert_eq!(lookup.join().unwrap(), FALLBACK_FAMILY);
+    });
+    assert_eq!(db.face(FAMILY, "Regular").family, FAMILY, "the stale failure was not recorded");
+}
+
+/// `data` (a single font) with an `fvar` table added: one `wght` axis, 200 to 900, default 400.
+/// It then loads as a variable font, which no bundled font is. Outlines don't vary (no `gvar`),
+/// which doesn't matter to how instances are made and kept.
+fn with_weight_axis(data: &[u8]) -> Vec<u8> {
+    let tables = u16::from_be_bytes([data[4], data[5]]) as usize;
+    let mut fvar = Vec::new();
+    // Version 1.0, axes at 16, reserved 2, one axis of 20 bytes, no named instances (size 8).
+    for v in [1_u16, 0, 16, 2, 1, 20, 0, 8] {
+        fvar.extend_from_slice(&v.to_be_bytes());
+    }
+    fvar.extend_from_slice(b"wght");
+    for v in [200_i32, 400, 900] {
+        fvar.extend_from_slice(&(v << 16).to_be_bytes());
+    }
+    fvar.extend_from_slice(&[0, 0, 1, 0]); // flags, name id 256
+    // Every table moves down by the one new 16-byte directory record.
+    let mut records: Vec<[u8; 16]> = (0..tables)
+        .map(|r| {
+            let mut rec: [u8; 16] = data[12 + r * 16..28 + r * 16].try_into().unwrap();
+            let offset = u32::from_be_bytes(rec[8..12].try_into().unwrap()) + 16;
+            rec[8..12].copy_from_slice(&offset.to_be_bytes());
+            rec
+        })
+        .collect();
+    let body = &data[12 + tables * 16..];
+    let mut end = 12 + (tables + 1) * 16 + body.len();
+    let pad = (4 - end % 4) % 4;
+    end += pad;
+    let mut rec = [0_u8; 16];
+    rec[..4].copy_from_slice(b"fvar");
+    rec[8..12].copy_from_slice(&(end as u32).to_be_bytes());
+    rec[12..].copy_from_slice(&(fvar.len() as u32).to_be_bytes());
+    records.push(rec);
+    // Readers find tables by binary search over the sorted tags.
+    records.sort_by_key(|r| [r[0], r[1], r[2], r[3]]);
+    let mut out = data[..12].to_vec();
+    out[4..6].copy_from_slice(&((tables + 1) as u16).to_be_bytes());
+    records.iter().for_each(|r| out.extend_from_slice(r));
+    out.extend_from_slice(body);
+    out.extend(std::iter::repeat_n(0, pad));
+    out.extend_from_slice(&fvar);
+    out
+}
+
+#[test]
+fn lookups_overlapping_to_make_a_variable_instance_make_it_once() {
+    let db = FontDb::with_font_dirs(vec![]);
+    assert_eq!(db.add_font(with_weight_axis(&renamed("SourceSans3-Regular.ttf"))), 1);
+    assert!(db.axes(FAMILY, "Regular").iter().any(|a| a.0 == "wght"), "the font is variable");
+    // Both lookups have missed the instance and made their own before either adds it.
+    *db.instance_gate.lock().unwrap() = Some(Arc::new(std::sync::Barrier::new(2)));
+    let style = "Regular {wght:650}";
+    let ids: Vec<u32> = std::thread::scope(|s| {
+        let lookups: Vec<_> = (0..2).map(|_| s.spawn(|| db.face(FAMILY, style).id())).collect();
+        lookups.into_iter().map(|l| l.join().unwrap()).collect()
+    });
+    *db.instance_gate.lock().unwrap() = None;
+    assert_eq!(ids[0], ids[1], "both lookups get the one instance");
+    assert_eq!(db.read_faces().iter().filter(|f| f.style == style).count(), 1);
+    let made = db.face(FAMILY, style);
+    assert!(made.id() == ids[0] && made.coords.iter().any(|(t, v)| t == b"wght" && *v == 650.0));
 }
 
 #[test]
 fn lookups_racing_to_make_a_variable_instance_make_it_once() {
-    // Uses a variable system font when one is installed (no bundled font is variable).
+    // An extra check on a real variable font, when one is installed.
     let Some(data) = ["/System/Library/Fonts/Supplemental/Skia.ttf", "/System/Library/Fonts/NewYork.ttf"].iter().find_map(|p| std::fs::read(p).ok())
     else {
-        eprintln!("no variable system font installed: nothing to check");
+        // No runtime skip in the test harness: say so loudly. The in-code variable font test
+        // (`lookups_overlapping_to_make_a_variable_instance_make_it_once`) proves the fix.
+        eprintln!("warning: SKIPPED: no variable system font installed; nothing checked here");
         return;
     };
     for round in 0..20 {
