@@ -1438,3 +1438,153 @@ fn text_jump_occurrences_count_only_laid_out_matches_with_or_without_a_page() {
         assert!(bridge.take_events().contains(&HostEvent::JumpNotFound { target: past }), "page {page:?}");
     }
 }
+
+// --- Selection events: fix round 1 ---
+
+/// A paragraph of `(text, props)` parts.
+fn paragraph_of(parts: &[(&str, wordcraft_doc::props::CharProps)]) -> wordcraft_doc::Paragraph {
+    let mut paragraph = wordcraft_doc::Paragraph::new();
+    for (text, props) in parts {
+        paragraph.text.push_str(text);
+        paragraph.runs.push(wordcraft_doc::Run { len: text.len(), props: props.clone() });
+    }
+    paragraph
+}
+
+#[test]
+fn selection_text_leaves_out_tracked_deletions_and_hidden_text_and_is_found_again() {
+    use wordcraft_doc::para_block;
+    use wordcraft_doc::props::CharProps;
+    let plain = CharProps::default();
+    let deleted = CharProps { del: Some(0), ..CharProps::default() };
+    let hidden = CharProps { hidden: Some(true), ..CharProps::default() };
+    let mut doc = Document::new();
+    doc.body = vec![
+        para_block(paragraph_of(&[("The fee is ", plain.clone()), ("ten ", deleted), ("five dollars.", plain.clone())])),
+        para_block(paragraph_of(&[("Alpha ", plain.clone()), ("SECRET ", hidden), ("Beta.", plain)])),
+    ];
+    let (mut h, bridge) = embed_app();
+    open_doc(&mut h, &bridge, &doc);
+    let end_of = |h: &egui_kittest::Harness<'_, WordApp>, i: usize| {
+        let path = Pos::body(i, 0).path;
+        Pos::body(i, h.state().session.doc.para(wordcraft_doc::StoryRef::Body, &path).map_or(0, |p| p.text.len()))
+    };
+    assert_eq!(h.state().session.doc.para_at(&Pos::body(1, 0)).map(|p| p.text.clone()).as_deref(), Some("Alpha SECRET Beta."));
+    // Across both paragraphs, by a drag: the deleted and hidden words are not there, the break is.
+    let last = end_of(&h, 1);
+    let (_, after) = drag_select(&mut h, &bridge, &Pos::body(0, 0), &last);
+    let [HostEvent::Selection { text, copy_text, .. }] = after.as_slice() else { panic!("{after:?}") };
+    assert_eq!(copy_text, "The fee is five dollars.\nAlpha Beta.");
+    assert_eq!(text, "The fee is five dollars. Alpha Beta.");
+    // Each paragraph's reported text is found again as a jump and as a mark.
+    for i in 0..2 {
+        let end = end_of(&h, i);
+        h.state_mut().session.sel = Selection { anchor: Pos::body(i, 0), focus: end.clone() };
+        frames(&mut h, 2);
+        let events = bridge.take_events();
+        let [HostEvent::Selection { text, .. }] = events.as_slice() else { panic!("{events:?}") };
+        let text = text.clone();
+        bridge.send(HostCommand::JumpTo(text_target(&text, None, 0)));
+        frames(&mut h, 3);
+        assert!(!bridge.take_events().iter().any(|e| matches!(e, HostEvent::JumpNotFound { .. })), "{text:?} was not found by a jump");
+        assert_eq!(h.state().session.sel.ordered(), (Pos::body(i, 0), end), "{text:?}");
+        bridge.send(HostCommand::SetMarks(vec![mark("again", &text)]));
+        settle_marks(&mut h);
+        assert_eq!(mark_ids(&h), vec!["again".to_string()], "{text:?} was not found as a mark");
+    }
+}
+
+/// A harness whose `ui` can be skipped for a frame (`logic` still runs), as eframe skips it when the
+/// view is not shown.
+fn skippable_app() -> (egui_kittest::Harness<'static, WordApp>, HostBridge, std::rc::Rc<std::cell::Cell<bool>>) {
+    let skip = std::rc::Rc::new(std::cell::Cell::new(false));
+    let bridge = HostBridge::new();
+    let app = WordApp::new(Session::new(Document::new()), Services::default()).with_host(bridge.clone(), EmbedProfile::View);
+    let skipping = skip.clone();
+    let mut h = egui_kittest::Harness::builder().with_size(WINDOW).with_max_steps(12).build_ui_state(
+        move |ui, app: &mut WordApp| {
+            let ctx = ui.ctx().clone();
+            app.logic(&ctx);
+            if !skipping.get() {
+                app.ui(ui);
+            }
+        },
+        app,
+    );
+    bridge.set_context(h.ctx.clone());
+    frames(&mut h, 2);
+    bridge.take_events();
+    (h, bridge, skip)
+}
+
+#[test]
+fn a_jump_held_across_a_frame_is_not_undone_by_a_newer_one_that_finds_nothing() {
+    let (mut h, bridge, skip) = skippable_app();
+    open_doc(&mut h, &bridge, &clauses(120));
+    drag_select(&mut h, &bridge, &Pos::body(0, 0), &Pos::body(0, 9));
+    // The first jump is found in a frame that draws nothing, so it is still waiting a frame later.
+    skip.set(true);
+    bridge.send(HostCommand::JumpTo(text_target("Clause 90.", None, 0)));
+    frames(&mut h, 1);
+    skip.set(false);
+    let missing = text_target("no such passage", None, 0);
+    bridge.send(HostCommand::JumpTo(missing.clone()));
+    frames(&mut h, 3);
+    assert_eq!(h.state().session.selected_text(), "Clause 90.", "a selection from an earlier frame was put back");
+    assert_eq!(bridge.take_events(), vec![HostEvent::JumpNotFound { target: missing }, HostEvent::SelectionCleared]);
+}
+
+#[test]
+fn a_find_that_leaves_the_selection_alone_keeps_a_reported_one() {
+    let (mut h, bridge) = embed_app();
+    open_doc(&mut h, &bridge, &clauses(30));
+    h.get_by_role(Role::TextInput).focus();
+    frames(&mut h, 2);
+    h.get_by_role(Role::TextInput).type_text("zzz");
+    frames(&mut h, 3);
+    select_a_visible_clause(&mut h, &bridge, 30);
+    // Next and Previous find no match: nothing moved, so the host's selection stands.
+    for button in ["Next match", "Previous match"] {
+        h.get_by_label(button).click();
+        frames(&mut h, 3);
+        assert_eq!(bridge.take_events(), vec![], "{button}");
+    }
+    // Escape in the field clears the search but selects nothing.
+    h.get_by_role(Role::TextInput).focus();
+    frames(&mut h, 2);
+    h.key_press(egui::Key::Escape);
+    frames(&mut h, 3);
+    assert_eq!(bridge.take_events(), vec![]);
+    assert_eq!(h.state().session.selected_text(), "Clause");
+}
+
+#[test]
+fn shift_click_extends_a_selection_and_reports_it() {
+    let (mut h, bridge) = embed_app();
+    open_doc(&mut h, &bridge, &clauses(20));
+    let start = screen_of(&mut h, &Pos::body(0, 0));
+    click(&mut h, start, egui::PointerButton::Primary);
+    bridge.take_events();
+    let end = screen_of(&mut h, &Pos::body(0, 9));
+    h.event(egui::Event::ModifiersChanged(egui::Modifiers::SHIFT));
+    h.event(egui::Event::PointerMoved(end));
+    h.event(egui::Event::PointerButton { pos: end, button: egui::PointerButton::Primary, pressed: true, modifiers: egui::Modifiers::SHIFT });
+    h.event(egui::Event::PointerButton { pos: end, button: egui::PointerButton::Primary, pressed: false, modifiers: egui::Modifiers::SHIFT });
+    h.event(egui::Event::ModifiersChanged(egui::Modifiers::NONE));
+    frames(&mut h, 6);
+    let events = bridge.take_events();
+    assert_selection_at(&mut h, &events, &Pos::body(0, 9), "Clause 1.");
+}
+
+#[test]
+fn a_backward_selection_reports_its_document_order_end() {
+    let (mut h, bridge) = embed_app();
+    open_doc(&mut h, &bridge, &clauses(20));
+    // Dragged from the end of clause 2 back to the start of clause 1: the focus comes first.
+    let (_, after) = drag_select(&mut h, &bridge, &Pos::body(1, 9), &Pos::body(0, 0));
+    assert!(h.state().session.sel.focus < h.state().session.sel.anchor, "the drag did not select backwards");
+    let [HostEvent::Selection { copy_text, .. }] = after.as_slice() else { panic!("{after:?}") };
+    assert!(copy_text.starts_with("Clause 1.") && copy_text.ends_with("\nClause 2."), "{copy_text:?}");
+    let text = copy_text.split_whitespace().collect::<Vec<_>>().join(" ");
+    assert_selection_at(&mut h, &after, &Pos::body(1, 9), &text);
+}

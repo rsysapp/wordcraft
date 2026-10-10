@@ -8,7 +8,7 @@ use wordcraft_engine::Selection;
 
 use super::bridge::{HostBridge, HostCommand, HostEvent};
 use super::marks::Marks;
-use super::text_match::TextIndex;
+use super::text_match::{TextIndex, visible_fragment_text};
 use super::wire::{JumpTarget, occurrence_index, page_index};
 use crate::WordApp;
 
@@ -21,8 +21,10 @@ struct PendingJump {
     target: JumpTarget,
     /// The scroll it replaced, put back when a newer jump finds nothing.
     displaced: Option<(usize, f32)>,
-    /// The selection it replaced, put back with the scroll.
+    /// The selection it replaced, put back with the scroll while still in the frame it was found in.
     replaced: SelectionBefore,
+    /// The frame (`Context::cumulative_frame_nr`) it was found in.
+    frame: u64,
 }
 
 /// What a jump's selection replaced: the session's selection and page hint, and what the host
@@ -124,16 +126,16 @@ impl HostState {
     }
 
     /// Look for the marks not yet found in this document and layout; `true` while some remain.
+    pub(crate) fn resolve_marks(&mut self, doc: &wordcraft_doc::Document, rev: u64, layout: &std::sync::Arc<wordcraft_layout::DocLayout>) -> bool {
+        self.marks.resolve(&mut self.index, doc, rev, layout)
+    }
+
     /// The editor moved the selection itself (open, jump, find, page buttons): not a person's
     /// selection, so it is never reported, and a reported one is cleared at the end of the frame (its
     /// toolbar would otherwise stay on text the view may have scrolled away).
     pub(crate) fn note_programmatic_selection(&mut self, sel: &Selection) {
         self.settled = sel.clone();
         self.clear_reported = true;
-    }
-
-    pub(crate) fn resolve_marks(&mut self, doc: &wordcraft_doc::Document, rev: u64, layout: &std::sync::Arc<wordcraft_layout::DocLayout>) -> bool {
-        self.marks.resolve(&mut self.index, doc, rev, layout)
     }
 
     pub fn new(bridge: HostBridge) -> Self {
@@ -167,7 +169,7 @@ pub(crate) fn before_frame(app: &mut WordApp, ctx: &egui::Context) {
     for command in host.bridge.take_commands() {
         match command {
             HostCommand::Open { name, bytes } => open(app, &mut host, &name, &bytes),
-            HostCommand::JumpTo(target) => jump(app, &mut host, target),
+            HostCommand::JumpTo(target) => jump(app, &mut host, target, ctx.cumulative_frame_nr()),
             // Looked for when next painted, against the layout painted then.
             HostCommand::SetMarks(marks) => host.marks.set(marks),
         }
@@ -235,8 +237,10 @@ enum Reading {
 /// zoom factor are CSS pixels from the canvas's top-left (eframe's web backend draws one point per
 /// CSS pixel at zoom 1). The PDF editor's embed build places its selections alike.
 fn read_selection(app: &mut WordApp, zoom: f32) -> Reading {
-    let Some((text, copy_text)) = host_texts(&app.session.selected_text()) else { return Reading::Blank };
     let (start, end) = app.session.sel.ordered();
+    // What the reader sees, as jumps and marks match it: no tracked deletions or hidden text.
+    let visible = visible_fragment_text(&app.session.doc.copy_range(&start, &end));
+    let Some((text, copy_text)) = host_texts(&visible) else { return Reading::Blank };
     let layout = app.session.layout();
     let rects = layout.selection_rects(&app.session.doc, &start, &end, app.session.page_hint);
     let Some((page, last)) = rects.last() else { return Reading::NotReady };
@@ -330,37 +334,38 @@ fn scrolled_by_person(ctx: &egui::Context, canvas: Option<egui::Rect>, canvas_fo
 ///
 /// A found jump's selection (the passage, or the caret at the page's top) is the editor's own: it
 /// is never reported and clears a reported one. A jump that finds nothing leaves the selection be,
-/// and one that replaces a waiting jump puts back the selection that jump replaced, with its scroll.
-fn jump(app: &mut WordApp, host: &mut HostState, target: JumpTarget) {
+/// and one that replaces a jump found in this same frame puts back the selection that jump
+/// replaced, with its scroll. A jump found in an earlier frame is not undone: by then the end of
+/// that frame may have cleared a reported selection, or a person may have selected anew.
+fn jump(app: &mut WordApp, host: &mut HostState, target: JumpTarget, frame: u64) {
     let waiting = host.pending_jump.take();
-    let superseded = waiting.is_some();
-    let (displaced, replaced) = match waiting {
-        Some(waiting) => (waiting.displaced, waiting.replaced),
-        None => (
-            app.canvas.scroll_to_doc,
-            SelectionBefore {
-                sel: app.session.sel.clone(),
-                page_hint: app.session.page_hint,
-                settled: host.settled.clone(),
-                clear_reported: host.clear_reported,
-            },
-        ),
+    let displaced = match &waiting {
+        Some(waiting) => waiting.displaced,
+        None => app.canvas.scroll_to_doc,
+    };
+    // Without a jump from this frame to undo, what is put back is what there is now: nothing changes.
+    let replaced = match waiting {
+        Some(waiting) if waiting.frame == frame => waiting.replaced,
+        _ => SelectionBefore {
+            sel: app.session.sel.clone(),
+            page_hint: app.session.page_hint,
+            settled: host.settled.clone(),
+            clear_reported: host.clear_reported,
+        },
     };
     match find_target(app, host, &target) {
         Some((page, y)) => {
             app.canvas.scroll_to_doc = Some((page, y));
             host.aim(page, y);
             host.note_programmatic_selection(&app.session.sel);
-            host.pending_jump = Some(PendingJump { target, displaced, replaced });
+            host.pending_jump = Some(PendingJump { target, displaced, replaced, frame });
         }
         None => {
             app.canvas.scroll_to_doc = displaced;
-            if superseded {
-                app.session.sel = replaced.sel;
-                app.session.page_hint = replaced.page_hint;
-                host.settled = replaced.settled;
-                host.clear_reported = replaced.clear_reported;
-            }
+            app.session.sel = replaced.sel;
+            app.session.page_hint = replaced.page_hint;
+            host.settled = replaced.settled;
+            host.clear_reported = replaced.clear_reported;
             host.page_target = None;
             host.bridge.emit(HostEvent::JumpNotFound { target });
         }

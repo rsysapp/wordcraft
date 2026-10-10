@@ -169,8 +169,12 @@ fn body_anchor(app: &WordApp) -> Pos {
 /// Find `query` and select the match; the canvas scrolls to it. An empty query clears the search and
 /// the highlight (the selected match). The selection is the editor's own, never reported to the host.
 pub fn run_find(app: &mut WordApp, query: &str, step: FindStep) {
+    let before = app.session.sel.clone();
     find(app, query, step);
-    note_programmatic_selection(app);
+    // Escape, or a step that found no match, leaves a person's selection as it was.
+    if app.session.sel != before {
+        note_programmatic_selection(app);
+    }
 }
 
 /// The selection is the editor's doing (find, the page buttons): see

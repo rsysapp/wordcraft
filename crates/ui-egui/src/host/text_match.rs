@@ -10,8 +10,9 @@ use std::sync::Arc;
 
 use unicode_normalization::UnicodeNormalization;
 use unicode_normalization::char::is_combining_mark;
+use wordcraft_doc::edit::Fragment;
 use wordcraft_doc::para::OBJ;
-use wordcraft_doc::{Document, Paragraph, Path, Pos, StoryRef};
+use wordcraft_doc::{Block, Document, Paragraph, Path, Pos, StoryRef};
 
 /// Longest passage a host may ask for, in folded characters; longer ones match nothing.
 pub const MAX_NEEDLE_CHARS: usize = 10_000;
@@ -159,6 +160,53 @@ fn visible_text(paragraph: &Paragraph) -> (String, Vec<Seg>) {
         visible.push(c);
     }
     (visible, segs)
+}
+
+/// Nested tables read at most, as `Document::plain_text` reads them.
+const MAX_TABLE_DEPTH: usize = 16;
+
+/// What a reader sees of a copied range (`Document::copy_range`), each paragraph by the rule jumps
+/// and marks match ([`visible_text`]), so a selection's text the host reads back is found again.
+/// Laid out as `Document::plain_text` lays text out: a line per paragraph, a table row's cells
+/// joined by tabs.
+pub fn visible_fragment_text(fragment: &Fragment) -> String {
+    let mut out = String::new();
+    for block in &fragment.blocks {
+        block_text(block, &mut out, 0);
+    }
+    if out.ends_with('\n') {
+        out.pop();
+    }
+    out
+}
+
+fn block_text(block: &Block, out: &mut String, depth: usize) {
+    if depth > MAX_TABLE_DEPTH {
+        return;
+    }
+    match block {
+        Block::Para(paragraph) => {
+            out.push_str(&visible_text(paragraph).0);
+            out.push('\n');
+        }
+        Block::Table(table) => {
+            for row in &table.rows {
+                let cells: Vec<String> = row
+                    .cells
+                    .iter()
+                    .map(|cell| {
+                        let mut text = String::new();
+                        for block in &cell.blocks {
+                            block_text(block, &mut text, depth.saturating_add(1));
+                        }
+                        text.trim_end_matches('\n').replace('\n', " ")
+                    })
+                    .collect();
+                out.push_str(&cells.join("\t"));
+                out.push('\n');
+            }
+        }
+    }
 }
 
 /// Source byte where the visible byte `at` starts.
@@ -777,6 +825,19 @@ mod tests {
         ];
         assert!(found_in_paragraph(paragraph.clone(), "Clause 5").1.is_empty());
         assert_eq!(found_in_paragraph(paragraph, "Clause applies").1.len(), 1);
+    }
+
+    #[test]
+    fn a_fragment_reads_as_the_visible_text_with_its_lines_and_cells() {
+        let mut with_field = paragraph_with_deletions(&[("Fee ", false), ("ten ", true), ("is  due", false)]);
+        assert!(with_field.insert_object(4, field("5"), &CharProps::default()).is_ok());
+        let mut table = Table::new(1, 2, 200.0);
+        table.rows[0].cells[0] = Cell::with_text("Left");
+        table.rows[0].cells[1].blocks = vec![para_block(paragraph_with_hidden(&[("Right", false), (" secret", true)]))];
+        let fragment =
+            Fragment { blocks: vec![Block::Para(with_field), Block::Table(table), Block::Para(Paragraph::with_text("End", CharProps::default()))] };
+        assert_eq!(visible_fragment_text(&fragment), "Fee 5is  due\nLeft\tRight\nEnd");
+        assert_eq!(visible_fragment_text(&Fragment::default()), "");
     }
 
     /// A paragraph of `(text, hidden)` parts.
