@@ -1887,3 +1887,89 @@ fn a_dark_chrome_keeps_comment_balloons_readable_on_their_white_cards() {
         assert!(contrast(bar, egui::Color32::WHITE) >= 4.5 && contrast(bar, area) >= 4.5, "author colour {bar:?}");
     }
 }
+
+/// Contrast of every text on the selected comment balloon in `h` against the card it sits on.
+fn selected_balloon_contrasts(h: &mut egui_kittest::Harness<'_, WordApp>) -> Vec<f32> {
+    h.state_mut().session.sel = Selection::caret(Pos::body(2, 0));
+    frames(h, 3);
+    let painted = shapes(h);
+    let body = painted
+        .iter()
+        .find_map(|s| match s {
+            egui::Shape::Text(t) if t.galley.text().contains("Check the supplier") => Some(t.visual_bounding_rect()),
+            _ => None,
+        })
+        .expect("the balloon is drawn");
+    // The card: the last filled card-sized rectangle under the text (its shadow is painted first;
+    // the markup area, under a translucent fill, is page-sized).
+    let (card, fill) = painted
+        .iter()
+        .filter_map(|s| match s {
+            egui::Shape::Rect(r) if r.fill.a() > 0 && r.rect.contains(body.center()) && r.rect.width() < 400.0 && r.rect.height() < 200.0 => {
+                Some((r.rect, r.fill))
+            }
+            _ => None,
+        })
+        .next_back()
+        .expect("the balloon's card");
+    let card_fill = blended(fill, egui::Color32::from_rgb(0xF3, 0xF3, 0xF3));
+    painted
+        .iter()
+        .filter_map(|s| match s {
+            egui::Shape::Text(t) if card.contains(t.visual_bounding_rect().center()) => {
+                let ink = t.galley.job.sections.first().expect("a section").format.color;
+                Some(contrast(ink, card_fill))
+            }
+            _ => None,
+        })
+        .collect()
+}
+
+fn commented_document() -> Document {
+    let mut editing = Session::new(clauses(5));
+    editing.run("select.text", &json!({"text": "Supplier", "occurrence": 3})).unwrap();
+    editing.run("review.newComment", &json!({"text": "Check the supplier"})).unwrap();
+    editing.doc
+}
+
+#[test]
+fn a_selected_balloon_is_readable_in_the_embed_and_in_the_full_apps_dark_mode() {
+    // The embed, dark chrome, the host's accent (a pale and a dark one).
+    for accent in ["#0f766e", "#fde047"] {
+        let (mut h, bridge) = embed_app();
+        bridge.send(HostCommand::SetTheme(theme(true, accent)));
+        open_doc(&mut h, &bridge, &commented_document());
+        let contrasts = selected_balloon_contrasts(&mut h);
+        assert!(contrasts.len() >= 2, "{accent}: {contrasts:?}");
+        assert!(contrasts.iter().all(|c| *c >= 4.5), "embed {accent}: {contrasts:?}");
+    }
+    // The full app in dark mode, no host accent: the card must not take the chrome's navy.
+    let mut h = full_app(commented_document());
+    h.state_mut().ui.dark = true;
+    frames(&mut h, 3);
+    assert!(Tokens::get(&h.ctx).dark);
+    let contrasts = selected_balloon_contrasts(&mut h);
+    assert!(contrasts.len() >= 2, "{contrasts:?}");
+    assert!(contrasts.iter().all(|c| *c >= 4.5), "full app dark: {contrasts:?}");
+}
+
+#[test]
+fn header_and_footer_label_text_reaches_normal_text_contrast_on_its_wash() {
+    // Pale, mid-tone and dark accents; #ffffff and #f0f0f0 halve to 3:1 to 4.5:1, not enough for text.
+    for accent in ["#ffffff", "#f0f0f0", "#fde047", "#22c55e", "#e0f2fe", "#0f766e", "#7c3aed", "#000000"] {
+        let (accent_colour, content) = ThemeSpec { dark: false, accent: accent.into(), accent_content: "#ffffff".into() }.colors().unwrap();
+        let over = AccentOverride { accent: accent_colour, content };
+        let wash = over.wash();
+        let text = over.on_white_text();
+        assert!(contrast(text, wash) >= 4.5, "{accent}: label {text:?} on its wash {wash:?} is {}", contrast(text, wash));
+        assert!(contrast(over.on_white(), egui::Color32::WHITE) >= 3.0, "{accent}: the line");
+        assert!(luminance(text) <= luminance(over.on_white()) + 1e-6, "{accent}: the text variant is never paler than the line");
+        // The wash is what the app paints behind the label, over the white page.
+        let tokens = Tokens::resolve(false, Some(over));
+        assert_eq!(blended(tokens.checked, egui::Color32::WHITE), wash, "{accent}");
+    }
+    // A teal that already clears 3:1 for the line is darkened for the text.
+    let teal = AccentOverride { accent: egui::Color32::from_rgb(0x0f, 0x76, 0x6e), content: egui::Color32::WHITE };
+    assert_eq!(teal.on_white(), teal.accent);
+    assert_ne!(teal.on_white_text(), teal.accent, "teal is 4.2:1 on its own wash");
+}

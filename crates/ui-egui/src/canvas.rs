@@ -271,7 +271,8 @@ pub fn show(app: &mut WordApp, ui: &mut Ui) {
                     let hy = sr.min.y + sect_body.y * geo.scale - 4.0;
                     let fy = sr.min.y + sect_body.bottom() * geo.scale + 4.0;
                     // embed: on the white page a host accent that is too pale is darkened.
-                    let (line, label_ink) = crate::theme::accent_on_white(ui.ctx()).map_or((t.accent, t.accent_text), |colour| (colour, colour));
+                    let (line, label_ink) =
+                        crate::theme::accent_override(ui.ctx()).map_or((t.accent, t.accent_text), |over| (over.on_white(), over.on_white_text()));
                     for (y, label) in [(hy, "Header"), (fy, "Footer")] {
                         dashed(&painter, pos2(sr.min.x, y), pos2(sr.max.x, y), Stroke::new(1.0, line));
                         let tr = Rect::from_min_size(pos2(sr.min.x + 2.0, if label == "Header" { y } else { y - 18.0 }), vec2(52.0, 18.0));
@@ -466,7 +467,8 @@ fn balloons(app: &mut WordApp, ui: &mut Ui, painter: &egui::Painter, rects: &[Re
             dashed(painter, anchor, pos2(pr.max.x, anchor.y), lead);
             painter.line_segment([pos2(pr.max.x, anchor.y), pos2(x0, top + 10.0)], lead);
             painter.rect_filled(card.translate(vec2(0.0, 1.0)), 4.0, t.page_shadow);
-            painter.rect_filled(card, 4.0, if selected { t.checked } else { Color32::WHITE });
+            // embed: a page colour in every mode, never the chrome's (dark chrome's navy under dark ink).
+            painter.rect_filled(card, 4.0, if selected { crate::theme::balloon_selected_fill(ui.ctx()) } else { Color32::WHITE });
             painter.rect_stroke(card, 4.0, Stroke::new(if selected { 1.5 } else { 1.0 }, color), egui::StrokeKind::Inside);
             painter.rect_filled(Rect::from_min_size(card.min, vec2(4.0, h)), egui::CornerRadius { nw: 4, sw: 4, ne: 0, se: 0 }, color);
             painter.galley(pos2(card.min.x + 10.0, card.min.y + 6.0), head.clone(), BALLOON_INK);

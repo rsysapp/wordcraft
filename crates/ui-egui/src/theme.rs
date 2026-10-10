@@ -132,7 +132,7 @@ impl Tokens {
             // Pages are white in both themes, so the selection and the wash are judged against white.
             let tint = over.on_white();
             tokens.selection = Color32::from_rgba_unmultiplied(tint.r(), tint.g(), tint.b(), if dark { 0x55 } else { 0x48 });
-            tokens.checked = Color32::from_rgba_unmultiplied(tint.r(), tint.g(), tint.b(), 0x30);
+            tokens.checked = Color32::from_rgba_unmultiplied(tint.r(), tint.g(), tint.b(), CHECKED_ALPHA);
         }
         tokens
     }
@@ -241,26 +241,52 @@ pub struct AccentOverride {
 // embed: the one rule for an accent drawn on the white page.
 impl AccentOverride {
     /// The accent as it is drawn on a white page: the accent itself, unless it is so pale that a
-    /// line, label or translucent wash of it would vanish on white (under 3:1); then it is mixed
-    /// halfway toward black, which is what contrasts most with white. Not toward the host's text
-    /// colour: a mid-tone accent can come with white text, which would lighten it further.
+    /// line or a translucent wash of it would vanish on white (under 3:1); then it is mixed toward
+    /// black, which is what contrasts most with white. Not toward the host's text colour: a
+    /// mid-tone accent can come with white text, which would lighten it further.
     pub fn on_white(self) -> Color32 {
-        if contrast_with_white(self.accent) >= 3.0 {
-            return self.accent;
-        }
-        let half = |channel: u8| channel / 2;
-        Color32::from_rgb(half(self.accent.r()), half(self.accent.g()), half(self.accent.b()))
+        darkened_until(self.accent, |colour| contrast(colour, Color32::WHITE) >= 3.0)
+    }
+
+    /// The same colour for small text on [`Self::wash`]: darkened by the same rule until it reads
+    /// as normal text (4.5:1).
+    pub fn on_white_text(self) -> Color32 {
+        let wash = self.wash();
+        darkened_until(self.on_white(), |colour| contrast(colour, wash) >= 4.5)
+    }
+
+    /// The accent's wash (`Tokens::checked`) over the white page, opaque: the fill of a selected
+    /// comment balloon and the ground of the header/footer label.
+    pub fn wash(self) -> Color32 {
+        let tint = self.on_white();
+        let over = |channel: u8| (u16::from(channel) * u16::from(CHECKED_ALPHA) + 255 * u16::from(255 - CHECKED_ALPHA) + 127) / 255;
+        Color32::from_rgb(over(tint.r()) as u8, over(tint.g()) as u8, over(tint.b()) as u8)
     }
 }
 
-// embed: WCAG contrast ratio of `colour` against white.
-fn contrast_with_white(colour: Color32) -> f32 {
+/// embed: the alpha of the accent wash behind checked controls and on the page.
+const CHECKED_ALPHA: u8 = 0x30;
+
+// embed: halve the channels (toward black) until `enough` holds, at most eight times.
+fn darkened_until(mut colour: Color32, enough: impl Fn(Color32) -> bool) -> Color32 {
+    for _ in 0..8 {
+        if enough(colour) {
+            break;
+        }
+        colour = Color32::from_rgb(colour.r() / 2, colour.g() / 2, colour.b() / 2);
+    }
+    colour
+}
+
+// embed: WCAG contrast ratio of two opaque colours.
+fn contrast(first: Color32, second: Color32) -> f32 {
     let linear = |channel: u8| {
         let value = f32::from(channel) / 255.0;
         if value <= 0.03928 { value / 12.92 } else { ((value + 0.055) / 1.055).powf(2.4) }
     };
-    let luminance = 0.2126 * linear(colour.r()) + 0.7152 * linear(colour.g()) + 0.0722 * linear(colour.b());
-    1.05 / (luminance + 0.05)
+    let luminance = |colour: Color32| 0.2126 * linear(colour.r()) + 0.7152 * linear(colour.g()) + 0.0722 * linear(colour.b());
+    let (high, low) = (luminance(first).max(luminance(second)), luminance(first).min(luminance(second)));
+    (high + 0.05) / (low + 0.05)
 }
 
 fn accent_id() -> egui::Id {
@@ -285,7 +311,8 @@ pub fn accent_content(ctx: &egui::Context) -> Color32 {
     accent_override(ctx).map_or(Color32::WHITE, |over| over.content)
 }
 
-/// embed: the host's accent as drawn on the white page (see [`AccentOverride::on_white`]), if it set one.
-pub fn accent_on_white(ctx: &egui::Context) -> Option<Color32> {
-    accent_override(ctx).map(AccentOverride::on_white)
+/// embed: the fill of a selected comment balloon. Balloons belong to the page, so it is a page
+/// colour in every mode: the host's accent wash over white, or the light theme's checked colour.
+pub fn balloon_selected_fill(ctx: &egui::Context) -> Color32 {
+    accent_override(ctx).map_or(Color32::from_rgb(0xDD, 0xE3, 0xF8), AccentOverride::wash)
 }
