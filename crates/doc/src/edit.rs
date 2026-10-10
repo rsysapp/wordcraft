@@ -88,6 +88,13 @@ impl Document {
         if a.story != b.story {
             return Vec::new();
         }
+        // embed: a range inside one paragraph is that paragraph, found without listing the whole
+        // story (host marks place thousands of such ranges). Same answer as the listing: a path
+        // names a listed paragraph when it leads to one no deeper than the listing walks.
+        if a.path == b.path {
+            let listed = !a.path.0.is_empty() && a.path.parent().len() / 3 <= crate::MAX_TABLE_DEPTH && self.para(a.story, &a.path).is_some();
+            return if listed { vec![a.path.clone()] } else { Vec::new() };
+        }
         self.para_paths(a.story).into_iter().filter(|p| *p >= a.path && *p <= b.path).collect()
     }
 
@@ -386,5 +393,116 @@ mod tests {
         let c = d.clamp(&Pos::body(9, 9));
         assert_eq!(c, Pos::body(0, 2));
         assert!(d.delete_range(&Pos { story: StoryRef::Part(3), path: Path::top(0), off: 0 }, &Pos::body(0, 0)).is_err());
+    }
+
+    // --- paths_between's one-paragraph shortcut answers as the story listing does ---
+
+    /// Blocks for nesting level `level`: a paragraph, then (below `deepest`) a one-cell table
+    /// holding the next level. Records every paragraph path and every table block path.
+    fn nested(level: usize, deepest: usize, prefix: &[u32], paragraphs: &mut Vec<Path>, tables: &mut Vec<Path>) -> Blocks {
+        let mut at = prefix.to_vec();
+        at.push(0);
+        paragraphs.push(Path(at.clone()));
+        let mut blocks = vec![para_block(Paragraph::with_text(&format!("level {level}"), CharProps::default()))];
+        if level < deepest {
+            at.pop();
+            at.push(1);
+            tables.push(Path(at.clone()));
+            let mut table = Table::new(1, 1, 400.0);
+            at.extend([0, 0]);
+            if let Some(cell) = table.rows.first_mut().and_then(|row| row.cells.first_mut()) {
+                cell.blocks = nested(level + 1, deepest, &at, paragraphs, tables);
+            }
+            blocks.push(Arc::new(Block::Table(table)));
+        }
+        blocks
+    }
+
+    /// A body with plain paragraphs around tables nested 17 deep (a paragraph at every level, the
+    /// deepest past what the listing walks), and a header with a table. Returns every path worth
+    /// asking about: paragraphs, table blocks, and paths that name nothing.
+    fn deep_document() -> (Document, Vec<Path>) {
+        let (mut paragraphs, mut tables) = (Vec::new(), Vec::new());
+        let mut d = Document::new();
+        let mut top = Table::new(1, 1, 400.0);
+        if let Some(cell) = top.rows.first_mut().and_then(|row| row.cells.first_mut()) {
+            cell.blocks = nested(1, 17, &[1, 0, 0], &mut paragraphs, &mut tables);
+        }
+        tables.push(Path(vec![1]));
+        d.body = vec![
+            para_block(Paragraph::with_text("before", CharProps::default())),
+            Arc::new(Block::Table(top)),
+            para_block(Paragraph::with_text("after", CharProps::default())),
+        ];
+        paragraphs.extend([Path(vec![0]), Path(vec![2])]);
+        let header = nested(0, 1, &[], &mut paragraphs, &mut tables);
+        d.parts.insert(1, crate::Part { kind: crate::PartKind::Header, blocks: header });
+        let mut paths = paragraphs;
+        paths.extend(tables);
+        paths.extend([
+            Path(Vec::new()),
+            Path(vec![3]),
+            Path(vec![u32::MAX]),
+            Path(vec![1, 0, 0, 7]),
+            Path(vec![1, 0, 5, 0]),
+            Path(vec![1, 0, 0]),
+            Path(vec![1, 0, 0, 0, 0]),
+            Path(vec![0, 0]),
+        ]);
+        (d, paths)
+    }
+
+    /// What `paths_between` answered before the shortcut: the story listing, filtered.
+    fn listed_between(d: &Document, a: &Pos, b: &Pos) -> Vec<Path> {
+        let (a, b) = if a <= b { (a, b) } else { (b, a) };
+        if a.story != b.story {
+            return Vec::new();
+        }
+        d.para_paths(a.story).into_iter().filter(|p| *p >= a.path && *p <= b.path).collect()
+    }
+
+    fn at(story: StoryRef, path: &Path) -> Pos {
+        Pos { story, path: path.clone(), off: 0 }
+    }
+
+    #[test]
+    fn one_paragraph_ranges_answer_as_the_listing_does() {
+        let (d, paths) = deep_document();
+        let deepest = paths.iter().filter(|p| d.para(StoryRef::Body, p).is_some()).map(Path::depth).max();
+        assert_eq!(deepest, Some(17), "the fixture needs a paragraph inside 17 nested tables");
+        let listed_depths: Vec<usize> = d.para_paths(StoryRef::Body).iter().map(Path::depth).collect();
+        assert_eq!(listed_depths.iter().max(), Some(&crate::MAX_TABLE_DEPTH), "the listing stops at the depth rule");
+        for story in [StoryRef::Body, StoryRef::Part(1), StoryRef::Part(99)] {
+            for path in &paths {
+                let one = at(story, path);
+                assert_eq!(d.paths_between(&one, &one), listed_between(&d, &one, &one), "{story:?} {path}");
+            }
+        }
+        // The deepest paragraph is a paragraph, but not one the listing walks: empty both ways.
+        let deep = paths.iter().find(|p| p.depth() == 17 && d.para(StoryRef::Body, p).is_some()).expect("depth 17");
+        assert!(d.paths_between(&at(StoryRef::Body, deep), &at(StoryRef::Body, deep)).is_empty());
+        let at_rule = paths.iter().find(|p| p.depth() == crate::MAX_TABLE_DEPTH && d.para(StoryRef::Body, p).is_some()).expect("depth 16");
+        assert_eq!(d.paths_between(&at(StoryRef::Body, at_rule), &at(StoryRef::Body, at_rule)), vec![at_rule.clone()]);
+        // Another story's paragraph at the same path is not this one's.
+        let header_first = Path(vec![0]);
+        assert_eq!(d.paths_between(&at(StoryRef::Part(1), &header_first), &at(StoryRef::Body, &header_first)), Vec::<Path>::new());
+    }
+
+    proptest::proptest! {
+        #[test]
+        fn any_range_answers_as_the_listing_does(first in 0usize..200, second in 0usize..200, story in 0u8..3, off_a in 0usize..8, off_b in 0usize..8, same in proptest::bool::ANY) {
+            let (d, paths) = deep_document();
+            let story = match story {
+                0 => StoryRef::Body,
+                1 => StoryRef::Part(1),
+                _ => StoryRef::Part(99),
+            };
+            let pick = |k: usize| paths.get(k % paths.len()).cloned().unwrap_or_default();
+            let a = Pos { story, path: pick(first), off: off_a };
+            // Half the ranges stay inside one path, where the shortcut answers.
+            let b = Pos { story, path: pick(if same { first } else { second }), off: off_b };
+            proptest::prop_assert_eq!(d.paths_between(&a, &b), listed_between(&d, &a, &b));
+            proptest::prop_assert_eq!(d.paths_between(&b, &a), listed_between(&d, &a, &b));
+        }
     }
 }

@@ -466,3 +466,44 @@ fn auto_hyphenation_breaks_long_words() {
     let l2 = lay(&d2);
     let _ = hyphens(&l2);
 }
+
+/// A paragraph inside `depth` nested one-cell tables, for each depth up to `deepest`: body paths.
+fn nested_tables(deepest: usize) -> (Document, Vec<Pos>) {
+    fn level(n: usize, deepest: usize) -> wordcraft_doc::Blocks {
+        let mut blocks = vec![wordcraft_doc::para_block(wordcraft_doc::Paragraph::with_text(&format!("level {n}"), Default::default()))];
+        if n < deepest {
+            let mut table = Table::new(1, 1, 400.0);
+            if let Some(cell) = table.rows.first_mut().and_then(|row| row.cells.first_mut()) {
+                cell.blocks = level(n + 1, deepest);
+            }
+            blocks.push(std::sync::Arc::new(wordcraft_doc::Block::Table(table)));
+        }
+        blocks
+    }
+    let mut d = Document::new();
+    d.body = level(0, deepest);
+    let mut path = vec![0u32];
+    let mut at = Vec::new();
+    for _ in 0..=deepest {
+        at.push(Pos { story: wordcraft_doc::StoryRef::Body, path: wordcraft_doc::Path(path.clone()), off: 0 });
+        path.pop();
+        path.extend([1, 0, 0, 0]);
+    }
+    (d, at)
+}
+
+#[test]
+fn a_selection_in_one_nested_paragraph_follows_the_depth_rules() {
+    let (d, paragraphs) = nested_tables(17);
+    let l = lay(&d);
+    for (depth, start) in paragraphs.iter().enumerate() {
+        let end = Pos { off: "level 1".len(), ..start.clone() };
+        assert!(d.para_at(start).is_some_and(|p| p.text.starts_with("level")), "depth {depth}: fixture path");
+        let rects = l.selection_rects(&d, start, &end, 0);
+        // Layout places tables nested up to 9 deep (the `depth > 8` rule in `layout_box`), so only
+        // their paragraphs have rectangles; the document lists paragraphs down to 16 tables deep.
+        assert_eq!(!rects.is_empty(), depth <= 9, "depth {depth}: {} rectangles", rects.len());
+        let listed = if depth <= 16 { vec![start.path.clone()] } else { Vec::new() };
+        assert_eq!(d.paths_between(start, &end), listed, "depth {depth}");
+    }
+}

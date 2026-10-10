@@ -624,8 +624,13 @@ pub fn count_words(s: &str) -> usize {
     s.split(|c: char| c.is_whitespace() || c == para::OBJ).filter(|w| w.chars().any(char::is_alphanumeric)).count()
 }
 
+// embed: one rule for how deep in nested tables paragraphs are listed and read, shared with
+// `Document::paths_between`'s one-paragraph shortcut.
+/// Tables nested deeper than this are not walked: their paragraphs are not listed or read.
+pub(crate) const MAX_TABLE_DEPTH: usize = 16;
+
 fn walk(bl: &Blocks, prefix: &mut Vec<u32>, out: &mut Vec<Path>, depth: usize) {
-    if depth > 16 {
+    if depth > MAX_TABLE_DEPTH {
         return;
     }
     for (i, b) in bl.iter().enumerate() {
@@ -649,7 +654,8 @@ fn walk(bl: &Blocks, prefix: &mut Vec<u32>, out: &mut Vec<Path>, depth: usize) {
 }
 
 fn text_of(bl: &Blocks, out: &mut String, depth: usize) {
-    if depth > 16 {
+    // embed: the shared depth rule.
+    if depth > MAX_TABLE_DEPTH {
         return;
     }
     for b in bl {
