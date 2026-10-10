@@ -108,25 +108,26 @@ struct Seg {
     exact: bool,
 }
 
-/// What a reader of the paragraph sees: field and equation results inlined, tracked deletions
-/// left out, other objects nothing. The host's own extraction of the file reads the same text, so
+/// What a reader of the paragraph sees: field and equation results inlined, tracked deletions and
+/// hidden text left out (as the renderer and the host's extraction treat them), other objects nothing. The host's own extraction of the file reads the same text, so
 /// a passage taken from it must be found here.
 fn visible_text(paragraph: &Paragraph) -> (String, Vec<Seg>) {
-    let deleted: Vec<std::ops::Range<usize>> = paragraph.run_ranges().filter(|(_, props)| props.del.is_some()).map(|(range, _)| range).collect();
-    let is_deleted = |at: usize| deleted.get(deleted.partition_point(|range| range.end <= at)).is_some_and(|range| range.start <= at);
+    let skipped: Vec<std::ops::Range<usize>> =
+        paragraph.run_ranges().filter(|(_, props)| props.del.is_some() || props.hidden.unwrap_or(false)).map(|(range, _)| range).collect();
+    let is_skipped = |at: usize| skipped.get(skipped.partition_point(|range| range.end <= at)).is_some_and(|range| range.start <= at);
     let mut visible = String::new();
     let mut segs: Vec<Seg> = Vec::new();
     let mut next_object = 0;
     for (at, c) in paragraph.text.char_indices() {
         let end = at + c.len_utf8();
-        // Objects are counted even inside deleted text: the k-th U+FFFC is `objects[k]`.
+        // Objects are counted even inside deleted or hidden text: the k-th U+FFFC is `objects[k]`.
         let object = if c == OBJ {
             next_object += 1;
             paragraph.objects.get(next_object - 1)
         } else {
             None
         };
-        if is_deleted(at) {
+        if is_skipped(at) {
             continue;
         }
         if c == OBJ {
@@ -516,6 +517,84 @@ mod tests {
         ];
         assert!(found_in_paragraph(paragraph.clone(), "Clause 5").1.is_empty());
         assert_eq!(found_in_paragraph(paragraph, "Clause applies").1.len(), 1);
+    }
+
+    /// A paragraph of `(text, hidden)` parts.
+    fn paragraph_with_hidden(parts: &[(&str, bool)]) -> Paragraph {
+        let mut paragraph = Paragraph::new();
+        for (text, hidden) in parts {
+            paragraph.text.push_str(text);
+            let props = CharProps { hidden: hidden.then_some(true), ..CharProps::default() };
+            paragraph.runs.push(Run { len: text.len(), props });
+        }
+        paragraph
+    }
+
+    fn sliced(paragraph: &Paragraph, ranges: &[(usize, usize)]) -> Vec<String> {
+        ranges.iter().filter_map(|(from, to)| paragraph.text.get(*from..*to)).map(str::to_string).collect()
+    }
+
+    #[test]
+    fn hidden_text_is_not_matched_and_the_visible_runs_join() {
+        let paragraph = paragraph_with_hidden(&[("Alpha ", false), ("HIDDEN ", true), ("Beta", false)]);
+        assert!(found_in_paragraph(paragraph.clone(), "hidden").1.is_empty());
+        assert!(found_in_paragraph(paragraph.clone(), "alpha hidden beta").1.is_empty());
+        let (_, ranges) = found_in_paragraph(paragraph.clone(), "alpha beta");
+        assert_eq!(ranges, vec![(0, paragraph.text.len())], "covers both visible runs and the hidden one between them");
+        assert_eq!(sliced(&paragraph, &ranges), vec!["Alpha HIDDEN Beta"]);
+        let (_, ranges) = found_in_paragraph(paragraph.clone(), "beta");
+        assert_eq!(sliced(&paragraph, &ranges), vec!["Beta"]);
+        let (_, ranges) = found_in_paragraph(paragraph.clone(), "alpha");
+        assert_eq!(sliced(&paragraph, &ranges), vec!["Alpha"], "ends before the hidden run");
+    }
+
+    #[test]
+    fn an_object_inside_hidden_text_keeps_the_object_counter_aligned() {
+        // "A " + hidden [comment anchor] + " B " + field "5": the field is objects[1].
+        let mut paragraph = paragraph_with_hidden(&[("A ", false), ("\u{FFFC}", true), (" B ", false), ("\u{FFFC}", false)]);
+        paragraph.objects = vec![InlineObject::Field { instr: "REF hidden_one".into(), result: "WRONG".into(), locked: false }, field("5")];
+        let (_, ranges) = found_in_paragraph(paragraph.clone(), "a b 5");
+        assert_eq!(ranges, vec![(0, paragraph.text.len())]);
+        assert!(found_in_paragraph(paragraph.clone(), "wrong").1.is_empty(), "the hidden field's result is not shown");
+        let (_, ranges) = found_in_paragraph(paragraph.clone(), "5");
+        assert_eq!(
+            ranges,
+            vec![(paragraph.text.len() - '\u{FFFC}'.len_utf8(), paragraph.text.len())],
+            "the visible field resolves to its own object"
+        );
+    }
+
+    #[test]
+    fn a_field_result_against_text_on_both_sides_maps_at_the_object_edges() {
+        let mut paragraph = Paragraph::with_text("Paynow", CharProps::default());
+        assert!(paragraph.insert_object(3, field("Rp 5"), &CharProps::default()).is_ok());
+        let object_len = '\u{FFFC}'.len_utf8();
+        let object_end = 3 + object_len;
+        assert_eq!(Folded::from_paragraph(&paragraph).text, "payrp 5now");
+        let (_, ranges) = found_in_paragraph(paragraph.clone(), "payrp 5");
+        assert_eq!(ranges, vec![(0, object_end)], "starts in the text, ends at the object's end");
+        let (_, ranges) = found_in_paragraph(paragraph.clone(), "5now");
+        assert_eq!(ranges, vec![(3, paragraph.text.len())], "starts at the object, ends in the text");
+        let (_, ranges) = found_in_paragraph(paragraph.clone(), "p 5");
+        assert_eq!(ranges, vec![(3, object_end)], "part of a result selects the whole object");
+        let (_, ranges) = found_in_paragraph(paragraph, "rp");
+        assert_eq!(ranges, vec![(3, object_end)]);
+    }
+
+    #[test]
+    fn an_object_without_a_result_does_not_merge_the_text_around_it() {
+        let mut paragraph = Paragraph::with_text("abcdef", CharProps::default());
+        assert!(paragraph.insert_object(3, InlineObject::BookmarkStart { name: "mark".into() }, &CharProps::default()).is_ok());
+        let object_len = '\u{FFFC}'.len_utf8();
+        let (visible, segs) = visible_text(&paragraph);
+        assert_eq!(visible, "abcdef");
+        assert_eq!(segs.len(), 2, "the object separates two source pieces");
+        let (_, ranges) = found_in_paragraph(paragraph.clone(), "cd");
+        assert_eq!(ranges, vec![(2, 4 + object_len)], "a match across the object spans it");
+        let (_, ranges) = found_in_paragraph(paragraph.clone(), "def");
+        assert_eq!(ranges, vec![(3 + object_len, 6 + object_len)], "bytes after the object are shifted past it");
+        let (_, ranges) = found_in_paragraph(paragraph, "abc");
+        assert_eq!(ranges, vec![(0, 3)]);
     }
 
     #[test]
