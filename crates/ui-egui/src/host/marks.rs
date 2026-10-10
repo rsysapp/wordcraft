@@ -9,12 +9,14 @@
 //! painting touches only the rectangles on visible pages.
 //!
 //! Limits: the budget is looked at after each passage folded, after each paragraph searched,
-//! every `WORK_PER_CHECK` places (plus passages compared) inside one paragraph, and after each mark
-//! placed. Between two looks the work is bounded by: folding one passage (linear in its length as
-//! sent; folding stops at `MAX_NEEDLE_CHARS` folded characters), building the automaton once
-//! (at most `MAX_MARKS` × 64 bytes of prefixes: about 5 ms and 1.5 MB measured natively), comparing
-//! one place with every passage sharing its prefix (each comparison at most a passage's length),
-//! and the document's text index, built once per document and shared with jumps.
+//! every `WORK_PER_CHECK` units of work inside one paragraph (a place, a passage compared there,
+//! and every 64 bytes compared; also between the passages sharing one place's prefix), and after
+//! each mark placed. Between two looks the work is bounded by: folding one passage (linear in its
+//! length as sent; folding stops at `MAX_NEEDLE_CHARS` folded characters), building the automaton
+//! once (at most `MAX_MARKS` × 64 bytes of prefixes: about 5 ms and 1.5 MB measured natively),
+//! about 16 KiB of passage compared plus one passage, and the document's text index, built once per
+//! document and shared with jumps. Crafted marks sharing a prefix with a long run of the same text
+//! still take many frames in all, but no frame spends much more than the budget on them.
 
 use std::sync::{Arc, Weak};
 
@@ -98,8 +100,10 @@ impl Marks {
             return false;
         }
         index.refresh(doc, rev);
-        let started = crate::now_ms();
-        let in_budget = || crate::now_ms() - started < SEARCH_BUDGET_MS;
+        // A monotonic clock (`performance.now()` on the web): the wall clock `now_ms` reads can step
+        // back, and on the web it ticks in whole milliseconds or coarser.
+        let started = web_time::Instant::now();
+        let in_budget = || started.elapsed().as_secs_f64() * 1000.0 < SEARCH_BUDGET_MS;
         let Marks { marks, search, .. } = self;
         let pages = layout.pages.len();
         // A mark's first match on its page when it names one (none when the document lacks that

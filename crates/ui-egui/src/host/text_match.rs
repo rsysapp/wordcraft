@@ -12,7 +12,8 @@ use unicode_normalization::UnicodeNormalization;
 use unicode_normalization::char::is_combining_mark;
 use wordcraft_doc::edit::Fragment;
 use wordcraft_doc::para::OBJ;
-use wordcraft_doc::{Block, Document, Paragraph, Path, Pos, StoryRef};
+// Nested tables are read at most `MAX_TABLE_DEPTH` deep, as `Document::plain_text` reads them.
+use wordcraft_doc::{Block, Document, MAX_TABLE_DEPTH, Paragraph, Path, Pos, StoryRef};
 
 /// Longest passage a host may ask for, in folded characters; longer ones match nothing.
 pub const MAX_NEEDLE_CHARS: usize = 10_000;
@@ -161,9 +162,6 @@ fn visible_text(paragraph: &Paragraph) -> (String, Vec<Seg>) {
     }
     (visible, segs)
 }
-
-/// Nested tables read at most, as `Document::plain_text` reads them.
-const MAX_TABLE_DEPTH: usize = 16;
 
 /// What a reader sees of a copied range (`Document::copy_range`), each paragraph by the rule jumps
 /// and marks match ([`visible_text`]), so a selection's text the host reads back is found again.
@@ -352,8 +350,13 @@ fn body_range(path: &Path, folded: &Folded, at: usize, end: usize) -> Option<(Po
 const PREFIX_BYTES: usize = 64;
 
 /// Work between two looks at the caller's budget: places the automaton reported plus passages
-/// compared there. Bounds the time between looks inside one long paragraph too.
+/// compared there, a passage counting one more for every [`BYTES_PER_WORK`] bytes compared. Bounds
+/// the time between looks inside one long paragraph, and inside one place, too.
 const WORK_PER_CHECK: usize = 256;
+
+/// Bytes of passage compared that count as one unit of work: between two looks at most
+/// `WORK_PER_CHECK` × 64 bytes (16 KiB) plus one passage (at most 40 KB) are compared.
+const BYTES_PER_WORK: usize = 64;
 
 /// One distinct folded passage and the passages (by position in the caller's list) it stands for.
 struct Needle {
@@ -391,9 +394,18 @@ pub(crate) struct FirstMatches {
     open: usize,
     /// The paragraph being searched.
     paragraph: usize,
-    /// Inside `paragraph`, when the last call stopped there: the end of the last place handled and
-    /// how many places ending there were handled.
-    within: Option<(usize, usize)>,
+    /// Inside `paragraph`, when the last call stopped there.
+    within: Option<Within>,
+}
+
+/// Where a pass stopped inside a paragraph.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct Within {
+    /// The end of the last place handled whole and how many places ending there were, if any.
+    done: Option<(usize, usize)>,
+    /// How many of the needles sharing the next place's prefix were already compared there: one
+    /// place can be more work than a look allows (many long passages sharing a prefix).
+    partial: usize,
 }
 
 impl FirstMatches {
@@ -527,14 +539,16 @@ impl TextIndex {
             // Resuming inside the paragraph: every place ending at or after the last one handled
             // starts at most a prefix's length before it, and the automaton reports the places that
             // end at one byte in the same order from there.
-            let resumed = within.take();
-            let from = resumed.map_or(0, |(end, _)| end.saturating_sub(PREFIX_BYTES));
+            let resumed = within.take().unwrap_or_default();
+            let from = resumed.done.map_or(0, |(end, _)| end.saturating_sub(PREFIX_BYTES));
             let places =
                 if from <= text.len() { automaton.try_find_overlapping_iter(aho_corasick::Input::new(text).range(from..)).ok() } else { None };
-            let mut handled = resumed;
+            let mut handled = resumed.done;
+            // Needles already compared at the first place not handled whole.
+            let mut skip_needles = resumed.partial;
             let mut skipped_at_end = 0usize;
             for place in places.into_iter().flatten() {
-                if let Some((end, count)) = resumed {
+                if let Some((end, count)) = resumed.done {
                     if place.end() < end {
                         continue;
                     }
@@ -543,18 +557,31 @@ impl TextIndex {
                         continue;
                     }
                 }
-                handled = Some(match handled {
-                    Some((end, count)) if end == place.end() => (end, count.saturating_add(1)),
-                    _ => (place.end(), 1),
-                });
                 let sharing = needles_of.get(place.pattern().as_usize()).map(Vec::as_slice).unwrap_or_default();
-                work = work.saturating_add(1 + sharing.len());
-                for &index in sharing {
+                // The automaton proved the prefix, so only the rest of each passage is compared.
+                let rest = text.get(place.end()..).unwrap_or_default();
+                let proven = place.end().saturating_sub(place.start());
+                work = work.saturating_add(1);
+                for (compared, &index) in sharing.iter().enumerate().skip(std::mem::take(&mut skip_needles)) {
+                    if work >= WORK_PER_CHECK {
+                        work = 0;
+                        if !more() {
+                            *within = Some(Within { done: handled, partial: compared });
+                            return;
+                        }
+                    }
                     let Some(needle) = needles.get_mut(index) else { continue };
-                    if needle.resume > (number, place.start()) || !text.get(place.start()..).is_some_and(|rest| rest.starts_with(&*needle.text)) {
+                    if needle.resume > (number, place.start()) {
                         continue;
                     }
-                    let end = place.start().saturating_add(needle.text.len());
+                    let tail = needle.text.get(proven..).unwrap_or_default();
+                    // `starts_with` compares at most the tail, and nothing when the text is shorter.
+                    let cost = if rest.len() >= tail.len() { tail.len() } else { 0 };
+                    work = work.saturating_add(1 + cost / BYTES_PER_WORK);
+                    if !rest.starts_with(tail) {
+                        continue;
+                    }
+                    let end = place.end().saturating_add(tail.len());
                     needle.resume = (number, end);
                     let Some((start, finish)) = body_range(path, folded, place.start(), end) else { continue };
                     let mut all_found = true;
@@ -573,10 +600,14 @@ impl TextIndex {
                         return;
                     }
                 }
+                handled = Some(match handled {
+                    Some((end, count)) if end == place.end() => (end, count.saturating_add(1)),
+                    _ => (place.end(), 1),
+                });
                 if work >= WORK_PER_CHECK {
                     work = 0;
                     if !more() {
-                        *within = handled;
+                        *within = Some(Within { done: handled, partial: 0 });
                         return;
                     }
                 }
@@ -1132,6 +1163,30 @@ mod tests {
         let last = search.found().last().cloned().flatten();
         assert_eq!(last, index.find_where("automaton", |_, _| true, 0));
         assert!(search.found().iter().take(300).all(Option::is_none));
+    }
+
+    #[test]
+    fn long_passages_sharing_a_prefix_are_compared_within_the_budget_inside_one_place() {
+        // Crafted marks: hundreds of long passages share their prefix with a long run of the same
+        // text, so every place there means comparing hundreds of long tails. One place is more work
+        // than a look allows, so the search stops inside a place and resumes there.
+        let d = doc(&[&"a".repeat(600)]);
+        let mut passages: Vec<String> = (0..300).map(|k| format!("{}{k}", "a".repeat(400))).collect();
+        passages.push("a".repeat(100));
+        let mut index = TextIndex::default();
+        index.refresh(&d, 1);
+        let mut search = FirstMatches::new(passages.clone());
+        let (mut calls, mut stopped_inside_a_place) = (0, 0);
+        while !search.done() {
+            calls += 1;
+            assert!(calls < 100_000, "the search does not move on");
+            index.find_first(&mut search, |_, _, _| true, || false);
+            stopped_inside_a_place += usize::from(search.within.is_some_and(|within| within.partial > 0));
+        }
+        assert!(stopped_inside_a_place > 100, "stopped inside a place only {stopped_inside_a_place} times");
+        let single: Vec<Option<(Pos, Pos)>> = passages.iter().map(|passage| index.find_where(passage, |_, _| true, 0)).collect();
+        assert_eq!(search.found(), single.as_slice());
+        assert!(search.found().last().is_some_and(Option::is_some));
     }
 
     #[test]

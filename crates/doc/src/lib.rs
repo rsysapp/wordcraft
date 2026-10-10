@@ -625,9 +625,9 @@ pub fn count_words(s: &str) -> usize {
 }
 
 // embed: one rule for how deep in nested tables paragraphs are listed and read, shared with
-// `Document::paths_between`'s one-paragraph shortcut.
+// `Document::paths_between`'s one-paragraph shortcut and the embed build's text matching.
 /// Tables nested deeper than this are not walked: their paragraphs are not listed or read.
-pub(crate) const MAX_TABLE_DEPTH: usize = 16;
+pub const MAX_TABLE_DEPTH: usize = 16;
 
 fn walk(bl: &Blocks, prefix: &mut Vec<u32>, out: &mut Vec<Path>, depth: usize) {
     if depth > MAX_TABLE_DEPTH {
