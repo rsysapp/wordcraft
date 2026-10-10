@@ -53,3 +53,8 @@ pub const COMMANDS: &[&str] = &[
 pub fn allows(id: &str) -> bool {
     COMMANDS.contains(&id)
 }
+
+/// The error a view-only session answers a refused command with (the UI's gate answers the same).
+pub fn refusal(id: &str) -> String {
+    format!("{id}: the document is open for viewing only")
+}

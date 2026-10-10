@@ -73,3 +73,17 @@ pub fn drawn_text(h: &Harness<'_, WordApp>) -> String {
 pub fn viewport_commands(h: &Harness<'_, WordApp>) -> Vec<egui::ViewportCommand> {
     h.output().viewport_output.get(&egui::ViewportId::ROOT).map(|v| v.commands.clone()).unwrap_or_default()
 }
+
+use wordcraft_ui_egui::host::{EmbedProfile, HostBridge};
+
+/// The embed build's app in view mode with `doc` loaded, and the bridge a host page would hold.
+pub fn view_app(doc: Document, pixels_per_point: f32) -> (Harness<'static, WordApp>, HostBridge) {
+    let bridge = HostBridge::new();
+    let app = WordApp::new(Session::new(doc), Services::default()).with_host(bridge.clone(), EmbedProfile::View);
+    let mut h = harness(app, pixels_per_point);
+    bridge.set_context(h.ctx.clone());
+    frames(&mut h, 2);
+    // Start each test with an empty event queue.
+    bridge.take_events();
+    (h, bridge)
+}

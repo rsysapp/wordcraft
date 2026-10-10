@@ -101,6 +101,13 @@ pub struct WordApp {
     /// embed: title last sent to the window; sent again only when it changes.
     #[cfg_attr(target_arch = "wasm32", allow(dead_code))]
     last_title: String,
+    /// embed: what this app shows and allows (`Full` outside the embed build). Public for the
+    /// embed crate and the tests only.
+    #[doc(hidden)]
+    pub profile: host::EmbedProfile,
+    /// embed: the host page's bridge and state; `None` outside the embed build.
+    #[doc(hidden)]
+    pub host: Option<host::HostState>,
 }
 
 impl WordApp {
@@ -128,6 +135,8 @@ impl WordApp {
             word_count: (0, 0),
             last_autosave: 0.0,
             last_title: String::new(),
+            profile: host::EmbedProfile::Full,
+            host: None,
         }
     }
 
@@ -136,8 +145,20 @@ impl WordApp {
         self
     }
 
+    /// embed: take commands from a host page through `bridge`, shown as `profile`.
+    #[doc(hidden)]
+    pub fn with_host(mut self, bridge: host::HostBridge, profile: host::EmbedProfile) -> Self {
+        host::profile::apply(&mut self, profile);
+        self.host = Some(host::HostState::new(bridge));
+        self
+    }
+
     /// Run a command; UI-level commands (`ui.*`) are handled here, the rest by the engine.
     pub fn run(&mut self, id: &str, params: Value) -> Result<Value, String> {
+        // embed: view mode refuses everything but navigation, selection, copy, find and zoom.
+        if let Some(r) = host::profile::view_gate(self, id, &params) {
+            return r;
+        }
         if let Some(r) = self.ui_command(id, &params) {
             return r;
         }
@@ -183,6 +204,10 @@ impl WordApp {
 
     /// Requests commands make of the UI (open a dialog…).
     fn handle_request(&mut self, req: &Value) {
+        // embed: view mode opens no dialogs, Backstage pages or windows.
+        if self.profile.is_view() {
+            return;
+        }
         if let Some(what) = req.get("open").and_then(Value::as_str) {
             match what {
                 "openFile" => self.open_dialog(),
@@ -375,7 +400,10 @@ impl WordApp {
             return;
         }
         let t = theme::Tokens::get(&ctx);
-        if self.ui.backstage {
+        if self.profile.is_view() {
+            // embed: view mode shows the document only.
+            host::view::show(self, ui);
+        } else if self.ui.backstage {
             backstage::show(self, ui);
         } else {
             chrome::title_bar(self, ui);
@@ -386,15 +414,20 @@ impl WordApp {
                 canvas::show(self, ui);
             });
         }
-        dialogs::show(self, &ctx);
+        // embed: view mode has no dialogs and follows no links out of the document.
+        if !self.profile.is_view() {
+            dialogs::show(self, &ctx);
+        }
         keys::global_shortcuts(self, &ctx);
-        if let Some(url) = self.canvas.open_url.take() {
+        if let Some(url) = self.canvas.open_url.take()
+            && !self.profile.is_view()
+        {
             ctx.open_url(egui::OpenUrl::new_tab(url));
         }
         // embed: only when it changes, and never on the web: eframe's web backend has no window title and
-        // logs a warning for every title command.
+        // logs a warning for every title command. An embedded view leaves the host page's title alone.
         #[cfg(not(target_arch = "wasm32"))]
-        {
+        if !self.profile.is_view() {
             let title = format!("{}{} - WordCraft", self.title_stem(), if self.session.dirty { " •" } else { "" });
             if title != self.last_title {
                 ctx.send_viewport_cmd(egui::ViewportCommand::Title(title.clone()));

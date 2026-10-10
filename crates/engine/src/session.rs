@@ -325,7 +325,7 @@ impl Session {
         let Some(spec) = reg.get(id) else { return Err(CmdError::Unknown(id.to_string())) };
         // embed: a view-only session refuses every edit path, not just the ones marked as mutating.
         if self.view_only && !crate::view_only::allows(id) {
-            return Err(CmdError::Disabled(format!("{id}: the document is open for viewing only")));
+            return Err(CmdError::Disabled(crate::view_only::refusal(id)));
         }
         if let Some(why) = (spec.enabled)(self) {
             return Err(CmdError::Disabled(format!("{id}: {why}")));
