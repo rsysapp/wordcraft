@@ -592,8 +592,12 @@ impl FontDb {
             if self.read_faces().iter().any(|f| f.family.eq_ignore_ascii_case(&family) && f.style.eq_ignore_ascii_case(&style)) {
                 continue;
             }
-            if let Some(f) = make_face(FontBytes::Owned(data.clone()), i, family, style, coords) {
-                self.faces.write().unwrap_or_else(|e| e.into_inner()).push(Arc::new(f));
+            let Some(f) = make_face(FontBytes::Owned(data.clone()), i, family, style, coords) else { continue };
+            // Check again under the write lock: lookups racing to load the same file add each
+            // face once.
+            let mut faces = self.faces.write().unwrap_or_else(|e| e.into_inner());
+            if !faces.iter().any(|g| g.family.eq_ignore_ascii_case(&f.family) && g.style.eq_ignore_ascii_case(&f.style)) {
+                faces.push(Arc::new(f));
                 added += 1;
             }
         }
@@ -688,11 +692,14 @@ impl FontDb {
         if let Some(f) = self.find(family, style) {
             return f;
         }
+        // Look again whatever loading reports: a lookup racing this one may have added the
+        // family's faces first, and then this one adds none.
         #[cfg(not(target_arch = "wasm32"))]
-        if self.load_cataloged(family)
-            && let Some(f) = self.find(family, style)
         {
-            return f;
+            self.load_cataloged(family);
+            if let Some(f) = self.find(family, style) {
+                return f;
+            }
         }
         self.find(FALLBACK_FAMILY, style)
             .or_else(|| self.find(FALLBACK_FAMILY, "Regular"))
@@ -840,8 +847,12 @@ impl FontDb {
             let Ok(data) = std::fs::read(&p) else { continue };
             let hit =
                 enumerate_faces(&data).iter().any(|(i, _, _, _)| skrifa::FontRef::from_index(&data, *i).is_ok_and(|f| f.charmap().map(c).is_some()));
-            if hit && self.add_font(data) > 0 && covered(self) {
-                return true;
+            // As in `face`: a racing fallback may have added this file first.
+            if hit {
+                self.add_font(data);
+                if covered(self) {
+                    return true;
+                }
             }
         }
         self.sys.lock().unwrap_or_else(|e| e.into_inner()).misses.insert(c);

@@ -134,3 +134,26 @@ fn the_scan_reads_names_without_loading_the_font() {
     assert!(file_face_names(&dir.join("readme.txt")).is_empty());
     assert!(file_face_names(&dir.join("missing.ttf")).is_empty());
 }
+
+#[test]
+fn lookups_racing_to_load_an_installed_font_all_find_it() {
+    let dir = font_dir("race");
+    for round in 0..20 {
+        let db = FontDb::with_font_dirs(vec![dir.clone()]);
+        db.load_system_fonts();
+        let start = std::sync::Barrier::new(8);
+        let found: Vec<String> = std::thread::scope(|s| {
+            let lookups: Vec<_> = (0..8)
+                .map(|_| {
+                    s.spawn(|| {
+                        start.wait();
+                        db.face(FAMILY, "Regular").family.clone()
+                    })
+                })
+                .collect();
+            lookups.into_iter().map(|l| l.join().unwrap()).collect()
+        });
+        assert!(found.iter().all(|f| f == FAMILY), "round {round}: {found:?}");
+        assert_eq!(db.read_faces().iter().filter(|f| f.family == FAMILY).count(), 2, "round {round}: each face loads once");
+    }
+}

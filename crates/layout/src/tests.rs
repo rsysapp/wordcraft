@@ -166,8 +166,15 @@ fn tall_first_page_header_pushes_body_down() {
     let l = lay(&d);
     let first = l.caret(&Pos::body(0, 0)).unwrap();
     assert!(first.top > d.last_section.margin_top + 50.0, "{first:?}");
-    let later = l.caret_on(&Pos::body(119, 0), l.pages.len() - 1).unwrap();
-    assert!(later.top < first.top, "{later:?}");
+    assert!(l.pages.len() > 1);
+    // Page 1 only: every later page has no header and its body starts at the top margin. Asked
+    // of each page's first line, not of a fixed paragraph: which paragraph lands where depends
+    // on the installed fonts' line heights.
+    for (i, page) in l.pages.iter().enumerate().skip(1) {
+        assert!(page.header.is_empty(), "page {i}");
+        let top = page.items.iter().find_map(|it| if let Placed::Lines { y, .. } = it { Some(*y) } else { None });
+        assert!(top.is_some_and(|t| (t - d.last_section.margin_top).abs() < 0.5 && t < first.top), "page {i}: {top:?}");
+    }
 }
 
 #[test]
