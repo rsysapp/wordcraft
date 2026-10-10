@@ -1,0 +1,27 @@
+[package]
+name = "wordcraft-embed"
+description = "WordCraft embed build: a wasm-bindgen module a host page mounts on its own canvas (view mode)"
+# Released on its own tags (embed-v<version>), independent of the app's version.
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+publish = false
+
+[lints]
+workspace = true
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+wordcraft-engine = { workspace = true }
+wordcraft-ui-egui = { workspace = true }
+egui = { workspace = true }
+log = { workspace = true }
+serde_json = { workspace = true }
+# `wgpu` pulls egui-wgpu's defaults: WebGPU plus the WebGL2 fallback, as in wordcraft-web.
+eframe = { workspace = true, features = ["default_fonts", "wgpu"] }
+wasm-bindgen = "0.2"
+wasm-bindgen-futures = "0.4"
+js-sys = "0.3"
+web-sys = { version = "0.3", features = ["HtmlCanvasElement"] }

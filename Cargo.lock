@@ -4898,6 +4898,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "wordcraft-embed"
+version = "0.1.0"
+dependencies = [
+ "eframe",
+ "egui",
+ "js-sys",
+ "log",
+ "serde_json",
+ "wasm-bindgen",
+ "wasm-bindgen-futures",
+ "web-sys",
+ "wordcraft-engine",
+ "wordcraft-ui-egui",
+]
+
+[[package]]
 name = "wordcraft-engine"
 version = "0.3.0"
 dependencies = [
