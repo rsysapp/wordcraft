@@ -28,7 +28,7 @@ fn the_window_title_is_sent_only_when_it_changes() {
 #[test]
 fn the_clock_is_wall_time_in_milliseconds() {
     // Native builds already pass; this pins the behaviour the wasm build gets from web-time
-    // (checked in the browser smoke test, Task 15).
+    // (checked in a browser).
     let first = wordcraft_ui_egui::now_ms();
     assert!(first > 1.7e12, "now_ms() = {first}");
     assert!(wordcraft_ui_egui::now_ms() >= first);

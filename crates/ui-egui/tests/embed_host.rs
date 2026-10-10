@@ -1631,7 +1631,7 @@ fn text_jump_occurrences_count_only_laid_out_matches_with_or_without_a_page() {
     }
 }
 
-// --- Selection events: fix round 1 ---
+// --- Selection events: visible text and the editor's own selections ---
 
 /// A paragraph of `(text, props)` parts.
 fn paragraph_of(parts: &[(&str, wordcraft_doc::props::CharProps)]) -> wordcraft_doc::Paragraph {
