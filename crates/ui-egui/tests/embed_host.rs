@@ -1140,3 +1140,27 @@ fn a_large_mark_set_finds_what_a_search_per_mark_finds() {
     }
     assert!(checked > 100, "too few marks checked: {checked}");
 }
+
+#[test]
+fn passages_longer_than_the_raw_cap_are_skipped_and_not_found() {
+    use wordcraft_ui_egui::host::text_match::MAX_RAW_PASSAGE_BYTES;
+    let (mut h, bridge) = embed_app();
+    open_doc(&mut h, &bridge, &clauses(20));
+    // Mostly whitespace: each folds to "clause 2.", so only the raw length tells them apart.
+    let filler = " \t\n".repeat(MAX_RAW_PASSAGE_BYTES / 3 + 1);
+    let at_cap = format!("{}Clause 2.", &filler[..MAX_RAW_PASSAGE_BYTES - "Clause 2.".len()]);
+    assert_eq!(at_cap.len(), MAX_RAW_PASSAGE_BYTES);
+    let over = format!("{}{at_cap}", " ".repeat(300 * 1024 - MAX_RAW_PASSAGE_BYTES));
+    assert_eq!(over.len(), 300 * 1024);
+    bridge.send(HostCommand::SetMarks(vec![mark("over", &over), mark("at", &at_cap)]));
+    frames(&mut h, 3);
+    assert_eq!(mark_ids(&h), vec!["at".to_string()], "the mark over the raw cap was kept");
+    assert!(bridge.take_events().is_empty(), "a mark over the cap is skipped silently");
+    let target = text_target(&over, None, 0);
+    bridge.send(HostCommand::JumpTo(target.clone()));
+    frames(&mut h, 2);
+    assert_eq!(bridge.take_events(), vec![HostEvent::JumpNotFound { target }]);
+    bridge.send(HostCommand::JumpTo(text_target(&at_cap, None, 0)));
+    frames(&mut h, 4);
+    assert_eq!(h.state().session.selected_text(), "Clause 2.");
+}

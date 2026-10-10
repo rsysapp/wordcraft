@@ -15,6 +15,10 @@ use wordcraft_doc::{Document, Paragraph, Path, Pos, StoryRef};
 
 /// Longest passage a host may ask for, in folded characters; longer ones match nothing.
 pub const MAX_NEEDLE_CHARS: usize = 10_000;
+/// Longest passage a host may ask for as sent, in bytes of UTF-8; longer ones match nothing and are
+/// never folded. Whitespace and inline objects fold to nothing, so the folded cap alone would still
+/// walk a huge passage of them in one step.
+pub const MAX_RAW_PASSAGE_BYTES: usize = 256 * 1024;
 /// Most matches [`TextIndex::find`] returns. Callers that need one particular match use
 /// [`TextIndex::find_where`], which is not limited by this.
 pub const MAX_MATCHES: usize = 10_000;
@@ -80,9 +84,13 @@ pub fn fold(src: &str) -> String {
     folded.trim_end().to_string()
 }
 
-/// The host's passage as matching compares it, or `None` when nothing is left to match or it is
-/// longer than [`MAX_NEEDLE_CHARS`]. Folding stops as soon as the passage is known to be too long.
+/// The host's passage as matching compares it, or `None` when nothing is left to match, it is
+/// longer than [`MAX_RAW_PASSAGE_BYTES`] as sent (checked before any folding) or longer than
+/// [`MAX_NEEDLE_CHARS`] once folded. Folding stops as soon as the passage is known to be too long.
 pub fn fold_query(passage: &str) -> Option<String> {
+    if passage.len() > MAX_RAW_PASSAGE_BYTES {
+        return None;
+    }
     // One character of slack: a trailing space is trimmed below and does not count.
     let folded: String = fold_mapped(passage, MAX_NEEDLE_CHARS + 1)?.into_iter().map(|(folded_char, _, _)| folded_char).collect();
     let folded = folded.trim_end();
@@ -901,6 +909,25 @@ mod tests {
         assert_eq!(fold_mapped(&"a".repeat(10), 10).map(|folded| folded.len()), Some(10));
         assert!(fold_query(&"x ".repeat(MAX_NEEDLE_CHARS)).is_none());
         assert_eq!(fold_query(&format!("{} ", "a".repeat(MAX_NEEDLE_CHARS))).map(|folded| folded.len()), Some(MAX_NEEDLE_CHARS));
+    }
+
+    #[test]
+    fn a_passage_longer_than_the_raw_cap_is_refused_before_it_is_folded() {
+        // Whitespace folds to nothing, so these fold to a short, valid passage: only the raw cap
+        // refuses the longer one, and it does so without folding it.
+        let at_cap = format!("{}Clause 2.", " ".repeat(MAX_RAW_PASSAGE_BYTES - "Clause 2.".len()));
+        assert_eq!(at_cap.len(), MAX_RAW_PASSAGE_BYTES);
+        assert_eq!(fold_query(&at_cap).as_deref(), Some("clause 2."));
+        let over = format!(" {at_cap}");
+        assert_eq!(fold_query(&over), None);
+        let d = doc(&["Clause 1.", "Clause 2."]);
+        let mut index = TextIndex::default();
+        index.refresh(&d, 1);
+        assert!(index.find_where(&at_cap, |_, _| true, 0).is_some());
+        assert!(index.find_where(&over, |_, _| true, 0).is_none());
+        let (one_pass, single) = both_ways(&d, &[&at_cap, &over], |_, _| true, false);
+        assert_eq!(one_pass, single);
+        assert_eq!((one_pass[0].is_some(), one_pass[1].is_some()), (true, false));
     }
 
     #[test]
