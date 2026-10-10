@@ -68,6 +68,48 @@ fn has(list: &[String], family: &str) -> bool {
     list.iter().any(|f| f == family)
 }
 
+/// A database whose font folders are `dirs` and that has no faces loaded (not even the bundled
+/// ones), so a test decides exactly which loaded face covers what.
+fn without_bundled(dirs: Vec<PathBuf>) -> FontDb {
+    let db = FontDb::with_font_dirs(dirs);
+    db.faces.write().unwrap().clear();
+    db
+}
+
+/// A meeting point for `n` threads that fails the test instead of hanging when one of them never
+/// arrives (a lookup that took another path, or panicked first).
+struct Rendezvous {
+    n: usize,
+    /// (arrived in this round, rounds completed).
+    state: std::sync::Mutex<(usize, usize)>,
+    met: std::sync::Condvar,
+}
+
+impl Rendezvous {
+    fn new(n: usize) -> Arc<Self> {
+        Arc::new(Rendezvous { n, state: std::sync::Mutex::new((0, 0)), met: std::sync::Condvar::new() })
+    }
+
+    fn wait(&self) {
+        let mut state = self.state.lock().unwrap();
+        let round = state.1;
+        state.0 += 1;
+        if state.0 == self.n {
+            *state = (0, round + 1);
+            self.met.notify_all();
+            return;
+        }
+        let (_state, timeout) = self.met.wait_timeout_while(state, std::time::Duration::from_secs(10), |s| s.1 == round).unwrap();
+        assert!(!timeout.timed_out(), "a thread never reached the meeting point");
+    }
+
+    /// A hook that meets the others `times` times.
+    fn hook(self: &Arc<Self>, times: usize) -> Option<Arc<dyn Fn() + Send + Sync>> {
+        let meet = self.clone();
+        Some(Arc::new(move || (0..times).for_each(|_| meet.wait())))
+    }
+}
+
 #[test]
 fn every_lookup_by_name_finds_installed_fonts_in_a_fresh_database() {
     let dir = font_dir("fresh");
@@ -166,19 +208,35 @@ fn lookups_racing_to_load_an_installed_font_all_find_it() {
 
 #[test]
 fn a_fallback_family_another_lookup_loaded_serves_the_character() {
-    // "Apple Symbols" is a preferred fallback family as long as the file's own name.
+    // Two preferred fallback families, each as long as the file's own name: "Hiragino Sans"
+    // comes before "Apple Symbols" in the preferred order.
     let dir = std::env::temp_dir().join(format!("dc-sysfonts-{}-fallback-loaded", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
-    let file = dir.join("Fallback.ttf");
-    std::fs::write(&file, renamed_as("SourceSans3-Regular.ttf", "Apple Symbols")).unwrap();
-    let db = FontDb::with_font_dirs(vec![dir]);
-    // Another lookup has loaded the family; then its file goes, so a scan can't find it again.
-    db.load_cataloged("Apple Symbols");
-    assert!(db.is_loaded("Apple Symbols"));
-    std::fs::remove_file(&file).unwrap();
-    assert!(db.system_fallback('A'), "a loaded face covers the character");
+    std::fs::write(dir.join("Hiragino.ttf"), renamed_as("SourceSans3-Regular.ttf", "Hiragino Sans")).unwrap();
+    std::fs::write(dir.join("Symbols.ttf"), renamed_as("SourceSans3-Regular.ttf", "Apple Symbols")).unwrap();
+    let db = without_bundled(vec![dir]);
+    db.load_system_fonts();
+    assert!(!db.read_faces().iter().any(|f| f.covers('A')), "nothing loaded covers it yet");
+    // Another lookup has loaded the first family, which covers the character.
+    db.load_cataloged("Hiragino Sans");
+    let attempts = db.load_attempts.load(Ordering::Relaxed);
+    assert!(db.system_fallback('A', 0));
+    assert!(!db.is_loaded("Apple Symbols"), "a later family is not loaded for nothing");
+    assert_eq!(db.load_attempts.load(Ordering::Relaxed), attempts);
     assert!(!db.sys.lock().unwrap().misses.contains(&'A'), "no miss is remembered");
+}
+
+#[test]
+fn the_runs_own_face_does_not_count_as_a_fallback() {
+    let dir = font_dir("exclude");
+    let db = without_bundled(vec![dir]);
+    // The run's own face covers the character, but the fallback must be another face.
+    db.add_font(renamed_as("SourceSans3-Regular.ttf", "Primary Sans3"));
+    let own = db.face("Primary Sans3", "Regular");
+    assert_eq!(own.family, "Primary Sans3");
+    let fallback = db.fallback_for('A', own.id());
+    assert_eq!(fallback.map(|f| f.family.clone()).as_deref(), Some(FAMILY), "the installed family is loaded and offered");
 }
 
 #[test]
@@ -245,8 +303,8 @@ fn a_failure_found_before_a_rescan_is_not_recorded_after_it() {
     let moved = dir.with_extension("moved");
     let _ = std::fs::remove_dir_all(&moved);
     std::fs::rename(&dir, &moved).unwrap();
-    let gate = Arc::new(std::sync::Barrier::new(2));
-    *db.load_gate.lock().unwrap() = Some(gate.clone());
+    let gate = Rendezvous::new(2);
+    *db.load_gate.lock().unwrap() = gate.hook(2);
     std::thread::scope(|s| {
         // This lookup's reads fail; it waits before recording that.
         let lookup = s.spawn(|| db.face(FAMILY, "Regular").family.clone());
@@ -259,6 +317,29 @@ fn a_failure_found_before_a_rescan_is_not_recorded_after_it() {
         assert_eq!(lookup.join().unwrap(), FALLBACK_FAMILY);
     });
     assert_eq!(db.face(FAMILY, "Regular").family, FAMILY, "the stale failure was not recorded");
+}
+
+#[test]
+fn a_rescan_between_the_scan_number_and_the_catalog_records_no_stale_failure() {
+    // The files move within the font folder: the old catalog's paths stop working, the new
+    // catalog's work.
+    let dir = font_dir("rescan-before-snapshot");
+    let db = FontDb::with_font_dirs(vec![dir.clone()]);
+    db.load_system_fonts();
+    let gate = Rendezvous::new(2);
+    *db.snapshot_gate.lock().unwrap() = gate.hook(2);
+    std::thread::scope(|s| {
+        let lookup = s.spawn(|| db.load_cataloged(FAMILY));
+        gate.wait();
+        std::fs::rename(dir.join("Sysfont-Regular.ttf"), dir.join("Moved-Regular.ttf")).unwrap();
+        std::fs::rename(dir.join("Sub"), dir.join("Moved")).unwrap();
+        *db.snapshot_gate.lock().unwrap() = None;
+        db.load_system_fonts();
+        gate.wait();
+        lookup.join().unwrap();
+    });
+    assert!(db.failed.lock().unwrap().families.is_empty(), "no failure recorded against the new catalog");
+    assert_eq!(db.face(FAMILY, "Regular").family, FAMILY);
 }
 
 /// `data` (a single font) with an `fvar` table added: one `wght` axis, 200 to 900, default 400.
@@ -311,7 +392,7 @@ fn lookups_overlapping_to_make_a_variable_instance_make_it_once() {
     assert_eq!(db.add_font(with_weight_axis(&renamed("SourceSans3-Regular.ttf"))), 1);
     assert!(db.axes(FAMILY, "Regular").iter().any(|a| a.0 == "wght"), "the font is variable");
     // Both lookups have missed the instance and made their own before either adds it.
-    *db.instance_gate.lock().unwrap() = Some(Arc::new(std::sync::Barrier::new(2)));
+    *db.instance_gate.lock().unwrap() = Rendezvous::new(2).hook(1);
     let style = "Regular {wght:650}";
     let ids: Vec<u32> = std::thread::scope(|s| {
         let lookups: Vec<_> = (0..2).map(|_| s.spawn(|| db.face(FAMILY, style).id())).collect();

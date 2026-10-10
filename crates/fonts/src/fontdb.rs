@@ -237,14 +237,32 @@ pub struct FontDb {
     /// Times `load_cataloged` read a family's files (tests check that a failure isn't retried).
     #[cfg(test)]
     load_attempts: std::sync::atomic::AtomicUsize,
-    /// Waited on by `instance` between making a face and adding it, so a test can make two
-    /// lookups overlap there.
+    /// Run by `instance` between making a face and adding it, so a test can make two lookups
+    /// overlap there.
     #[cfg(test)]
-    instance_gate: Mutex<Option<Arc<std::sync::Barrier>>>,
-    /// Waited on twice by `load_cataloged` after reading a family's files and before recording
-    /// a failure ("reads done", then "go on"), so a test can rescan in between.
+    instance_gate: TestHook,
+    /// Run by `load_cataloged` between taking the scan number and reading the catalog, so a test
+    /// can rescan in between.
     #[cfg(test)]
-    load_gate: Mutex<Option<Arc<std::sync::Barrier>>>,
+    snapshot_gate: TestHook,
+    /// Run by `load_cataloged` after reading a family's files and before recording a failure, so
+    /// a test can rescan in between.
+    #[cfg(test)]
+    load_gate: TestHook,
+}
+
+/// A point where a test can pause a lookup (to force an interleaving).
+#[cfg(test)]
+type TestHook = Mutex<Option<Arc<dyn Fn() + Send + Sync>>>;
+
+/// Run `hook` if a test set one. Cloned out first: running it while holding the lock would
+/// block other lookups reaching the same point.
+#[cfg(test)]
+fn run_hook(hook: &TestHook) {
+    let run = hook.lock().unwrap_or_else(|e| e.into_inner()).clone();
+    if let Some(run) = run {
+        run();
+    }
 }
 
 /// Families that failed to load, and the scan they were recorded against.
@@ -553,6 +571,8 @@ impl FontDb {
             #[cfg(test)]
             instance_gate: Mutex::new(None),
             #[cfg(test)]
+            snapshot_gate: Mutex::new(None),
+            #[cfg(test)]
             load_gate: Mutex::new(None),
         }
     }
@@ -710,6 +730,20 @@ impl FontDb {
     /// read again until the next scan.
     #[cfg(not(target_arch = "wasm32"))]
     fn load_cataloged(&self, family: &str) {
+        // The scan number is taken before the catalog is read. A rescan in between then makes
+        // this load's failure stale (not recorded); read the other way round, a failure to read
+        // the old catalog's files would be recorded against the new catalog.
+        self.ensure_catalog();
+        let key = family.to_ascii_lowercase();
+        let scan = {
+            let failed = self.failed.lock().unwrap_or_else(|e| e.into_inner());
+            if failed.families.contains(&key) {
+                return;
+            }
+            failed.scan
+        };
+        #[cfg(test)]
+        run_hook(&self.snapshot_gate);
         let paths: Vec<std::path::PathBuf> = {
             let cat = self.read_catalog();
             let mut p: Vec<_> = cat.iter().filter(|c| c.family.eq_ignore_ascii_case(family)).map(|c| c.path.clone()).collect();
@@ -720,14 +754,6 @@ impl FontDb {
         if paths.is_empty() {
             return;
         }
-        let key = family.to_lowercase();
-        let scan = {
-            let failed = self.failed.lock().unwrap_or_else(|e| e.into_inner());
-            if failed.families.contains(&key) {
-                return;
-            }
-            failed.scan
-        };
         #[cfg(test)]
         self.load_attempts.fetch_add(1, Ordering::Relaxed);
         for p in paths {
@@ -736,13 +762,7 @@ impl FontDb {
             }
         }
         #[cfg(test)]
-        {
-            let gate = self.load_gate.lock().unwrap_or_else(|e| e.into_inner()).clone();
-            if let Some(gate) = gate {
-                gate.wait();
-                gate.wait();
-            }
-        }
+        run_hook(&self.load_gate);
         // Record a failure only while the family is still not loaded (a racing load may have
         // succeeded; a success wins) and no rescan has happened since this load began. Lookups
         // look for loaded faces before they consult this record, so it never hides one.
@@ -826,13 +846,7 @@ impl FontDb {
         }
         let f = make_face(base.bytes.clone(), base.index, base.family.clone(), style.to_string(), coords)?;
         #[cfg(test)]
-        {
-            // Cloned out first: waiting while holding the lock would block the other lookup.
-            let gate = self.instance_gate.lock().unwrap_or_else(|e| e.into_inner()).clone();
-            if let Some(gate) = gate {
-                gate.wait();
-            }
-        }
+        run_hook(&self.instance_gate);
         // Check again under the write lock: lookups racing to make the same instance add it
         // once, since a duplicate gets its own id and splits the per-face caches.
         let mut faces = self.faces.write().unwrap_or_else(|e| e.into_inner());
@@ -881,7 +895,7 @@ impl FontDb {
             return Some(f);
         }
         #[cfg(not(target_arch = "wasm32"))]
-        if self.system_fallback(c) {
+        if self.system_fallback(c, exclude) {
             return self.loaded_fallback(c, exclude);
         }
         None
@@ -895,9 +909,10 @@ impl FontDb {
     }
 
     /// Load a system font covering `c` (preferred fallback families first, then any cataloged
-    /// file under 40 MB). Returns true if one was loaded. Misses are remembered.
+    /// file under 40 MB). Returns true once a loaded face other than `exclude` covers `c`, whoever
+    /// loaded it. Misses are remembered.
     #[cfg(not(target_arch = "wasm32"))]
-    fn system_fallback(&self, c: char) -> bool {
+    fn system_fallback(&self, c: char, exclude: u32) -> bool {
         if c.is_control() || c.is_whitespace() {
             return false;
         }
@@ -907,7 +922,8 @@ impl FontDb {
                 return false;
             }
         }
-        let covered = |db: &FontDb| db.read_faces().iter().any(|f| f.covers(c));
+        // The excluded face (the run's own) doesn't count: `fallback_for` won't return it.
+        let covered = |db: &FontDb| db.read_faces().iter().any(|f| f.id != exclude && f.covers(c));
         let cataloged: Vec<String> = self.read_catalog().iter().map(|e| e.family.clone()).collect();
         for fam in SYSTEM_FALLBACKS {
             if !cataloged.iter().any(|f| f.eq_ignore_ascii_case(fam)) {
