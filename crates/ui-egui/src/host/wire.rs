@@ -3,26 +3,41 @@
 //!
 //! Page and occurrence numbers are whole numbers on the wire. A fractional, negative or non-finite
 //! one is malformed and refused when the JSON is parsed, so the call fails and queues nothing. A
-//! whole number beyond `u32` is merely out of range for any document: it saturates to `u32::MAX`
-//! and later answers `jumpNotFound` (or skips a mark), exactly like a page the document lacks.
+//! whole number of any size (`18446744073709551616`, `1e21`) is merely out of range for any
+//! document: it saturates to `u32::MAX` and later answers `jumpNotFound` (or skips a mark), exactly
+//! like a page the document lacks.
 
 use egui::Color32;
+use serde::de::Error as _;
 use serde::{Deserialize, Deserializer, Serialize};
+use serde_json::Number;
 use wordcraft_doc::props::Rgb;
+
+use crate::theme::c32;
 
 /// Most marks one `setMarks` call keeps; the rest are ignored.
 pub const MAX_MARKS: usize = 2_000;
 
-/// A non-negative JSON integer, saturated to `u32::MAX`: JavaScript integers reach 2^53, and one
-/// beyond `u32` is out of range, not malformed.
+/// A non-negative whole JSON number of any size, saturated to `u32::MAX`. JavaScript writes large
+/// integers in exponent form (`1e+21`), which JSON parsers read as floats, so the value is judged by
+/// what it is rather than by how it is spelled.
 fn saturating_u32<'de, D: Deserializer<'de>>(deserializer: D) -> Result<u32, D::Error> {
-    let value = u64::deserialize(deserializer)?;
-    Ok(u32::try_from(value).unwrap_or(u32::MAX))
+    let number = Number::deserialize(deserializer)?;
+    if let Some(unsigned) = number.as_u64() {
+        return Ok(u32::try_from(unsigned).unwrap_or(u32::MAX));
+    }
+    match number.as_f64() {
+        Some(value) if value.is_finite() && value >= 0.0 && value.fract() == 0.0 => {
+            Ok(if value >= f64::from(u32::MAX) { u32::MAX } else { value as u32 })
+        }
+        _ => Err(D::Error::custom(format!("{number} is not a non-negative whole number"))),
+    }
 }
 
 fn saturating_optional_u32<'de, D: Deserializer<'de>>(deserializer: D) -> Result<Option<u32>, D::Error> {
-    let value = Option::<u64>::deserialize(deserializer)?;
-    Ok(value.map(|number| u32::try_from(number).unwrap_or(u32::MAX)))
+    #[derive(Deserialize)]
+    struct Whole(#[serde(deserialize_with = "saturating_u32")] u32);
+    Ok(Option::<Whole>::deserialize(deserializer)?.map(|whole| whole.0))
 }
 
 /// Where to jump: a page (1-based), or a passage of text (`occurrence` is 0-based, among the
@@ -36,7 +51,7 @@ pub enum JumpTarget {
     },
     Text {
         text: String,
-        #[serde(deserialize_with = "saturating_optional_u32")]
+        #[serde(default, deserialize_with = "saturating_optional_u32")]
         page: Option<u32>,
         #[serde(deserialize_with = "saturating_u32")]
         occurrence: u32,
@@ -87,12 +102,11 @@ pub fn parse_color(value: &str) -> Option<Color32> {
         return None;
     }
     // The colour digits go through the engine's own parser; only the alpha pair is read here.
-    let Rgb(red, green, blue) = Rgb::parse(hex.get(..6)?)?;
-    let alpha = match hex.get(6..) {
-        Some("") | None => 0xFF,
-        Some(pair) => u8::from_str_radix(pair, 16).ok()?,
-    };
-    Some(Color32::from_rgba_unmultiplied(red, green, blue, alpha))
+    let opaque = c32(Rgb::parse(hex.get(..6)?)?);
+    match hex.get(6..) {
+        Some("") | None => Some(opaque),
+        Some(pair) => Some(Color32::from_rgba_unmultiplied(opaque.r(), opaque.g(), opaque.b(), u8::from_str_radix(pair, 16).ok()?)),
+    }
 }
 
 /// The 0-based index of a host's 1-based page number, if it names one of `pages`.
@@ -115,31 +129,31 @@ fn checked_theme(theme: &ThemeSpec, what: &str) -> Result<(), String> {
 }
 
 pub fn parse_mount_options(json: &str) -> Result<MountOptions, String> {
-    let options: MountOptions = serde_json::from_str(json).map_err(|error| format!("MountOptions: {error}"))?;
+    let options: MountOptions = serde_json::from_str(json).map_err(|error| format!("mount: {error}"))?;
     if options.mode != "view" {
-        return Err(format!("MountOptions.mode '{}' is not supported: this build has view mode only", options.mode));
+        return Err(format!("mount: mode '{}' is not supported: this build has view mode only", options.mode));
     }
-    checked_theme(&options.theme, "MountOptions.theme")?;
+    checked_theme(&options.theme, "mount")?;
     Ok(options)
 }
 
 pub fn parse_theme(json: &str) -> Result<ThemeSpec, String> {
-    let theme: ThemeSpec = serde_json::from_str(json).map_err(|error| format!("Theme: {error}"))?;
-    checked_theme(&theme, "Theme")?;
+    let theme: ThemeSpec = serde_json::from_str(json).map_err(|error| format!("setTheme: {error}"))?;
+    checked_theme(&theme, "setTheme")?;
     Ok(theme)
 }
 
 pub fn parse_jump_target(json: &str) -> Result<JumpTarget, String> {
-    serde_json::from_str(json).map_err(|error| format!("JumpTarget: {error}"))
+    serde_json::from_str(json).map_err(|error| format!("jumpTo: {error}"))
 }
 
 /// `Mark[]` from the host's JSON. Marks beyond [`MAX_MARKS`] are ignored (the first ones are kept),
 /// as the embed API says, so a long list still paints its first part.
 pub fn parse_marks(json: &str) -> Result<Vec<MarkSpec>, String> {
-    let mut marks: Vec<MarkSpec> = serde_json::from_str(json).map_err(|error| format!("Mark[]: {error}"))?;
+    let mut marks: Vec<MarkSpec> = serde_json::from_str(json).map_err(|error| format!("setMarks: {error}"))?;
     marks.truncate(MAX_MARKS);
     if let Some(bad) = marks.iter().find(|mark| parse_color(&mark.color).is_none()) {
-        return Err(format!("Mark {}: color must be '#rrggbbaa'", bad.id));
+        return Err(format!("setMarks: mark {:?} has colour {:?}; expected #rrggbbaa", bad.id, bad.color));
     }
     Ok(marks)
 }
@@ -197,6 +211,11 @@ mod tests {
         assert!(parse_jump_target(r#"{"page":3}"#).is_err());
         assert!(parse_jump_target(r#"{"kind":"bookmark","name":"x"}"#).is_err());
         assert!(parse_jump_target(r#"{"kind":"text","text":"x","page":null}"#).is_err(), "occurrence is required");
+        assert_eq!(
+            parse_jump_target(r#"{"kind":"text","text":"x","occurrence":0}"#).unwrap(),
+            JumpTarget::Text { text: "x".into(), page: None, occurrence: 0 },
+            "an omitted page means the whole document"
+        );
         assert!(parse_jump_target(r#""page 1""#).is_err());
     }
 
@@ -213,6 +232,11 @@ mod tests {
             r#"{"kind":"text","text":"x","page":null,"occurrence":0.5}"#,
             r#"{"kind":"text","text":"x","page":1.5,"occurrence":0}"#,
             r#"{"kind":"text","text":"x","page":-3,"occurrence":0}"#,
+            r#"{"kind":"page","page":-0.5}"#,
+            r#"{"kind":"page","page":-1e21}"#,
+            r#"{"kind":"page","page":1e-1}"#,
+            r#"{"kind":"page","page":4294967295.5}"#,
+            r#"{"kind":"text","text":"x","page":null,"occurrence":-1e300}"#,
         ] {
             assert!(parse_jump_target(bad).is_err(), "{bad}");
         }
@@ -225,9 +249,38 @@ mod tests {
             parse_jump_target(r#"{"kind":"text","text":"x","page":5000000000,"occurrence":9007199254740991}"#).unwrap(),
             JumpTarget::Text { text: "x".into(), page: Some(u32::MAX), occurrence: u32::MAX }
         );
+        for huge in ["4294967295", "4294967296", "18446744073709551615", "18446744073709551616", "100000000000000000000", "1e+21", "1e300", "1.5e10"]
+        {
+            let page = format!(r#"{{"kind":"page","page":{huge}}}"#);
+            assert_eq!(parse_jump_target(&page).unwrap(), JumpTarget::Page { page: u32::MAX }, "{huge}");
+            let occurrence = format!(r#"{{"kind":"text","text":"x","page":{huge},"occurrence":{huge}}}"#);
+            assert_eq!(
+                parse_jump_target(&occurrence).unwrap(),
+                JumpTarget::Text { text: "x".into(), page: Some(u32::MAX), occurrence: u32::MAX },
+                "{huge}"
+            );
+            let mark = format!(r##"[{{"id":"m","text":"x","page":{huge},"color":"#000000"}}]"##);
+            assert_eq!(parse_marks(&mark).unwrap()[0].page, Some(u32::MAX), "{huge}");
+        }
+        assert_eq!(parse_jump_target(r#"{"kind":"page","page":3.0}"#).unwrap(), JumpTarget::Page { page: 3 });
+        assert_eq!(parse_jump_target(r#"{"kind":"page","page":4294967294}"#).unwrap(), JumpTarget::Page { page: 4_294_967_294 });
         assert_eq!(page_index(u32::MAX, 3), None, "no document has that page");
         let far = parse_marks(r##"[{"id":"far","text":"x","page":9007199254740991,"color":"#000000"}]"##).unwrap();
         assert_eq!(far[0].page, Some(u32::MAX));
+    }
+
+    #[test]
+    fn error_messages_carry_the_api_method_names() {
+        assert!(parse_jump_target("{}").unwrap_err().starts_with("jumpTo: "));
+        assert!(parse_marks("{}").unwrap_err().starts_with("setMarks: "));
+        assert!(parse_marks(r#"[{"id":"a","text":"x","page":null,"color":"red"}]"#).unwrap_err().starts_with("setMarks: "));
+        assert!(parse_theme("{}").unwrap_err().starts_with("setTheme: "));
+        assert!(parse_mount_options("{}").unwrap_err().starts_with("mount: "));
+        assert!(
+            parse_mount_options(r##"{"mode":"edit","theme":{"dark":false,"accent":"#000000","accentContent":"#ffffff"}}"##)
+                .unwrap_err()
+                .starts_with("mount: ")
+        );
     }
 
     #[test]
