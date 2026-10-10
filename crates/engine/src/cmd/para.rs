@@ -273,8 +273,8 @@ fn apply_style(s: &mut Session, v: &Value) -> CmdResult {
     let (a, b) = s.sel.ordered();
     s.doc.format_paragraphs(&a, &b, &|p| {
         p.style = Some(id.clone());
-        // Applying a heading or Normal removes direct list numbering (except list styles).
-        if (id.starts_with("Heading") || id == "Title" || id == "Normal") && p.numbering.is_some_and(|n| n.num != 0) && id == "Normal" {
+        // Applying Normal removes direct list numbering (except list styles); headings keep it.
+        if id == "Normal" && p.numbering.is_some_and(|n| n.num != 0) {
             p.numbering = None;
         }
     })?;
