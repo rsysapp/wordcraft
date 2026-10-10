@@ -300,34 +300,42 @@ fn check_mark_pages(marks: &JsValue) -> Result<(), JsValue> {
     Ok(())
 }
 
-/// The host array's length, read through a catch-checked call (see [`copy_bytes`]).
+#[wasm_bindgen]
+extern "C" {
+    /// `Uint8Array.prototype.set.call(target, source)`: `target.set(source)` on a view of wasm memory.
+    /// js-sys's own `copy_to`/`to_vec` call this without `catch`; this one returns what it throws. The
+    /// glue builds the view of `target` and calls `set` inside one catch wrapper, with no Rust code in
+    /// between, so a memory growth cannot detach the view between the two.
+    #[wasm_bindgen(catch, js_namespace = Uint8Array, js_name = "prototype.set.call")]
+    fn set_into(target: &mut [u8], source: &js_sys::Uint8Array) -> Result<(), JsValue>;
+}
+
+/// The array's `length`, read once. Through `Reflect::get`, so a subclass's throwing getter is an
+/// error here.
 fn byte_length(bytes: &js_sys::Uint8Array) -> Result<usize, JsValue> {
-    let length = js_sys::Reflect::get(bytes, &JsValue::from_str("length")).map_err(|_| type_error("open: bytes could not be read"))?;
+    let length = js_sys::Reflect::get(bytes, &JsValue::from_str("length")).map_err(|_| type_error("open: the length of bytes could not be read"))?;
     match length.as_f64() {
-        // A float-to-integer `as` saturates; a typed array's length is a whole number anyway.
-        Some(length) if length.is_finite() && length >= 0.0 => Ok(length as usize),
-        _ => Err(type_error("open: bytes could not be read")),
+        // A float-to-integer `as` saturates, and anything past the size cap is refused uncopied.
+        Some(length) if length.is_finite() && length.fract() == 0.0 && length >= 0.0 => Ok(length as usize),
+        _ => Err(type_error("open: bytes has no usable length")),
     }
 }
 
-/// Copies the host's `len` bytes into a new vector, every JavaScript step through a catch-checked
-/// call. wasm-bindgen's own copy (`to_vec`) calls `Uint8Array.prototype.set` through an import that
-/// cannot fail: on a buffer detached or shrunk since its length was read, `set` throws, and an
-/// exception thrown through Rust code skips its cleanup, leaving this object borrowed (`free()`
-/// refused, `Drop` never run). Here it becomes a TypeError and nothing is queued.
-fn copy_bytes(source: &js_sys::Uint8Array, len: usize) -> Result<Vec<u8>, JsValue> {
-    let unreadable = |_| type_error("open: bytes could not be read");
-    let mut bytes = vec![0u8; len];
-    let args = js_sys::Array::of1(source);
-    // Taken after the allocation, which may have grown the memory and replaced its buffer. The view
-    // covers exactly the vector; `set` writes the host's bytes into it.
-    let memory = wasm_bindgen::memory().dyn_into::<js_sys::WebAssembly::Memory>().map_err(unreadable)?;
-    let offset = u32::try_from(bytes.as_mut_ptr() as usize).map_err(|_| type_error("open: bytes could not be read"))?;
-    let length = u32::try_from(len).map_err(|_| type_error("open: bytes could not be read"))?;
-    let view = js_sys::Uint8Array::new_with_byte_offset_and_length(&memory.buffer(), offset, length);
-    let set = js_sys::Reflect::get(&view, &JsValue::from_str("set")).and_then(|set| set.dyn_into::<js_sys::Function>()).map_err(unreadable)?;
-    js_sys::Reflect::apply(&set, &view, &args).map_err(unreadable)?;
-    Ok(bytes)
+/// `len` bytes of `bytes`, copied into a buffer of exactly that size.
+///
+/// Every JavaScript call that could throw here is a `catch` import. An exception thrown through a
+/// non-`catch` import unwinds past this method's Rust frames without running their cleanup (there is
+/// no unwinding on wasm32), and that cleanup includes releasing the borrow of `self` that
+/// wasm-bindgen takes for the call: `free()` would then throw "attempted to take ownership ... while
+/// borrowed" and garbage collection would never run `Drop`. js-sys's `to_vec` is such a call: `set`
+/// throws for a detached or transferred buffer, and its `copy_to` asserts (an abort) if `length`
+/// changes between its two reads. Here `length` is read once, the copy throws into an `Err`, and a
+/// source longer than the view (a length that changed since) is refused by `set` with a RangeError,
+/// also an `Err`. A shorter one leaves the rest zeroed.
+fn copy_bytes(bytes: &js_sys::Uint8Array, len: usize) -> Result<Vec<u8>, JsValue> {
+    let mut copy = vec![0; len];
+    set_into(&mut copy, bytes).map_err(|_| type_error("open: bytes could not be read (a detached or changed buffer)"))?;
+    Ok(copy)
 }
 
 /// What a malformed argument throws.
