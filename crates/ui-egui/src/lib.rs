@@ -272,6 +272,7 @@ impl WordApp {
                 self.open_dialog();
                 json!({})
             }
+            #[cfg(feature = "brand")] // embed: not in the embed build (no ArtCraft links)
             "ui.discord" => {
                 self.canvas.open_url = Some("https://discord.gg/artcraft".into());
                 json!({})

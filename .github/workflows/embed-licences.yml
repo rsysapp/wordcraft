@@ -1,0 +1,43 @@
+# The embed build's THIRD-PARTY-LICENSES.txt is generated at release time; this runs the same
+# generation (no build, no zip) so a licence problem shows before a release: an unaccepted
+# licence, a changed or unvalidated licence file, a notice with a placeholder, a toolchain other
+# than the one the embed workflows pin.
+#
+# A workflow of its own: the upstream workflows run on main and release only, and the embed
+# branches (named *-embed) need this check on their pushes.
+name: Embed licences
+
+on:
+  push:
+    branches: [main, "*-embed"]
+  pull_request:
+  workflow_dispatch:
+
+# Read-only: it only reads the repository.
+permissions:
+  contents: read
+
+concurrency:
+  group: embed-licences-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  embed-licences:
+    name: embed build licence notices
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+      # The toolchain the module is built with, so the standard library notices are the same ones.
+      # third-party-licenses.sh reads it from this line (and every embed workflow's) and fails
+      # when the running rustc, or two embed workflows, differ.
+      - uses: dtolnay/rust-toolchain@1d64bbcee8ef0c191a54710c227fd268a0d5014b # 1.95.0
+        with:
+          toolchain: 1.95.0
+      - name: Install cargo-about
+        run: packaging/embed/install-cargo-about.sh
+      - name: Generate the licence notices
+        run: packaging/embed/third-party-licenses.sh "$RUNNER_TEMP/THIRD-PARTY-LICENSES.txt"

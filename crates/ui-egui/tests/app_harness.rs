@@ -10,7 +10,8 @@ fn the_full_window_draws_its_chrome_and_pages() {
     frames(&mut h, 4);
     let text = drawn_text(&h);
     assert!(text.contains("AutoSave"), "title bar missing:\n{text}");
-    assert!(text.contains("Discord"), "community button missing:\n{text}");
+    // Without `brand` (the embed build's setting) there is no community button.
+    assert_eq!(text.contains("Discord"), cfg!(feature = "brand"), "community button with brand {}:\n{text}", cfg!(feature = "brand"));
     assert!(!h.state().canvas.page_rects.is_empty(), "no pages laid out");
 }
 

@@ -808,3 +808,11 @@ fn dragging_the_scroll_bar_drops_the_page_target() {
     assert_eq!(bar_page(&h), Some(visible + 1), "the scroll bar drag left the target in place");
     assert_ne!(bar_page(&h), Some(3));
 }
+
+/// The embed build turns `brand` off; its full application then has no community link either.
+#[test]
+fn the_community_link_belongs_to_the_brand_feature() {
+    let mut app = WordApp::new(Session::new(wordcraft_doc::Document::new()), Services::default());
+    let result = app.run("ui.discord", json!({}));
+    assert_eq!(app.canvas.open_url.is_some(), cfg!(feature = "brand"), "ui.discord answered {result:?}");
+}

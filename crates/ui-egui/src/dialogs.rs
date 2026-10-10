@@ -721,9 +721,15 @@ fn body(app: &mut WordApp, ui: &mut Ui, d: &mut Dialog) -> bool {
                         env!("CARGO_PKG_VERSION"),
                         option_env!("WORDCRAFT_BUILD_SHA").map(|s| s.get(..8).unwrap_or(s)).unwrap_or("development build")
                     ));
+                    // embed: without `brand` (the embed build) the About text links no ArtCraft site or community.
+                    #[cfg(feature = "brand")]
                     ui.label("A free, open-source word processor written from scratch in Rust.\nPart of the Crafting Apps from the ArtCraft team.");
+                    #[cfg(not(feature = "brand"))]
+                    ui.label("A free, open-source word processor written from scratch in Rust.");
                     ui.add_space(6.0);
+                    #[cfg(feature = "brand")]
                     ui.hyperlink_to("getartcraft.com/apps/wordcraft", "https://getartcraft.com/apps/wordcraft");
+                    #[cfg(feature = "brand")]
                     ui.hyperlink_to("Join us on Discord: discord.gg/artcraft", "https://discord.gg/artcraft");
                     ui.hyperlink_to("Source code: github.com/storytold/wordcraft", "https://github.com/storytold/wordcraft");
                     ui.add_space(6.0);

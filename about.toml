@@ -1,0 +1,201 @@
+# cargo-about policy for the third-party licence notices shipped with the embed build
+# (packaging/embed/package.sh -> THIRD-PARTY-LICENSES.txt). Build-time tool only; it is not a
+# dependency. `accepted` is the fork's licence policy for what the module may contain (permissive
+# licences only, as ATTRIBUTION.md and NOTICE say); there is no cargo-deny configuration to mirror.
+accepted = [
+    "MIT",
+    "MIT-0",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "Zlib",
+    "Unicode-3.0",
+    "BSL-1.0",
+    "CC0-1.0",
+]
+
+# Only the code that is compiled into the module: no build scripts, no tests.
+ignore-build-dependencies = true
+ignore-dev-dependencies = true
+targets = ["wasm32-unknown-unknown"]
+
+# egui's default UI fonts (Ubuntu-Light, Hack, emoji-icon-font, Noto Emoji): the crate is
+# MIT/Apache-2.0 code plus font licences. The font licence texts the crate ships are also copied
+# into licenses/ by package.sh.
+[epaint_default_fonts]
+accepted = ["OFL-1.1", "Ubuntu-font-1.0"]
+
+# Crates whose package has no licence file, or only a template or a combined one: the licence
+# file is clarified so its real copyright holder line is shown (checksums pin the exact text; a
+# release that changes it fails the package until this section is reviewed). 'git' files come
+# from the upstream repository at the commit each package was published from (.cargo_vcs_info.json);
+# the WordCraft crates point at this workspace's LICENSE-MIT.
+# upstream licence files (checked out at the commit each package was published from)
+[egui.clarify]
+license = "MIT OR Apache-2.0"
+[[egui.clarify.git]]
+path = "LICENSE-MIT"
+checksum = "95ca92f5f8ea5231f1580b3a2a799e8260af3114b900e1def5355a7f44bcf60c"
+license = "MIT"
+
+[eframe.clarify]
+license = "MIT OR Apache-2.0"
+[[eframe.clarify.git]]
+path = "LICENSE-MIT"
+checksum = "95ca92f5f8ea5231f1580b3a2a799e8260af3114b900e1def5355a7f44bcf60c"
+license = "MIT"
+
+[ecolor.clarify]
+license = "MIT OR Apache-2.0"
+[[ecolor.clarify.git]]
+path = "LICENSE-MIT"
+checksum = "95ca92f5f8ea5231f1580b3a2a799e8260af3114b900e1def5355a7f44bcf60c"
+license = "MIT"
+
+[egui-wgpu.clarify]
+license = "MIT OR Apache-2.0"
+[[egui-wgpu.clarify.git]]
+path = "LICENSE-MIT"
+checksum = "95ca92f5f8ea5231f1580b3a2a799e8260af3114b900e1def5355a7f44bcf60c"
+license = "MIT"
+
+[emath.clarify]
+license = "MIT OR Apache-2.0"
+[[emath.clarify.git]]
+path = "LICENSE-MIT"
+checksum = "95ca92f5f8ea5231f1580b3a2a799e8260af3114b900e1def5355a7f44bcf60c"
+license = "MIT"
+
+[epaint.clarify]
+license = "MIT OR Apache-2.0"
+[[epaint.clarify.git]]
+path = "LICENSE-MIT"
+checksum = "95ca92f5f8ea5231f1580b3a2a799e8260af3114b900e1def5355a7f44bcf60c"
+license = "MIT"
+
+[accesskit.clarify]
+license = "(MIT OR Apache-2.0) AND BSD-3-Clause"
+[[accesskit.clarify.git]]
+path = "LICENSE-MIT"
+checksum = "23f18e03dc49df91622fe2a76176497404e46ced8a715d9d2b67a7446571cca3"
+license = "MIT"
+[[accesskit.clarify.git]]
+path = "LICENSE.chromium"
+checksum = "845022e0c1db1abb41a6ba4cd3c4b674ec290f3359d9d3c78ae558d4c0ed9308"
+license = "BSD-3-Clause"
+
+[profiling.clarify]
+license = "MIT OR Apache-2.0"
+[[profiling.clarify.git]]
+path = "LICENSE-MIT"
+checksum = "c8167fdeeed46d3f244d3f85c5bf998ce889343691c32be2c61a8bc4b5c08333"
+license = "MIT"
+
+[krilla.clarify]
+license = "MIT OR Apache-2.0"
+[[krilla.clarify.git]]
+path = "LICENSE_MIT"
+checksum = "9d1eb142840c7acfd5511b4dd298cece3f0053f5809228906445cd8a3365592f"
+license = "MIT"
+
+[wordcraft-doc.clarify]
+license = "MIT OR Apache-2.0"
+[[wordcraft-doc.clarify.git]]
+path = "LICENSE-MIT"
+checksum = "fc257de83c44ae49e4aad1cf777b886794be3ac9c8d00c010ef55935d5bbeba5"
+license = "MIT"
+
+[wordcraft-docx.clarify]
+license = "MIT OR Apache-2.0"
+[[wordcraft-docx.clarify.git]]
+path = "LICENSE-MIT"
+checksum = "fc257de83c44ae49e4aad1cf777b886794be3ac9c8d00c010ef55935d5bbeba5"
+license = "MIT"
+
+[wordcraft-embed.clarify]
+license = "MIT OR Apache-2.0"
+[[wordcraft-embed.clarify.git]]
+path = "LICENSE-MIT"
+checksum = "fc257de83c44ae49e4aad1cf777b886794be3ac9c8d00c010ef55935d5bbeba5"
+license = "MIT"
+
+[wordcraft-engine.clarify]
+license = "MIT OR Apache-2.0"
+[[wordcraft-engine.clarify.git]]
+path = "LICENSE-MIT"
+checksum = "fc257de83c44ae49e4aad1cf777b886794be3ac9c8d00c010ef55935d5bbeba5"
+license = "MIT"
+
+[wordcraft-fonts.clarify]
+license = "MIT OR Apache-2.0"
+[[wordcraft-fonts.clarify.git]]
+path = "LICENSE-MIT"
+checksum = "fc257de83c44ae49e4aad1cf777b886794be3ac9c8d00c010ef55935d5bbeba5"
+license = "MIT"
+
+[wordcraft-formats.clarify]
+license = "MIT OR Apache-2.0"
+[[wordcraft-formats.clarify.git]]
+path = "LICENSE-MIT"
+checksum = "fc257de83c44ae49e4aad1cf777b886794be3ac9c8d00c010ef55935d5bbeba5"
+license = "MIT"
+
+[wordcraft-geom.clarify]
+license = "MIT OR Apache-2.0"
+[[wordcraft-geom.clarify.git]]
+path = "LICENSE-MIT"
+checksum = "fc257de83c44ae49e4aad1cf777b886794be3ac9c8d00c010ef55935d5bbeba5"
+license = "MIT"
+
+[wordcraft-layout.clarify]
+license = "MIT OR Apache-2.0"
+[[wordcraft-layout.clarify.git]]
+path = "LICENSE-MIT"
+checksum = "fc257de83c44ae49e4aad1cf777b886794be3ac9c8d00c010ef55935d5bbeba5"
+license = "MIT"
+
+[wordcraft-pdf.clarify]
+license = "MIT OR Apache-2.0"
+[[wordcraft-pdf.clarify.git]]
+path = "LICENSE-MIT"
+checksum = "fc257de83c44ae49e4aad1cf777b886794be3ac9c8d00c010ef55935d5bbeba5"
+license = "MIT"
+
+[wordcraft-proof.clarify]
+license = "MIT OR Apache-2.0"
+[[wordcraft-proof.clarify.git]]
+path = "LICENSE-MIT"
+checksum = "fc257de83c44ae49e4aad1cf777b886794be3ac9c8d00c010ef55935d5bbeba5"
+license = "MIT"
+
+[wordcraft-render.clarify]
+license = "MIT OR Apache-2.0"
+[[wordcraft-render.clarify.git]]
+path = "LICENSE-MIT"
+checksum = "fc257de83c44ae49e4aad1cf777b886794be3ac9c8d00c010ef55935d5bbeba5"
+license = "MIT"
+
+[wordcraft-ui-egui.clarify]
+license = "MIT OR Apache-2.0"
+[[wordcraft-ui-egui.clarify.git]]
+path = "LICENSE-MIT"
+checksum = "fc257de83c44ae49e4aad1cf777b886794be3ac9c8d00c010ef55935d5bbeba5"
+license = "MIT"
+
+
+# licence files inside the published package
+[type-map.clarify]
+license = "MIT OR Apache-2.0"
+[[type-map.clarify.files]]
+path = "LICENSE-MIT"
+checksum = "b47fb719a40d9ef9c8e3be525c41ce129c46d613cfc96a91bddd7c19dcebf7a1"
+license = "MIT"
+
+[libm.clarify]
+license = "MIT"
+[[libm.clarify.files]]
+path = "LICENSE.txt"
+checksum = "3823dda7cf046602f4b4e77ec8e227863dc4736037cc85bb33d9f19febe16bb7"
+license = "MIT"

@@ -15,7 +15,10 @@ crate-type = ["cdylib", "rlib"]
 
 [target.'cfg(target_arch = "wasm32")'.dependencies]
 wordcraft-engine = { workspace = true }
-wordcraft-ui-egui = { workspace = true }
+# Without `brand`: a modified build may not carry the ArtCraft links (docs/brand/LICENSE-brand.txt).
+# A path dependency, because a workspace dependency would ignore `default-features = false`. Build
+# this package on its own (`-p wordcraft-embed`): beside the apps, cargo turns `brand` back on.
+wordcraft-ui-egui = { path = "../../crates/ui-egui", default-features = false }
 egui = { workspace = true }
 log = { workspace = true }
 serde_json = { workspace = true }

@@ -66,7 +66,12 @@ pub fn show(app: &mut WordApp, ui: &mut Ui) {
                 }
             }
             ui.with_layout(egui::Layout::bottom_up(egui::Align::Min), |ui| {
-                for (label, id) in [("About", "about"), ("Discord community", "discord")] {
+                // embed: the embed build (no `brand` feature) has no ArtCraft links.
+                #[cfg(feature = "brand")]
+                const LINKS: [(&str, &str); 2] = [("About", "about"), ("Discord community", "discord")];
+                #[cfg(not(feature = "brand"))]
+                const LINKS: [(&str, &str); 1] = [("About", "about")];
+                for (label, id) in LINKS {
                     let (r, resp) = ui.allocate_exact_size(vec2(200.0, 32.0), Sense::click());
                     if resp.hovered() {
                         ui.painter().rect_filled(r, 0.0, egui::Color32::from_white_alpha(26));

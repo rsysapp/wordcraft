@@ -8,6 +8,12 @@ description = "WordCraft egui front end (Word-style ribbon UI); swappable: nothi
 [lints]
 workspace = true
 
+# embed: the ArtCraft community links and About wording (docs/brand/LICENSE-brand.txt). The embed
+# build, a modified version, turns it off; everything else keeps the default.
+[features]
+default = ["brand"]
+brand = []
+
 [dependencies]
 wordcraft-geom = { workspace = true }
 wordcraft-doc = { workspace = true }
