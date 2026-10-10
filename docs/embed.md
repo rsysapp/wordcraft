@@ -97,8 +97,9 @@ holds the write token and the right to attest.
 
 `verify-zip.sh` extracts nothing. It requires the `.sha256` to be one line naming this zip with
 its hash, the entry names to be exactly the files listed in "Build" (plain relative names: no
-absolute path, `..`, backslash or folder entry) and `SHA256SUMS` to list each of them once, and it
-hashes every entry streamed out of the zip. A host can run it on a download.
+absolute path, `..`, backslash or folder entry, at most 100 characters, no two differing only in
+case) and `SHA256SUMS` to list each of them once, and it hashes every entry streamed out of the
+zip. A host can run it on a download.
 
 The release job attests the zip and its `.sha256` file with GitHub artifact attestation (signed
 SLSA build provenance, `actions/attest-build-provenance`). The checksum only shows that a file is
@@ -165,7 +166,8 @@ script fails if a declaration is missing.
   messages echo the strings the host sent.
 - `destroy()` stops the runner and frees the canvas. Later calls do nothing and deliver nothing
   (malformed arguments still throw); a second `destroy()` does nothing. `free()` (or
-  `[Symbol.dispose]()`, or garbage collection) destroys the editor too.
+  `[Symbol.dispose]()`, or garbage collection) destroys the editor too. After `free()` the object
+  is gone: wasm-bindgen throws on any later call, `destroy()` included.
 - Each `mount` installs eframe's panic hook; mounting and destroying repeatedly in one page chains
   hooks, one per mount. Nothing is stored in the host page's storage.
 
@@ -194,29 +196,52 @@ script fails if a declaration is missing.
   mark is skipped.
 - `open` takes files of at most 100 MB (`MAX_OPEN_BYTES`, 100 MiB). A larger one is answered, in
   order, `openFailed` ("This file is too large or complex to be shown here.") without its bytes ever
-  being copied into the module, and leaves the open document unchanged. An empty array, which is
+  being copied into the module, and leaves the open document unchanged. The size is judged before
+  anything else, so a file over the limit gets this answer whatever its name or type (a large PDF
+  too, not the unsupported-type message). An empty array, which is
   also how a detached or transferred buffer reads, is answered `openFailed` without being touched.
 - Inside a Word package the embed build reads at most 64 MiB per part, 192 MiB in all and 2,000,000
   XML elements across the package (below the desktop app's limits, because a failed allocation aborts a
-  WebAssembly module and its memory never shrinks). A file beyond any of them answers the same
-  `openFailed` message as an oversized one.
+  WebAssembly module and its memory never shrinks), with elements nested at most 64 deep (the desktop
+  allows 256). The reader recurses once per level and a stack overflow traps the module; measured
+  in Chromium, the deepest path uses about 2 KiB of the 1 MiB WebAssembly stack per level, so 64
+  levels stay near 140 KiB. A file beyond any of these limits answers the same `openFailed` message
+  as an oversized one.
 - Matching cost: the document's text index is built once per document and shared by jumps and
   marks. All marks are looked for in one pass over the document with an automaton built from at
   most 64 bytes of each passage (each candidate is then checked against the whole passage), and
   that work, like placing the marks' rectangles, stops after a time budget per frame and goes on in
-  the next, so a long list on a long document never stalls a frame. Marks show their first match
-  only.
+  the next, so a long list on a long document never stalls a frame. The budget is also looked at
+  between the passages compared at one place, so marks crafted to share a long opening with the
+  document's text take many frames, not one long one. Marks show their first match only.
 - The command and event queues are unbounded: the host page is trusted not to flood them.
 
 ## Crashes
 
-A Rust panic aborts the WebAssembly module: there is no unwinding on wasm32. After one the editor
-sends nothing more and later calls may throw. The host therefore treats "no `opened` or
-`openFailed` within its timeout after `open`", or a call that throws, as a failure: it shows its own
-failure panel, calls `destroy` and mounts a fresh editor for the next document. It also puts a
-timeout on `mount`: `mount` resolves after the first frame, which a canvas that never paints (in a
-hidden tab, say) or a failed start does not produce. On a `mount` timeout, keep the promise and
-`destroy` the editor if it resolves late.
+A Rust panic aborts the WebAssembly module: there is no unwinding on wasm32. A stack overflow or a
+failed allocation traps it the same way. After a trap the editor sends nothing more and later calls
+may throw. The host therefore treats "no `opened` or `openFailed` within its timeout after `open`",
+or a call that throws, as a failure: it shows its own failure panel and discards the whole module
+instance, never mounting on it again.
+
+A trap leaves the instance's memory as it was: locks held (the font caches, for one), the stack
+pointer not restored. And `init` returns the same cached instance. A new editor mounted on it can
+therefore crash at once or hang until the host's timeout. So after a failure the host:
+
+1. calls `destroy()` on the failed editor inside a `try`, since after a trap it may throw;
+2. drops every reference to that editor and to the module it came from;
+3. for the next mount, loads a fresh instance: a new `import()` of the glue under a new URL (its own
+   module record, for example `wordcraft_embed.js?attempt=2`), then that glue's `init`, which makes
+   a new WebAssembly instance with its own memory. The compiled `WebAssembly.Module` may be reused
+   (pass it to `init` as `module_or_path`); only the instance must be new. A recreated iframe or
+   worker that loads the glue is a fresh instance too.
+
+`destroy()` throws nothing by itself. It can throw only after a trap, or after `free()` (wasm-bindgen
+refuses any call on a freed object). Both are cases where the host's `try` is needed anyway.
+
+The host also puts a timeout on `mount`: `mount` resolves after the first frame, which a canvas that
+never paints (in a hidden tab, say) or a failed start does not produce. On a `mount` timeout, keep
+the promise and `destroy` the editor if it resolves late.
 
 eframe paints on animation frames, which a browser does not run in a hidden or background tab. There
 `mount`'s first frame, and the `opened` or `openFailed` that answers an `open`, wait until the tab
@@ -243,8 +268,9 @@ No title bar, ribbon, Backstage, status bar, side panes, dialogs, context menus,
 download or print. The document area keeps the file's own markup, read-only: tracked changes and
 Word comment balloons beside the page. Every edit is refused in two places: `Session::run` runs
 only `wordcraft_engine::view_only::COMMANDS`, and `WordApp::run` refuses UI commands, saving and
-downloads, whatever the keyboard or pointer does. Ctrl/⌘+C copies the selection. Links inside the
-document are not followed.
+downloads, whatever the keyboard or pointer does. Ctrl/⌘+C copies the selection as the `selection`
+event's `copyText` reports it (no tracked deletions or hidden text). Links inside the document are
+not followed.
 
 ## Branding
 
