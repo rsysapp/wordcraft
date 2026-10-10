@@ -1,6 +1,7 @@
 # CI for the embed build. The upstream workflows run on main and release only; the embed branches
-# (named *-embed) and pull requests get these gates:
-#   lint     actionlint on the workflows, shellcheck on the packaging scripts
+# (named *-embed) and pull requests into them get these gates:
+#   lint     actionlint on the workflows, shellcheck on the packaging scripts, and the self-test of
+#            the zip verifier (crafted zips it must refuse)
 #   check    `cargo xtask ci`: fmt, clippy, tests, assets, layers, the wasm32 check and, last, the
 #            `embed` step, which builds and tests the configuration the module ships: ui-egui
 #            without default features (embed_host, embed_view, app_harness) and clippy for
@@ -15,6 +16,7 @@ on:
   push:
     branches: ["*-embed"]
   pull_request:
+    branches: ["*-embed"]
   workflow_dispatch:
 
 # Read-only everywhere: nothing here publishes or writes to the repository.
@@ -28,9 +30,6 @@ concurrency:
 env:
   CARGO_TERM_COLOR: always
   CARGO_INCREMENTAL: 0
-  BINARYEN_VERSION: "123"
-  # From the release's own .sha256 asset, cross-checked by hashing the tarball.
-  BINARYEN_SHA256: e959f2170af4c20c552e9de3a0253704d6a9d2766e8fdb88e4d6ac4bae9388fe
   ACTIONLINT_VERSION: 1.7.12
   # From the release's own checksums file.
   ACTIONLINT_SHA256: 8aca8db96f1b94770f1b0d72b6dddcb1ebb8123cb3712530b08cc387b349a3d8
@@ -55,6 +54,8 @@ jobs:
         run: '"$RUNNER_TEMP/actionlint" -color'
       - name: shellcheck
         run: shellcheck packaging/*.sh packaging/*/*.sh
+      - name: verify-zip.sh refuses crafted zips
+        run: packaging/embed/test-verify-zip.sh
 
   check:
     name: cargo xtask ci
@@ -80,7 +81,7 @@ jobs:
         with:
           key: embed-ci
       - name: cargo xtask ci
-        run: cargo xtask ci
+        run: cargo --locked xtask ci
 
   package:
     name: package dry run
@@ -100,13 +101,9 @@ jobs:
         run: |
           v="$(awk '/^name = "wasm-bindgen"$/ { getline; gsub(/version = |"/, ""); print; exit }' Cargo.lock)"
           cargo install wasm-bindgen-cli --version "$v" --locked
+      # The version and SHA-256 are in packaging/embed/tools.env; the script checks the tarball.
       - name: Install wasm-opt (binaryen)
-        run: |
-          tarball="binaryen-version_${BINARYEN_VERSION}-x86_64-linux.tar.gz"
-          curl -fsSL -o "$RUNNER_TEMP/$tarball" "https://github.com/WebAssembly/binaryen/releases/download/version_${BINARYEN_VERSION}/$tarball"
-          echo "$BINARYEN_SHA256  $RUNNER_TEMP/$tarball" | sha256sum -c -
-          tar -xzf "$RUNNER_TEMP/$tarball" -C "$RUNNER_TEMP"
-          echo "$RUNNER_TEMP/binaryen-version_${BINARYEN_VERSION}/bin" >> "$GITHUB_PATH"
+        run: packaging/embed/install-binaryen.sh
       # The version and SHA-256 are in packaging/embed/cargo-about.env; the script checks the tarball.
       - name: Install cargo-about (licence notices of the Rust crates)
         run: packaging/embed/install-cargo-about.sh

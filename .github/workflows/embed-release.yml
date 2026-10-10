@@ -18,15 +18,33 @@ concurrency:
 env:
   CARGO_TERM_COLOR: always
   CARGO_INCREMENTAL: 0
-  BINARYEN_VERSION: "123"
-  # From the release's own .sha256 asset, cross-checked by hashing the tarball.
-  BINARYEN_SHA256: e959f2170af4c20c552e9de3a0253704d6a9d2766e8fdb88e4d6ac4bae9388fe
 
 jobs:
+  # Seconds, before any toolchain: a tag that does not name the crate's version fails here, not
+  # after the gates and the build.
+  version:
+    name: Tag matches the version
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+      - name: The tag names the crate's version
+        run: |
+          have="$(packaging/embed/package.sh --print-version)"
+          if [ "embed-v$have" != "$GITHUB_REF_NAME" ]; then
+            echo "::error::tag $GITHUB_REF_NAME, but apps/wordcraft-embed is version $have"
+            exit 1
+          fi
+
   # The same gates as Embed CI's check job, at the tagged commit. No build cache in this workflow:
   # a restored cache could carry another run's outputs into the release.
   gates:
     name: cargo xtask ci
+    needs: version
     runs-on: ubuntu-24.04
     timeout-minutes: 150
     permissions:
@@ -46,12 +64,13 @@ jobs:
           components: rustfmt, clippy
           targets: wasm32-unknown-unknown
       - name: cargo xtask ci
-        run: cargo xtask ci
+        run: cargo --locked xtask ci
 
   # Builds with a read-only token. Nothing here can write to the repository. A named runner image,
   # not -latest, keeps the operating system from changing between releases.
   build:
     name: Embed build (wasm)
+    needs: version
     runs-on: ubuntu-24.04
     timeout-minutes: 90
     permissions:
@@ -60,13 +79,6 @@ jobs:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
           persist-credentials: false
-      - name: The tag names the crate's version
-        run: |
-          have="$(packaging/embed/package.sh --print-version)"
-          if [ "embed-v$have" != "$GITHUB_REF_NAME" ]; then
-            echo "::error::tag $GITHUB_REF_NAME, but apps/wordcraft-embed is version $have"
-            exit 1
-          fi
       # dtolnay/rust-toolchain publishes each Rust release as a branch, not a tag; this is the
       # 1.95.0 branch's commit.
       - uses: dtolnay/rust-toolchain@1d64bbcee8ef0c191a54710c227fd268a0d5014b # 1.95.0
@@ -77,13 +89,9 @@ jobs:
         run: |
           v="$(awk '/^name = "wasm-bindgen"$/ { getline; gsub(/version = |"/, ""); print; exit }' Cargo.lock)"
           cargo install wasm-bindgen-cli --version "$v" --locked
+      # The version and SHA-256 are in packaging/embed/tools.env; the script checks the tarball.
       - name: Install wasm-opt (binaryen)
-        run: |
-          tarball="binaryen-version_${BINARYEN_VERSION}-x86_64-linux.tar.gz"
-          curl -fsSL -o "$RUNNER_TEMP/$tarball" "https://github.com/WebAssembly/binaryen/releases/download/version_${BINARYEN_VERSION}/$tarball"
-          echo "$BINARYEN_SHA256  $RUNNER_TEMP/$tarball" | sha256sum -c -
-          tar -xzf "$RUNNER_TEMP/$tarball" -C "$RUNNER_TEMP"
-          echo "$RUNNER_TEMP/binaryen-version_${BINARYEN_VERSION}/bin" >> "$GITHUB_PATH"
+        run: packaging/embed/install-binaryen.sh
       # The version and SHA-256 are in packaging/embed/cargo-about.env; the script checks the tarball.
       - name: Install cargo-about (licence notices of the Rust crates)
         run: packaging/embed/install-cargo-about.sh
@@ -105,6 +113,7 @@ jobs:
     name: Release
     needs: [gates, build]
     runs-on: ubuntu-24.04
+    timeout-minutes: 15
     permissions:
       contents: write
       # Only for the attestation below: the OIDC token that Sigstore signs the provenance with,

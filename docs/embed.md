@@ -14,7 +14,8 @@ packaging/embed/package.sh   # dist/release/wordcraft-embed-<version>.zip and .z
 
 It needs the `wasm32-unknown-unknown` target, `wasm-bindgen` at the version in `Cargo.lock`
 (`cargo install wasm-bindgen-cli --version <it> --locked`, or `WASM_BINDGEN=…`), binaryen's
-`wasm-opt` (or `WASM_OPT=…`; the script runs `wasm-opt -Oz`), cargo-about at the version in
+`wasm-opt` at the version in `packaging/embed/tools.env` (`WASM_OPT=…` names a binary; the script
+refuses any other version and runs `wasm-opt -Oz`), cargo-about at the version in
 `packaging/embed/cargo-about.env`, `jq` and `python3`. The version is `apps/wordcraft-embed`'s
 own, not the app's (`packaging/embed/package.sh --print-version`); release tags are
 `embed-v<version>`.
@@ -56,16 +57,48 @@ location; the script rewrites those paths with `--remap-path-prefix` (registry a
 `/cargo/registry/src` and `/cargo/git/checkouts`, the checkout to `.`) and fails if the module or
 its glue still holds `CARGO_HOME`, the checkout path or the home folder.
 
+### Reproducing a release
+
+To rebuild a release's zip and compare it with the published `.zip.sha256`:
+
+1. Check out the tag cleanly (`git clone`, or `git checkout embed-v<version>` in a tree with no
+   changes). The commit is compiled into the module's About text, so a build from another commit,
+   even with identical sources, differs.
+2. Use the Rust toolchain the workflows pin (their `toolchain:` lines): `RUSTUP_TOOLCHAIN=1.95.0`,
+   with the `wasm32-unknown-unknown` target.
+3. Install `wasm-bindgen-cli` at the version `Cargo.lock` locks for `wasm-bindgen`
+   (`awk '/^name = "wasm-bindgen"$/ { getline; print; exit }' Cargo.lock`), with `--locked`.
+4. Install binaryen at the version in `packaging/embed/tools.env` (123); its SHA-256 for the Linux
+   x86_64 release is there too (`packaging/embed/install-binaryen.sh` does it on that platform).
+   `package.sh` refuses another `wasm-opt`.
+5. Install cargo-about at the version in `packaging/embed/cargo-about.env`
+   (`packaging/embed/install-cargo-about.sh`), and have `jq` and `python3`.
+6. Run `packaging/embed/package.sh`, then compare `dist/release/wordcraft-embed-<version>.zip.sha256`
+   with the release's file, and run `packaging/embed/verify-zip.sh` on your zip.
+
+Honest status: equality has been checked between builds on one machine (macOS) and at different
+checkout paths. It has not yet been checked between macOS and the Linux runner that builds the
+release, so a build on another platform may differ in bytes (compare the files inside the zip:
+`unzip -p <zip> SHA256SUMS` lists each file's hash) until someone has compared the two.
+
 ### CI and releases
 
-`Embed CI` (`.github/workflows/embed-ci.yml`) runs on pull requests and on pushes to branches
-named `*-embed`: actionlint and shellcheck, `cargo xtask ci` (which ends with `cargo xtask embed`:
-the host tests without default features, the configuration the module ships, and clippy for
-`wordcraft-embed` on wasm32) and a dry run of the package. A tag `embed-v<version>`, matching
-`apps/wordcraft-embed`'s version, runs `Embed release`: the same gates, the build, a check of the
-zip against `SHA256SUMS` and its `.sha256` (`packaging/embed/verify-zip.sh`), then a GitHub release
-holding `wordcraft-embed-<version>.zip` and `wordcraft-embed-<version>.zip.sha256`. The release job
-alone holds the write token and the right to attest.
+`Embed CI` (`.github/workflows/embed-ci.yml`) runs on pull requests into `*-embed` branches and on
+pushes to them: actionlint, shellcheck and `packaging/embed/test-verify-zip.sh` (crafted zips the
+verifier must refuse), `cargo --locked xtask ci` (which ends with `cargo xtask embed`: the host
+tests without default features, the configuration the module ships, and clippy for
+`wordcraft-embed` on wasm32; every cargo call in it is `--locked`) and a dry run of the package.
+A tag `embed-v<version>` runs `Embed release`: first a seconds-long job that fails a tag that does
+not match `apps/wordcraft-embed`'s version, then the same gates and the build (uncached, so no
+earlier run's outputs reach the release), a check of the zip with
+`packaging/embed/verify-zip.sh`, then a GitHub release holding
+`wordcraft-embed-<version>.zip` and `wordcraft-embed-<version>.zip.sha256`. The release job alone
+holds the write token and the right to attest.
+
+`verify-zip.sh` extracts nothing. It requires the `.sha256` to be one line naming this zip with
+its hash, the entry names to be exactly the files listed in "Build" (plain relative names: no
+absolute path, `..`, backslash or folder entry) and `SHA256SUMS` to list each of them once, and it
+hashes every entry streamed out of the zip. A host can run it on a download.
 
 The release job attests the zip and its `.sha256` file with GitHub artifact attestation (signed
 SLSA build provenance, `actions/attest-build-provenance`). The checksum only shows that a file is

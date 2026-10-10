@@ -139,8 +139,8 @@ fn cmd_wasm() -> Result<(), String> {
     let mut results = Vec::new();
     for pkg in &set {
         let mut c = cargo();
-        c.args(["check", "--target", "wasm32-unknown-unknown", "-p", pkg]);
-        let ok = run(c, &format!("cargo check --target wasm32-unknown-unknown -p {pkg}")).is_ok();
+        c.args(["check", "--locked", "--target", "wasm32-unknown-unknown", "-p", pkg]);
+        let ok = run(c, &format!("cargo check --locked --target wasm32-unknown-unknown -p {pkg}")).is_ok();
         results.push((pkg.clone(), ok));
     }
     println!("\nwasm32-unknown-unknown check:");
@@ -153,13 +153,26 @@ fn cmd_wasm() -> Result<(), String> {
 
 /// The configuration the embed module ships: `wordcraft-embed` builds ui-egui without its default
 /// features, which `cargo test --workspace` (feature unification across the apps) never compiles.
+/// `--locked` everywhere in `ci`: a change to `Cargo.lock` is a commit, never a side effect of a check.
 fn cmd_embed() -> Result<(), String> {
     let mut test = cargo();
-    test.args(["test", "-p", "wordcraft-ui-egui", "--no-default-features", "--test", "embed_host", "--test", "embed_view", "--test", "app_harness"]);
-    run(test, "cargo test -p wordcraft-ui-egui --no-default-features --test embed_host --test embed_view --test app_harness")?;
+    test.args([
+        "test",
+        "--locked",
+        "-p",
+        "wordcraft-ui-egui",
+        "--no-default-features",
+        "--test",
+        "embed_host",
+        "--test",
+        "embed_view",
+        "--test",
+        "app_harness",
+    ]);
+    run(test, "cargo test --locked -p wordcraft-ui-egui --no-default-features --test embed_host --test embed_view --test app_harness")?;
     let mut clippy = cargo();
-    clippy.args(["clippy", "--target", "wasm32-unknown-unknown", "-p", "wordcraft-embed", "--", "-D", "warnings"]);
-    run(clippy, "cargo clippy --target wasm32-unknown-unknown -p wordcraft-embed -- -D warnings")
+    clippy.args(["clippy", "--locked", "--target", "wasm32-unknown-unknown", "-p", "wordcraft-embed", "--", "-D", "warnings"]);
+    run(clippy, "cargo clippy --locked --target wasm32-unknown-unknown -p wordcraft-embed -- -D warnings")
 }
 
 fn cmd_ci() -> Result<(), String> {
@@ -177,16 +190,16 @@ fn cmd_ci() -> Result<(), String> {
             "clippy",
             Box::new(|| {
                 let mut c = cargo();
-                c.args(["clippy", "--workspace", "--all-targets", "--", "-D", "warnings"]);
-                run(c, "cargo clippy --workspace --all-targets -- -D warnings")
+                c.args(["clippy", "--locked", "--workspace", "--all-targets", "--", "-D", "warnings"]);
+                run(c, "cargo clippy --locked --workspace --all-targets -- -D warnings")
             }),
         ),
         (
             "test",
             Box::new(|| {
                 let mut c = cargo();
-                c.args(["test", "--workspace"]);
-                run(c, "cargo test --workspace")
+                c.args(["test", "--locked", "--workspace"]);
+                run(c, "cargo test --locked --workspace")
             }),
         ),
         ("assets", Box::new(|| assets::run(&root()))),

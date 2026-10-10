@@ -6,9 +6,9 @@
 # The version is apps/wordcraft-embed's own (released as tags embed-v<version>), not the app's.
 # Needs: the wasm32-unknown-unknown target; wasm-bindgen at the version in Cargo.lock
 # (cargo install wasm-bindgen-cli --version <it> --locked, or set WASM_BINDGEN); wasm-opt from
-# binaryen (or set WASM_OPT); cargo-about at the version in cargo-about.env, and jq and python3
-# (see third-party-licenses.sh). The zip holds, at its root, the files the embed API lists
-# (docs/embed.md).
+# binaryen at the version in tools.env (or set WASM_OPT); cargo-about at the version in
+# cargo-about.env, and jq and python3 (see third-party-licenses.sh). The zip holds, at its root,
+# the files the embed API lists (docs/embed.md).
 set -euo pipefail
 # shellcheck source=../env.sh
 . "$(dirname "${BASH_SOURCE[0]}")/../env.sh"
@@ -30,6 +30,14 @@ if [ "$HAVE" != "$LOCKED" ]; then
   exit 1
 fi
 command -v "$WASM_OPT" >/dev/null || { echo "error: wasm-opt not found (binaryen; or set WASM_OPT)" >&2; exit 1; }
+# The optimiser's output is part of the zip's bytes, so only the pinned release is used.
+# shellcheck source=tools.env
+. "$ROOT/packaging/embed/tools.env"
+HAVE_OPT="$("$WASM_OPT" --version 2>/dev/null | awk '{ print $3 }')" || true
+if [ "$HAVE_OPT" != "$BINARYEN_VERSION" ]; then
+  echo "error: wasm-opt ${HAVE_OPT:-not found} (binaryen); tools.env pins version $BINARYEN_VERSION (packaging/embed/install-binaryen.sh, or set WASM_OPT)" >&2
+  exit 1
+fi
 
 NAME="wordcraft-embed-$EMBED_VERSION"
 WORK="$CARGO_TARGET_DIR/embed-package"
