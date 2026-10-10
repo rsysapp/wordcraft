@@ -447,17 +447,40 @@ fn the_view_bar_shows_the_page_and_moves_between_pages() {
     assert_eq!(h.state().canvas.visible_page, Some(0));
 }
 
+/// The scale the engine's Zoom in / Zoom out steps to from a displayed scale (whole tenths of 100%).
+fn stepped_scale(displayed: f32, step: f32) -> f32 {
+    let per_cent = wordcraft_ui_egui::canvas::PX_PER_PT / 100.0;
+    let percent = (displayed / per_cent).round();
+    (((percent / 100.0 * 10.0).round() / 10.0 + step).clamp(0.1, 5.0)) * 100.0 * per_cent
+}
+
 #[test]
-fn the_view_bar_zooms_and_fits_the_page_width() {
-    let (mut h, _bridge) = view_app(clauses(10), 1.0);
-    let fitted = h.state().canvas.scale;
-    h.get_by_label("Zoom in").click();
-    frames(&mut h, 3);
-    let zoomed = h.state().canvas.scale;
-    assert!((zoomed - 1.1 * wordcraft_ui_egui::canvas::PX_PER_PT).abs() < 0.01, "{fitted} -> {zoomed}");
-    h.get_by_label("Fit page width").click();
-    frames(&mut h, 3);
-    assert!((h.state().canvas.scale - fitted).abs() < 0.01);
+fn the_view_bar_zooms_from_the_fitted_scale_in_wide_and_narrow_windows() {
+    // The fitted scale is not the stored zoom (1.0): Zoom in must grow the page and Zoom out shrink it
+    // whatever the window is, not step from 100%.
+    for size in [egui::vec2(1800.0, 900.0), egui::vec2(1100.0, 800.0), egui::vec2(420.0, 700.0)] {
+        let (mut h, _bridge) = view_app(clauses(10), 1.0);
+        h.set_size(size);
+        frames(&mut h, 3);
+        let fitted = h.state().canvas.scale;
+        h.get_by_label("Zoom in").click();
+        frames(&mut h, 3);
+        let zoomed_in = h.state().canvas.scale;
+        assert!(zoomed_in > fitted, "{size:?}: Zoom in {fitted} -> {zoomed_in}");
+        assert!((zoomed_in - stepped_scale(fitted, 0.1)).abs() < 0.01, "{size:?}: {fitted} -> {zoomed_in}");
+        h.get_by_label("Fit page width").click();
+        frames(&mut h, 3);
+        assert!((h.state().canvas.scale - fitted).abs() < 0.01, "{size:?}: Fit page width did not return to the fitted scale");
+        h.get_by_label("Zoom out").click();
+        frames(&mut h, 3);
+        let zoomed_out = h.state().canvas.scale;
+        assert!(zoomed_out < fitted, "{size:?}: Zoom out {fitted} -> {zoomed_out}");
+        assert!((zoomed_out - stepped_scale(fitted, -0.1)).abs() < 0.01, "{size:?}: {fitted} -> {zoomed_out}");
+        // From a stored zoom the next step is one more tenth.
+        h.get_by_label("Zoom out").click();
+        frames(&mut h, 3);
+        assert!((h.state().canvas.scale - stepped_scale(zoomed_out, -0.1)).abs() < 0.01, "{size:?}");
+    }
 }
 
 #[test]
@@ -568,4 +591,103 @@ fn the_view_bar_draws_no_replace_control() {
     frames(&mut h, 3);
     let text = drawn_text(&h);
     assert!(!text.contains("Replace"), "{text}");
+}
+
+/// Type `text` one character at a time into the find field, as a person does.
+fn type_into_find(h: &mut Harness<'static, WordApp>, text: &str) {
+    h.get_by_role(Role::TextInput).focus();
+    frames(h, 2);
+    for letter in text.chars() {
+        h.get_by_role(Role::TextInput).type_text(&letter.to_string());
+        frames(h, 2);
+    }
+}
+
+#[test]
+fn typing_a_query_letter_by_letter_stays_on_its_first_match() {
+    let (mut h, _bridge) = view_app(clauses(30), 1.0);
+    type_into_find(&mut h, "schedule 2");
+    let app = h.state();
+    let first = app.session.find.results.first().cloned().expect("matches");
+    assert_eq!(first.0, Pos::body(1, first.0.off), "the first match is in clause 2");
+    assert_eq!(app.session.selected_text(), "Schedule 2");
+    assert_eq!(app.session.sel.ordered().0, first.0, "typing skipped on to a later match");
+}
+
+#[test]
+fn typing_searches_on_from_the_caret_and_stays_there() {
+    let (mut h, _bridge) = view_app(clauses(30), 1.0);
+    let caret = Pos::body(4, 0);
+    h.state_mut().session.sel = Selection::caret(caret.clone());
+    type_into_find(&mut h, "schedule 2");
+    let app = h.state();
+    let expected = app.session.find.results.iter().find(|(start, _)| *start >= caret).cloned().expect("a match after the caret");
+    assert_eq!(app.session.sel.ordered().0, expected.0);
+}
+
+#[test]
+fn typing_searches_the_body_when_the_caret_is_in_another_story() {
+    let (mut h, _bridge) = view_app(clauses(30), 1.0);
+    let elsewhere = Pos { story: StoryRef::Part(1), path: wordcraft_doc::Path::top(0), off: 0 };
+    h.state_mut().session.sel = Selection::caret(elsewhere);
+    type_into_find(&mut h, "schedule 2");
+    let app = h.state();
+    let first = app.session.find.results.first().cloned().expect("matches in the body");
+    assert_eq!(first.0.story, StoryRef::Body);
+    assert_eq!(app.session.sel.ordered().0, first.0);
+    assert_eq!(app.session.selected_text(), "Schedule 2");
+}
+
+#[test]
+fn the_match_count_is_not_shown_for_a_selection_that_moved_away() {
+    let (mut h, _bridge) = view_app(clauses(30), 1.0);
+    type_into_find(&mut h, "schedule 2");
+    let count = h.state().session.find.results.len();
+    assert!(drawn_text(&h).contains(&format!("1 of {count}")), "{}", drawn_text(&h));
+    let at = screen_of(&mut h, &Pos::body(0, 3));
+    click(&mut h, at, egui::PointerButton::Primary);
+    frames(&mut h, 3);
+    let text = drawn_text(&h);
+    assert!(!text.contains(&format!("1 of {count}")), "stale position: {text}");
+    assert!(text.contains(&format!("{count} matches")), "{text}");
+}
+
+#[test]
+fn next_page_reaches_a_last_page_that_is_never_the_most_visible() {
+    // Zoomed out so every page is in view, the first page stays "most visible" at any scroll offset,
+    // so Next page must follow its own target to reach the last page.
+    let (mut h, bridge) = view_app(clauses(40), 1.0);
+    h.state_mut().run("view.zoom", json!({"value": 15})).unwrap();
+    frames(&mut h, 4);
+    let count = pages(&mut h);
+    assert!(count >= 3, "{count} pages");
+    bridge.take_events();
+    for _ in 0..count {
+        if h.get_by_label("Next page").accesskit_node().is_disabled() {
+            break;
+        }
+        h.get_by_label("Next page").click();
+        frames(&mut h, 4);
+    }
+    assert!(drawn_text(&h).contains(&format!("Page {count} of {count}")), "{}", drawn_text(&h));
+    assert!(h.get_by_label("Next page").accesskit_node().is_disabled());
+    assert!(!h.get_by_label("Previous page").accesskit_node().is_disabled());
+    let events = bridge.take_events();
+    assert_eq!(events.last(), Some(&wordcraft_ui_egui::host::HostEvent::PageChanged { page: count as u32 }), "{events:?}");
+    // Previous page walks back the same way.
+    h.get_by_label("Previous page").click();
+    frames(&mut h, 4);
+    assert!(drawn_text(&h).contains(&format!("Page {} of {count}", count - 1)), "{}", drawn_text(&h));
+}
+
+#[test]
+fn scrolling_away_hands_the_page_back_to_what_is_visible() {
+    let (mut h, _bridge) = view_app(clauses(120), 1.0);
+    h.get_by_label("Next page").click();
+    frames(&mut h, 4);
+    assert!(drawn_text(&h).contains("Page 2 of"), "{}", drawn_text(&h));
+    // The view moves on its own (a person scrolling, or the host page jumping).
+    h.state_mut().canvas.scroll_to_doc = Some((3, 0.0));
+    frames(&mut h, 4);
+    assert!(drawn_text(&h).contains("Page 4 of"), "{}", drawn_text(&h));
 }

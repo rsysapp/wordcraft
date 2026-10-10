@@ -3,6 +3,7 @@
 
 use egui::{Rect, Sense, Stroke, Ui, vec2};
 use serde_json::json;
+use wordcraft_doc::{Pos, StoryRef};
 use wordcraft_engine::Selection;
 
 use crate::theme::{Tokens, regular};
@@ -32,36 +33,55 @@ fn bar(app: &mut WordApp, ui: &mut Ui) {
         });
 }
 
-fn page_controls(app: &mut WordApp, ui: &mut Ui) {
+/// Small dimmed text in the bar (page, zoom and match status).
+fn status_label(ui: &mut Ui, text: impl Into<String>) {
     let t = Tokens::get(ui.ctx());
+    ui.label(egui::RichText::new(text.into()).font(regular(12.0)).color(t.text_dim));
+}
+
+fn page_controls(app: &mut WordApp, ui: &mut Ui) {
     let pages = app.session.layout().pages.len();
+    let visible = app.canvas.visible_page;
+    let jumped = app.host.as_ref().and_then(|host| host.current_page(visible));
     // No wrap-around: the ends disable their button. A document with no pages disables both.
-    let current = app.canvas.visible_page.unwrap_or(0).min(pages.saturating_sub(1));
+    let current = jumped.unwrap_or(0).min(pages.saturating_sub(1));
     if icon_button(ui, "chevronUp", "Previous page", current > 0) {
         go_to_page(app, current.saturating_sub(1));
     }
-    let text = if pages == 0 { "No pages".to_string() } else { format!("Page {} of {pages}", current + 1) };
-    ui.label(egui::RichText::new(text).font(regular(12.0)).color(t.text_dim));
+    status_label(ui, format!("Page {} of {pages}", if pages == 0 { 0 } else { current + 1 }));
     if icon_button(ui, "chevronDown", "Next page", current.saturating_add(1) < pages) {
         go_to_page(app, current.saturating_add(1));
     }
 }
 
 fn zoom_controls(app: &mut WordApp, ui: &mut Ui) {
-    let t = Tokens::get(ui.ctx());
     if icon_button(ui, "minus", "Zoom out", true) {
-        let _ = app.run("view.zoomOut", json!({}));
+        step_zoom(app, "view.zoomOut");
     }
     // What is drawn, so a fitted page shows the zoom it got.
-    let percent = (app.canvas.scale / crate::canvas::PX_PER_PT * 100.0).round();
-    let percent = if percent.is_finite() { percent } else { 100.0 };
-    ui.label(egui::RichText::new(format!("{percent:.0}%")).font(regular(12.0)).color(t.text_dim));
+    status_label(ui, format!("{:.0}%", displayed_percent(app)));
     if icon_button(ui, "plus", "Zoom in", true) {
-        let _ = app.run("view.zoomIn", json!({}));
+        step_zoom(app, "view.zoomIn");
     }
     if icon_button(ui, "pageWidth", "Fit page width", true) {
         let _ = app.run("view.pageWidth", json!({}));
     }
+}
+
+/// The zoom the page is drawn at, in percent (within the engine's 10 to 500).
+fn displayed_percent(app: &WordApp) -> f32 {
+    let percent = (app.canvas.scale / crate::canvas::PX_PER_PT * 100.0).round();
+    if percent.is_finite() { percent.clamp(10.0, 500.0) } else { 100.0 }
+}
+
+/// Zoom in or out from what is on screen. While a fit is set the engine's stored zoom (the step's
+/// starting point) is stale, so a step from it could zoom the wrong way.
+fn step_zoom(app: &mut WordApp, command: &str) {
+    if !app.session.view.fit.is_empty() {
+        let percent = displayed_percent(app);
+        let _ = app.run("view.zoom", json!({"value": percent}));
+    }
+    let _ = app.run(command, json!({}));
 }
 
 /// Which way a find goes.
@@ -73,7 +93,6 @@ pub enum FindStep {
 }
 
 fn find_controls(app: &mut WordApp, ui: &mut Ui) {
-    let t = Tokens::get(ui.ctx());
     let Some((mut query, focus)) = app.host.as_mut().map(|host| (std::mem::take(&mut host.find_query), std::mem::take(&mut host.focus_find))) else {
         return;
     };
@@ -82,10 +101,7 @@ fn find_controls(app: &mut WordApp, ui: &mut Ui) {
     let next = icon_button(ui, "chevronDown", "Next match", has_query);
     let previous = icon_button(ui, "chevronUp", "Previous match", has_query);
     if has_query {
-        let count = app.session.find.results.len();
-        let status =
-            if count == 0 { "No matches".to_string() } else { format!("{} of {count}", app.session.find.current.saturating_add(1).min(count)) };
-        ui.label(egui::RichText::new(status).font(regular(12.0)).color(t.text_dim));
+        status_label(ui, match_status(app));
     }
     let field = ui.add(egui::TextEdit::singleline(&mut query).id_salt("embed_find").hint_text("Find in document").desired_width(180.0));
     if focus {
@@ -115,31 +131,88 @@ fn find_controls(app: &mut WordApp, ui: &mut Ui) {
     }
 }
 
+/// "3 of 12" while the selection is a match, else the bare count: the selection can move off the
+/// match (a click in the text), and the old position would then be wrong.
+fn match_status(app: &WordApp) -> String {
+    let find = &app.session.find;
+    let count = find.results.len();
+    if count == 0 {
+        return "No matches".to_string();
+    }
+    let (start, end) = app.session.sel.ordered();
+    let is_selected = |index: usize| find.results.get(index).is_some_and(|(a, b)| *a == start && *b == end);
+    let position = if is_selected(find.current) { Some(find.current) } else { (0..count).find(|&index| is_selected(index)) };
+    match position {
+        Some(index) => format!("{} of {count}", index.saturating_add(1)),
+        None if count == 1 => "1 match".to_string(),
+        None => format!("{count} matches"),
+    }
+}
+
+/// Where a search from the current selection begins: the selection's start in the body. The engine
+/// searches only the story the caret is in, so a caret anywhere else would otherwise confine (or
+/// empty) the search; it starts at the top of the body instead.
+fn body_anchor(app: &WordApp) -> Pos {
+    let start = app.session.sel.ordered().0;
+    if start.story == StoryRef::Body { start } else { Pos::body(0, 0) }
+}
+
 /// Find `query` and select the match; the canvas scrolls to it. An empty query clears the search and
 /// the highlight (the selected match).
 pub fn run_find(app: &mut WordApp, query: &str, step: FindStep) {
     if query.is_empty() {
-        let was_match =
-            app.session.find.results.iter().any(|(start, end)| Selection { anchor: start.clone(), focus: end.clone() } == app.session.sel);
+        let (start, end) = app.session.sel.ordered();
+        let was_match = app.session.find.results.iter().any(|(a, b)| *a == start && *b == end);
         app.session.find.results.clear();
         app.session.find.current = 0;
         if was_match {
-            app.session.sel = Selection::caret(app.session.sel.focus.clone());
+            app.session.sel = Selection::caret(start);
+        }
+        if let Some(host) = app.host.as_mut() {
+            host.find_anchor = None;
         }
         return;
     }
-    // The options are set every time: a host's earlier regex search must not make typed text a pattern.
-    let _ = match step {
-        FindStep::First => app.run("edit.find", json!({"text": query, "matchCase": false, "wholeWord": false, "regex": false})),
-        FindStep::Next => app.run("edit.findNext", json!({})),
-        FindStep::Previous => app.run("edit.findPrevious", json!({})),
-    };
+    match step {
+        FindStep::First => {
+            // Each keystroke searches again from where the search began: the engine takes the first
+            // match at or after the caret, and the last keystroke left the caret on its match, so
+            // a longer query would otherwise skip to a later match.
+            let kept = app.host.as_ref().and_then(|host| host.find_anchor.clone());
+            let anchor = kept.unwrap_or_else(|| body_anchor(app));
+            if let Some(host) = app.host.as_mut() {
+                host.find_anchor = Some(anchor.clone());
+            }
+            app.session.sel = Selection::caret(anchor);
+            // The options are set every time: a host's earlier regex search must not make typed text a pattern.
+            let _ = app.run("edit.find", json!({"text": query, "matchCase": false, "wholeWord": false, "regex": false}));
+        }
+        FindStep::Next | FindStep::Previous => {
+            let command = if step == FindStep::Next { "edit.findNext" } else { "edit.findPrevious" };
+            if app.run(command, json!({})).is_ok() {
+                // Typing on refines the search from the match just stepped to.
+                let anchor = body_anchor(app);
+                if let Some(host) = app.host.as_mut() {
+                    host.find_anchor = Some(anchor);
+                }
+            }
+        }
+    }
 }
 
 /// Show page `index` (0-based) at the top of the view, with the caret on its first line.
 pub fn go_to_page(app: &mut WordApp, index: usize) {
+    let pages = app.session.layout().pages.len();
+    if pages == 0 {
+        return;
+    }
+    // Never past the last page: the target is reported to the host as the current page.
+    let index = index.min(pages - 1);
     let _ = app.session.run("edit.goto", &json!({"page": index.saturating_add(1)}));
     app.canvas.scroll_to_doc = Some((index, 0.0));
+    if let Some(host) = app.host.as_mut() {
+        host.jump_to(index);
+    }
 }
 
 /// An icon button that screen readers and UI tests know by `label`.
