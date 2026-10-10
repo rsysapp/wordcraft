@@ -65,6 +65,7 @@ fn zoom_controls(app: &mut WordApp, ui: &mut Ui) {
     }
     if icon_button(ui, "pageWidth", "Fit page width", true) {
         let _ = app.run("view.pageWidth", json!({}));
+        keep_target_in_view(app);
     }
 }
 
@@ -82,6 +83,14 @@ fn step_zoom(app: &mut WordApp, command: &str) {
         let _ = app.run("view.zoom", json!({"value": percent}));
     }
     let _ = app.run(command, json!({}));
+    keep_target_in_view(app);
+}
+
+/// A zoom moves every page: put the jump's target page at the top again, so it stays in view.
+fn keep_target_in_view(app: &mut WordApp) {
+    if let Some(page) = app.host.as_ref().and_then(|host| host.page_target) {
+        app.canvas.scroll_to_doc = Some((page, 0.0));
+    }
 }
 
 /// Which way a find goes.
@@ -185,11 +194,16 @@ pub fn run_find(app: &mut WordApp, query: &str, step: FindStep) {
             }
             app.session.sel = Selection::caret(anchor);
             // The options are set every time: a host's earlier regex search must not make typed text a pattern.
-            let _ = app.run("edit.find", json!({"text": query, "matchCase": false, "wholeWord": false, "regex": false}));
+            let found = app.run("edit.find", json!({"text": query, "matchCase": false, "wholeWord": false, "regex": false}));
+            if found.is_ok() {
+                forget_page_target(app);
+            }
         }
         FindStep::Next | FindStep::Previous => {
             let command = if step == FindStep::Next { "edit.findNext" } else { "edit.findPrevious" };
             if app.run(command, json!({})).is_ok() {
+                // The view went to the match, wherever the last jump was.
+                forget_page_target(app);
                 // Typing on refines the search from the match just stepped to.
                 let anchor = body_anchor(app);
                 if let Some(host) = app.host.as_mut() {
@@ -197,6 +211,12 @@ pub fn run_find(app: &mut WordApp, query: &str, step: FindStep) {
                 }
             }
         }
+    }
+}
+
+fn forget_page_target(app: &mut WordApp) {
+    if let Some(host) = app.host.as_mut() {
+        host.page_target = None;
     }
 }
 

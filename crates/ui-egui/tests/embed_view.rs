@@ -680,14 +680,131 @@ fn next_page_reaches_a_last_page_that_is_never_the_most_visible() {
     assert!(drawn_text(&h).contains(&format!("Page {} of {count}", count - 1)), "{}", drawn_text(&h));
 }
 
+/// The label's page number ("Page 3 of 8" -> 3).
+fn bar_page(h: &Harness<'static, WordApp>) -> Option<usize> {
+    let text = drawn_text(h);
+    let after = text.split("Page ").nth(1)?;
+    after.split_whitespace().next()?.parse().ok()
+}
+
+/// Next page until it is disabled; returns the page it ended on.
+fn next_to_the_end(h: &mut Harness<'static, WordApp>) -> usize {
+    for _ in 0..40 {
+        if h.get_by_label("Next page").accesskit_node().is_disabled() {
+            break;
+        }
+        h.get_by_label("Next page").click();
+        frames(h, 4);
+    }
+    bar_page(h).expect("a page label")
+}
+
 #[test]
-fn scrolling_away_hands_the_page_back_to_what_is_visible() {
-    let (mut h, _bridge) = view_app(clauses(120), 1.0);
+fn a_layout_change_without_input_keeps_the_page_target() {
+    let (mut h, bridge) = view_app(clauses(120), 1.0);
     h.get_by_label("Next page").click();
     frames(&mut h, 4);
-    assert!(drawn_text(&h).contains("Page 2 of"), "{}", drawn_text(&h));
-    // The view moves on its own (a person scrolling, or the host page jumping).
-    h.state_mut().canvas.scroll_to_doc = Some((3, 0.0));
+    assert_eq!(bar_page(&h), Some(2));
+    // The layout moves under the target with no scroll input: another zoom (as a settling layout or a
+    // window resize would), over several frames.
+    h.state_mut().run("view.zoom", json!({"value": 15})).unwrap();
+    h.set_size(egui::vec2(1400.0, 1000.0));
+    frames(&mut h, 6);
+    assert_ne!(h.state().canvas.visible_page, Some(1), "the layout change did not move the visible page, so this proves nothing");
+    assert_eq!(bar_page(&h), Some(2), "the target was dropped without any scroll input");
+    let count = pages(&mut h);
+    bridge.take_events();
+    assert_eq!(next_to_the_end(&mut h), count);
+    assert!(h.get_by_label("Next page").accesskit_node().is_disabled());
+    let events = bridge.take_events();
+    assert_eq!(events.last(), Some(&wordcraft_ui_egui::host::HostEvent::PageChanged { page: count as u32 }), "{events:?}");
+}
+
+#[test]
+fn a_wheel_scroll_drops_the_page_target_and_the_host_follows_what_is_visible() {
+    let (mut h, bridge) = view_app(clauses(120), 1.0);
+    for _ in 0..2 {
+        h.get_by_label("Next page").click();
+        frames(&mut h, 4);
+    }
+    assert_eq!(bar_page(&h), Some(3));
+    bridge.take_events();
+    let canvas = h.state().canvas.canvas_rect.expect("a canvas");
+    h.hover_at(canvas.center());
+    frames(&mut h, 1);
+    h.event(egui::Event::MouseWheel {
+        unit: egui::MouseWheelUnit::Point,
+        delta: egui::vec2(0.0, 5000.0),
+        phase: egui::TouchPhase::Move,
+        modifiers: egui::Modifiers::NONE,
+    });
+    frames(&mut h, 8);
+    let visible = h.state().canvas.visible_page.expect("a visible page");
+    assert!(visible < 2, "the wheel did not scroll up (visible page {visible})");
+    assert_eq!(bar_page(&h), Some(visible + 1));
+    let events = bridge.take_events();
+    assert_eq!(events.last(), Some(&wordcraft_ui_egui::host::HostEvent::PageChanged { page: visible as u32 + 1 }), "{events:?}");
+}
+
+#[test]
+fn a_scroll_key_in_the_document_drops_the_page_target() {
+    let (mut h, _bridge) = view_app(clauses(40), 1.0);
+    h.state_mut().run("view.zoom", json!({"value": 15})).unwrap();
     frames(&mut h, 4);
-    assert!(drawn_text(&h).contains("Page 4 of"), "{}", drawn_text(&h));
+    let count = pages(&mut h);
+    assert_eq!(next_to_the_end(&mut h), count);
+    // A click in the text is not a scroll; the target stays.
+    let at = screen_of(&mut h, &Pos::body(0, 3));
+    click(&mut h, at, egui::PointerButton::Primary);
+    frames(&mut h, 2);
+    assert!(h.state().canvas.focused);
+    assert_eq!(bar_page(&h), Some(count));
+    h.key_press(egui::Key::ArrowDown);
+    frames(&mut h, 3);
+    assert_eq!(bar_page(&h), Some(h.state().canvas.visible_page.unwrap_or(0) + 1));
+    assert_ne!(bar_page(&h), Some(count));
+}
+
+#[test]
+fn a_zoom_from_the_bar_keeps_the_page_target_in_view() {
+    let (mut h, _bridge) = view_app(clauses(120), 1.0);
+    for _ in 0..2 {
+        h.get_by_label("Next page").click();
+        frames(&mut h, 4);
+    }
+    for label in ["Zoom out", "Zoom in", "Fit page width"] {
+        h.get_by_label(label).click();
+        frames(&mut h, 4);
+        assert_eq!(bar_page(&h), Some(3), "{label} dropped the target");
+        let app = h.state();
+        let canvas = app.canvas.canvas_rect.expect("a canvas");
+        let top = app.canvas.page_rects[2].min.y;
+        assert!((top - canvas.min.y).abs() < 40.0, "{label}: page 3 starts at {top}, the view at {}", canvas.min.y);
+    }
+}
+
+#[test]
+fn dragging_the_scroll_bar_drops_the_page_target() {
+    let (mut h, _bridge) = view_app(clauses(120), 1.0);
+    for _ in 0..2 {
+        h.get_by_label("Next page").click();
+        frames(&mut h, 4);
+    }
+    assert_eq!(bar_page(&h), Some(3));
+    let canvas = h.state().canvas.canvas_rect.expect("a canvas");
+    let grip = egui::pos2(canvas.max.x - 4.0, canvas.min.y + 120.0);
+    h.hover_at(grip);
+    frames(&mut h, 2);
+    h.event(press(grip, egui::PointerButton::Primary));
+    frames(&mut h, 1);
+    let end = egui::pos2(grip.x, canvas.max.y - 4.0);
+    h.event(egui::Event::PointerMoved(egui::pos2(grip.x, grip.y + 40.0)));
+    frames(&mut h, 1);
+    h.event(egui::Event::PointerMoved(end));
+    frames(&mut h, 2);
+    h.event(release(end, egui::PointerButton::Primary));
+    frames(&mut h, 4);
+    let visible = h.state().canvas.visible_page.expect("a visible page");
+    assert_eq!(bar_page(&h), Some(visible + 1), "the scroll bar drag left the target in place");
+    assert_ne!(bar_page(&h), Some(3));
 }

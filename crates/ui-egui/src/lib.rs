@@ -336,7 +336,7 @@ impl WordApp {
             self.styled = true;
         }
         // embed: a host page's commands apply before this frame's layout.
-        host::state::before_frame(self);
+        host::state::before_frame(self, ctx);
         let dark = self.ui.dark || self.session.view.dark_mode;
         if self.applied_dark != Some(dark) {
             theme::apply(ctx, &if dark { theme::Tokens::dark() } else { theme::Tokens::light() });
