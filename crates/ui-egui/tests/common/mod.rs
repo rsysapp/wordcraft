@@ -87,3 +87,62 @@ pub fn view_app(doc: Document, pixels_per_point: f32) -> (Harness<'static, WordA
     bridge.take_events();
     (h, bridge)
 }
+
+use wordcraft_doc::Pos;
+
+/// The document as JSON: equal strings mean an unchanged document.
+pub fn doc_json(h: &Harness<'_, WordApp>) -> String {
+    serde_json::to_string(&h.state().session.doc).expect("document serialises")
+}
+
+pub fn press(at: egui::Pos2, button: egui::PointerButton) -> egui::Event {
+    egui::Event::PointerButton { pos: at, button, pressed: true, modifiers: egui::Modifiers::NONE }
+}
+
+pub fn release(at: egui::Pos2, button: egui::PointerButton) -> egui::Event {
+    egui::Event::PointerButton { pos: at, button, pressed: false, modifiers: egui::Modifiers::NONE }
+}
+
+/// Click at `at`, then let the app settle.
+pub fn click(h: &mut Harness<'_, WordApp>, at: egui::Pos2, button: egui::PointerButton) {
+    h.event(egui::Event::PointerMoved(at));
+    h.event(press(at, button));
+    h.event(release(at, button));
+    frames(h, 4);
+}
+
+pub fn double_click(h: &mut Harness<'_, WordApp>, at: egui::Pos2) {
+    h.event(egui::Event::PointerMoved(at));
+    for _ in 0..2 {
+        h.event(press(at, egui::PointerButton::Primary));
+        h.event(release(at, egui::PointerButton::Primary));
+    }
+    frames(h, 4);
+}
+
+/// Screen point (egui points) in the middle of the line at `pos`.
+pub fn screen_of(h: &mut Harness<'_, WordApp>, pos: &Pos) -> egui::Pos2 {
+    let app = h.state_mut();
+    let layout = app.session.layout();
+    let caret = layout.caret_on(pos, app.session.page_hint).expect("position is laid out");
+    wordcraft_ui_egui::canvas::page_to_screen(app, caret.page, caret.x, caret.top + caret.height / 2.0).expect("page is on screen")
+}
+
+/// A harness that draws only the side panes, after installing the app's fonts.
+pub fn panes_harness(app: WordApp) -> Harness<'static, WordApp> {
+    let mut warm_frames = 0;
+    Harness::builder().with_size(WINDOW).with_max_steps(12).build_ui_state(
+        move |ui, app: &mut WordApp| {
+            if warm_frames < 2 {
+                if warm_frames == 0 {
+                    wordcraft_ui_egui::theme::install_fonts(ui.ctx());
+                }
+                warm_frames += 1;
+                ui.ctx().request_repaint();
+                return;
+            }
+            wordcraft_ui_egui::panes::show(app, ui);
+        },
+        app,
+    )
+}

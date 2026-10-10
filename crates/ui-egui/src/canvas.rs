@@ -299,7 +299,8 @@ pub fn show(app: &mut WordApp, ui: &mut Ui) {
             }
             // IME candidate window placement.
             let cr = Rect::from_min_max(pos2(x, y0), pos2(x + 1.0, y1));
-            if focused {
+            // embed: view mode takes no text input, so it never claims the IME (and the on-screen keyboard).
+            if focused && !app.profile.is_view() {
                 ui.ctx().output_mut(|o| {
                     o.ime =
                         Some(egui::output::IMEOutput { rect: cr, cursor_rect: cr, purpose: Default::default(), should_interrupt_composition: false });
@@ -338,7 +339,10 @@ pub fn show(app: &mut WordApp, ui: &mut Ui) {
         app.canvas.context_issue = app.session.run("review.suggestions", &json!({})).ok().filter(|v| !v.is_null());
         app.canvas.context_synonyms = app.session.run("review.thesaurus", &json!({})).ok().and_then(|v| v.get("synonyms").cloned());
     }
-    resp.context_menu(|ui| context_menu(app, ui));
+    // embed: view mode has no menus (the embed contract); Ctrl/Cmd+C still copies.
+    if !app.profile.is_view() {
+        resp.context_menu(|ui| context_menu(app, ui));
+    }
     if resp.hovered() {
         ui.ctx().set_cursor_icon(egui::CursorIcon::Text);
     }

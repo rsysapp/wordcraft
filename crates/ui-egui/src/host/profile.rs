@@ -57,7 +57,7 @@ pub(crate) fn view_gate(app: &mut WordApp, id: &str, params: &Value) -> Option<R
     }
     // Ctrl/⌘+F and Find without text open no dialog or pane in view mode. "Without text" is the
     // engine's reading: a `text` that is not a string counts as none and would open the pane.
-    if id == "edit.find" && params.get("text").and_then(Value::as_str).is_none() {
+    if id == "edit.find" && wordcraft_engine::p::str(params, "text").is_none() {
         return Some(Ok(json!({})));
     }
     if wordcraft_engine::view_only::allows(id) { None } else { Some(Err(refusal(id))) }

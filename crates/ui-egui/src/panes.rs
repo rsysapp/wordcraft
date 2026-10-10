@@ -230,11 +230,16 @@ fn comments(app: &mut WordApp, ui: &mut Ui) {
                 if let Some(part) = part {
                     let key = egui::Id::new(("comment_edit", id));
                     let mut text = ui.data(|d| d.get_temp::<String>(key)).unwrap_or_else(|| app.session.doc.plain_text(StoryRef::Part(part)));
-                    let r = ui.add(egui::TextEdit::multiline(&mut text).desired_rows(1).desired_width(f32::INFINITY).hint_text("Add a comment"));
+                    // embed: in view mode the comment text is read-only and never written back.
+                    let editable = app.profile.allows_editing();
+                    let r = ui.add_enabled(
+                        editable,
+                        egui::TextEdit::multiline(&mut text).desired_rows(1).desired_width(f32::INFINITY).hint_text("Add a comment"),
+                    );
                     if r.changed() {
                         ui.data_mut(|d| d.insert_temp(key, text.clone()));
                     }
-                    if r.lost_focus() {
+                    if r.lost_focus() && editable {
                         let blocks =
                             text.split('\n').map(|l| wordcraft_doc::para_block(wordcraft_doc::Paragraph::with_text(l, Default::default()))).collect();
                         let _ = app.session.doc.set_story(StoryRef::Part(part), blocks);

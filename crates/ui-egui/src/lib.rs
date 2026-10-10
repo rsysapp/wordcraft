@@ -135,7 +135,9 @@ impl WordApp {
             word_count: (0, 0),
             last_autosave: 0.0,
             last_title: String::new(),
+            // embed: the full application unless `with_host` switches to the embed build's profile.
             profile: host::EmbedProfile::Full,
+            // embed: no host page unless `with_host` attaches one.
             host: None,
         }
     }
