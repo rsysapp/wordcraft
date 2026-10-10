@@ -185,23 +185,35 @@ pub fn show(app: &mut WordApp, ui: &mut Ui) {
         scroll_target = Some(r.expand2(vec2(40.0, 60.0)));
     }
     app.canvas.scroll_to_caret = false;
-    // embed: a host jump puts its target at the top of the view.
-    let host_target = app.canvas.scroll_to_doc.take().and_then(|(page, y)| {
-        let y = if y.is_finite() { y.max(0.0) } else { 0.0 };
-        geo.rects.get(page).map(|pr| Rect::from_min_size(pos2(pr.min.x, pr.min.y + y * geo.scale), vec2(pr.width(), 1.0)))
+    // embed: a host jump puts its target at the top of the view. The offset is set on the scroll area
+    // itself rather than through `scroll_to_rect`, so this frame's viewport already shows it: a scroll
+    // target would move the view only on a later frame (and animated), leaving this frame to measure
+    // the old position, which after an open is the previous document's.
+    let host_offset = app.canvas.scroll_to_doc.take().and_then(|(page, y)| {
+        geo.rects.get(page).map(|pr| {
+            // Kept within the page: a huge or non-finite offset would otherwise be unbounded.
+            let dy = if y.is_finite() { (y * geo.scale).min(pr.height()).max(0.0) } else { 0.0 };
+            // Clamped as the scroll area will clamp it, so the measured view is the one that stays.
+            (pr.min.y + dy).min(geo.size.y - area.height()).max(0.0)
+        })
     });
+    // embed: a host jump wins over a caret scroll from the same frame, which would animate away from it.
+    if host_offset.is_some() {
+        scroll_target = None;
+    }
     let mut origin = area.min;
     let mut ui_area = ui.new_child(egui::UiBuilder::new().max_rect(area));
-    let out = egui::ScrollArea::both().id_salt("canvas_scroll").auto_shrink([false, false]).show_viewport(&mut ui_area, |ui, viewport| {
+    let mut scroll = egui::ScrollArea::both().id_salt("canvas_scroll").auto_shrink([false, false]);
+    // embed: see `host_offset`.
+    if let Some(offset) = host_offset {
+        scroll = scroll.vertical_scroll_offset(offset);
+    }
+    let out = scroll.show_viewport(&mut ui_area, |ui, viewport| {
         origin = ui.min_rect().min - viewport.min.to_vec2();
         let content = Rect::from_min_size(ui.min_rect().min, geo.size);
         let resp = ui.allocate_rect(content, Sense::click_and_drag());
         if let Some(tr) = scroll_target {
             ui.scroll_to_rect(Rect::from_min_size(ui.min_rect().min + tr.min.to_vec2(), tr.size()), None);
-        }
-        // embed: after the caret's scroll, so a host jump wins when both are pending.
-        if let Some(tr) = host_target {
-            ui.scroll_to_rect(Rect::from_min_size(ui.min_rect().min + tr.min.to_vec2(), tr.size()), Some(egui::Align::TOP));
         }
         // embed: the host hears which page is in view.
         app.canvas.visible_page = crate::host::view::visible_page(&geo.rects, viewport);

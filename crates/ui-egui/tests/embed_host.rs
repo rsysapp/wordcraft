@@ -12,7 +12,7 @@ fn opening_a_word_document_answers_opened_and_page_one() {
     let count = pages(&mut h);
     assert!(count >= 3, "fixture too short: {count} pages");
     assert_eq!(events.first(), Some(&HostEvent::Opened { pages: count as u32 }), "{events:?}");
-    assert!(events.contains(&HostEvent::PageChanged { page: 1 }), "{events:?}");
+    assert_eq!(events, vec![HostEvent::Opened { pages: count as u32 }, HostEvent::PageChanged { page: 1 }]);
     assert!(h.state().session.view_only, "an opened document stays view-only");
     assert!(!h.state().session.dirty);
 }
@@ -59,9 +59,12 @@ fn a_second_open_replaces_the_document_and_reports_page_one_again() {
     h.state_mut().canvas.scroll_to_doc = Some((2, 0.0));
     frames(&mut h, 4);
     bridge.take_events();
-    let events = open_doc(&mut h, &bridge, &clauses(5));
-    assert_eq!(events, vec![HostEvent::Opened { pages: 1 }, HostEvent::PageChanged { page: 1 }]);
-    assert!(h.state().session.doc.plain_text(wordcraft_doc::StoryRef::Body).starts_with("Clause 1."));
+    // Several pages, so the previous document's scroll position still lands on a page of this one.
+    let events = open_doc(&mut h, &bridge, &clauses(120));
+    let count = pages(&mut h) as u32;
+    assert!(count >= 3, "fixture too short: {count} pages");
+    assert_eq!(events, vec![HostEvent::Opened { pages: count }, HostEvent::PageChanged { page: 1 }]);
+    assert_eq!(h.state().canvas.visible_page, Some(0));
     assert!(h.state().session.view_only);
 }
 
@@ -272,4 +275,36 @@ fn the_hand_written_zip_is_a_real_package() {
     let xml = br#"<?xml version="1.0"?><w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:body><w:p><w:r><w:t>Hello</w:t></w:r></w:p></w:body></w:document>"#;
     let doc = wordcraft_ui_egui::host::open::open_document("hand.docx", &zip(&[content_types(), Entry::stored("word/document.xml", xml)]));
     assert_eq!(doc.map(|d| d.plain_text(wordcraft_doc::StoryRef::Body)), Ok("Hello".to_string()));
+}
+
+#[test]
+fn a_jump_offset_stays_within_its_page() {
+    let (mut h, bridge) = embed_app();
+    open_doc(&mut h, &bridge, &clauses(120));
+    // Past the bottom of the second page: the view's top lands at that page's bottom edge, so the
+    // page filling the view is the third, never one further down.
+    for offset in [f32::MAX, 1e30, 1e9] {
+        h.state_mut().canvas.scroll_to_doc = Some((0, 0.0));
+        frames(&mut h, 3);
+        h.state_mut().canvas.scroll_to_doc = Some((1, offset));
+        frames(&mut h, 3);
+        assert_eq!(h.state().canvas.visible_page, Some(2), "offset {offset}");
+    }
+    // Above the top of a page is its top.
+    h.state_mut().canvas.scroll_to_doc = Some((1, -1e30));
+    frames(&mut h, 3);
+    assert_eq!(h.state().canvas.visible_page, Some(1));
+    bridge.take_events();
+}
+
+#[test]
+fn a_host_jump_wins_over_a_caret_scroll_from_the_same_frame() {
+    let (mut h, bridge) = embed_app();
+    open_doc(&mut h, &bridge, &clauses(120));
+    // The caret is on page one; both scrolls are asked for in one frame.
+    h.state_mut().canvas.scroll_to_caret = true;
+    h.state_mut().canvas.scroll_to_doc = Some((4, 0.0));
+    frames(&mut h, 6);
+    assert_eq!(h.state().canvas.visible_page, Some(4));
+    assert_eq!(bridge.take_events(), vec![HostEvent::PageChanged { page: 5 }]);
 }
