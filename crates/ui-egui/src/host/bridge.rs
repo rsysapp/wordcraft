@@ -6,7 +6,7 @@ use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 use serde::Serialize;
 
-use super::wire::JumpTarget;
+use super::wire::{JumpTarget, MarkSpec};
 
 /// What a host page asks of the editor.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -15,6 +15,8 @@ pub enum HostCommand {
     Open { name: String, bytes: Vec<u8> },
     /// Show a page or a passage; answered by `JumpNotFound` when there is nothing to show.
     JumpTo(JumpTarget),
+    /// Replace every host mark; an empty list clears them. Marks not found are skipped silently.
+    SetMarks(Vec<MarkSpec>),
 }
 
 /// What the editor tells the host page; serialises to the embed API's `EditorEvent`.

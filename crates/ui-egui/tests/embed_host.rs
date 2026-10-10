@@ -773,3 +773,303 @@ fn a_selection_drag_that_scrolls_the_view_drops_the_page_target() {
     h.event(release(low + egui::vec2(80.0, 0.0), egui::PointerButton::Primary));
     frames(&mut h, 2);
 }
+
+// --- setMarks: host highlights ---
+
+use serde_json::json;
+use wordcraft_engine::Selection;
+use wordcraft_ui_egui::host::MarkSpec;
+use wordcraft_ui_egui::host::wire::MAX_MARKS;
+
+const AMBER: &str = "#ffd60080";
+
+fn amber() -> egui::Color32 {
+    egui::Color32::from_rgba_unmultiplied(0xff, 0xd6, 0x00, 0x80)
+}
+
+fn mark(id: &str, text: &str) -> MarkSpec {
+    MarkSpec { id: id.into(), text: text.into(), page: None, color: AMBER.into() }
+}
+
+fn mark_on(id: &str, text: &str, page: u32) -> MarkSpec {
+    MarkSpec { page: Some(page), ..mark(id, text) }
+}
+
+fn mark_rects(h: &egui_kittest::Harness<'_, WordApp>) -> Vec<(egui::Rect, String)> {
+    h.state().host.as_ref().expect("embed host").mark_rects()
+}
+
+fn marks_pending(h: &egui_kittest::Harness<'_, WordApp>) -> bool {
+    h.state().host.as_ref().expect("embed host").marks_pending()
+}
+
+/// Run frames until every mark is resolved (a long list resolves over several frames).
+fn settle_marks(h: &mut egui_kittest::Harness<'_, WordApp>) {
+    for _ in 0..2_000 {
+        frames(h, 1);
+        if !marks_pending(h) {
+            frames(h, 1);
+            return;
+        }
+    }
+    panic!("marks never finished resolving");
+}
+
+fn mark_ids(h: &egui_kittest::Harness<'_, WordApp>) -> Vec<String> {
+    let mut ids: Vec<String> = mark_rects(h).into_iter().map(|(_, id)| id).collect();
+    ids.dedup();
+    ids
+}
+
+/// Whether a painted mark rectangle covers the start of the passage at `pos` (just right of it).
+fn marked_at(h: &mut egui_kittest::Harness<'_, WordApp>, pos: &Pos) -> Vec<String> {
+    let at = screen_of(h, pos) + egui::vec2(2.0, 0.0);
+    mark_rects(h).into_iter().filter(|(rect, _)| rect.contains(at)).map(|(_, id)| id).collect()
+}
+
+fn activated(events: &[HostEvent]) -> Vec<String> {
+    events
+        .iter()
+        .filter_map(|event| match event {
+            HostEvent::MarkActivated { id } => Some(id.clone()),
+            _ => None,
+        })
+        .collect()
+}
+
+#[test]
+fn marks_paint_found_passages_and_skip_the_rest() {
+    let (mut h, bridge) = embed_app();
+    open_doc(&mut h, &bridge, &clauses(20));
+    bridge.send(HostCommand::SetMarks(vec![mark("t1", "clause 2. the supplier"), mark("gone", "not in this document")]));
+    frames(&mut h, 3);
+    let rects = mark_rects(&h);
+    assert!(!rects.is_empty(), "found mark not painted");
+    assert!(rects.iter().all(|(_, id)| id == "t1"), "{rects:?}");
+    assert!(shapes(&h).iter().any(|s| matches!(s, egui::Shape::Rect(r) if r.fill == amber())), "no rectangle in the mark's colour");
+    assert!(bridge.take_events().is_empty(), "unfound marks are skipped silently");
+}
+
+#[test]
+fn clicking_a_mark_sends_mark_activated() {
+    let (mut h, bridge) = embed_app();
+    open_doc(&mut h, &bridge, &clauses(20));
+    bridge.send(HostCommand::SetMarks(vec![mark("t1", "Clause 3. The Supplier")]));
+    frames(&mut h, 3);
+    let (rect, _) = mark_rects(&h).first().cloned().expect("mark painted");
+    click(&mut h, rect.center(), egui::PointerButton::Primary);
+    assert_eq!(activated(&bridge.take_events()), vec!["t1".to_string()]);
+    // A click beside every mark activates nothing.
+    let elsewhere = screen_of(&mut h, &Pos::body(10, 12));
+    click(&mut h, elsewhere, egui::PointerButton::Primary);
+    assert!(activated(&bridge.take_events()).is_empty());
+}
+
+#[test]
+fn marks_sit_above_the_page_and_below_the_selection() {
+    let (mut h, bridge) = embed_app();
+    open_doc(&mut h, &bridge, &clauses(20));
+    bridge.send(HostCommand::SetMarks(vec![mark("t1", "Clause 2.")]));
+    h.state_mut().session.sel = Selection { anchor: Pos::body(1, 0), focus: Pos::body(1, 9) };
+    frames(&mut h, 3);
+    let painted = shapes(&h);
+    let selection = wordcraft_ui_egui::theme::Tokens::light().selection;
+    let at = |fill: egui::Color32| painted.iter().position(|s| matches!(s, egui::Shape::Rect(r) if r.fill == fill));
+    let (page, mark, sel) = (at(egui::Color32::WHITE).expect("page"), at(amber()).expect("mark"), at(selection).expect("selection"));
+    assert!(page < mark && mark < sel, "paint order page {page}, mark {mark}, selection {sel}");
+}
+
+#[test]
+fn an_empty_list_or_a_new_document_clears_marks() {
+    let (mut h, bridge) = embed_app();
+    open_doc(&mut h, &bridge, &clauses(20));
+    bridge.send(HostCommand::SetMarks(vec![mark("t1", "Clause 2.")]));
+    frames(&mut h, 2);
+    assert!(!mark_rects(&h).is_empty());
+    bridge.send(HostCommand::SetMarks(Vec::new()));
+    frames(&mut h, 2);
+    assert!(mark_rects(&h).is_empty());
+    assert!(!shapes(&h).iter().any(|s| matches!(s, egui::Shape::Rect(r) if r.fill == amber())), "a cleared mark is still painted");
+    bridge.send(HostCommand::SetMarks(vec![mark("t1", "Clause 2.")]));
+    frames(&mut h, 2);
+    open_doc(&mut h, &bridge, &clauses(5));
+    assert!(mark_rects(&h).is_empty(), "marks belong to the document they were set on");
+}
+
+#[test]
+fn marks_ignore_comment_anchors_inside_the_passage() {
+    let mut editing = Session::new(clauses(5));
+    editing.run("select.text", &json!({"text": "Supplier", "occurrence": 3})).unwrap();
+    editing.run("review.newComment", &json!({"text": "Check the supplier"})).unwrap();
+    let anchored = editing.doc.para_at(&Pos::body(2, 0)).is_some_and(|p| p.text.contains('\u{FFFC}'));
+    assert!(anchored, "the fixture needs comment anchors inside clause 3");
+    let (mut h, bridge) = embed_app();
+    open_doc(&mut h, &bridge, &editing.doc);
+    bridge.send(HostCommand::SetMarks(vec![mark("c3", "Clause 3. The Supplier shall deliver")]));
+    frames(&mut h, 2);
+    assert!(!mark_rects(&h).is_empty(), "comment anchors broke the match");
+}
+
+#[test]
+fn where_marks_overlap_the_topmost_wins_the_click() {
+    let (mut h, bridge) = embed_app();
+    open_doc(&mut h, &bridge, &clauses(20));
+    let inside = Pos::body(2, "Clause 3. The ".len());
+    for (order, winner) in [(["wide", "narrow"], "narrow"), (["narrow", "wide"], "wide")] {
+        let marks = order.iter().map(|id| if *id == "wide" { mark("wide", "Clause 3. The Supplier") } else { mark("narrow", "3. The Supplier") });
+        bridge.send(HostCommand::SetMarks(marks.collect()));
+        frames(&mut h, 3);
+        // Both cover the point; the one sent last is painted last.
+        let mut covering = marked_at(&mut h, &inside);
+        covering.dedup();
+        assert_eq!(covering, order.to_vec(), "both marks cover the click, in paint order");
+        let painted: Vec<usize> =
+            shapes(&h).iter().enumerate().filter(|(_, s)| matches!(s, egui::Shape::Rect(r) if r.fill == amber())).map(|(index, _)| index).collect();
+        assert!(painted.len() >= 2, "{painted:?}");
+        let at = screen_of(&mut h, &inside) + egui::vec2(2.0, 0.0);
+        click(&mut h, at, egui::PointerButton::Primary);
+        assert_eq!(activated(&bridge.take_events()), vec![winner.to_string()], "one event, for the topmost mark");
+    }
+}
+
+#[test]
+fn a_drag_across_a_mark_selects_and_activates_nothing() {
+    let (mut h, bridge) = embed_app();
+    open_doc(&mut h, &bridge, &clauses(20));
+    bridge.send(HostCommand::SetMarks(vec![mark("t1", "Clause 3. The Supplier shall deliver")]));
+    frames(&mut h, 3);
+    let (rect, _) = mark_rects(&h).first().cloned().expect("mark painted");
+    let (from, to) = (rect.left_center() + egui::vec2(4.0, 0.0), rect.right_center() - egui::vec2(4.0, 0.0));
+    assert!(to.x - from.x > 40.0, "the mark is too narrow to drag across");
+    bridge.take_events();
+    h.event(egui::Event::PointerMoved(from));
+    h.event(press(from, egui::PointerButton::Primary));
+    h.event(egui::Event::PointerMoved(from + egui::vec2(20.0, 0.0)));
+    h.event(egui::Event::PointerMoved(to));
+    h.event(release(to, egui::PointerButton::Primary));
+    frames(&mut h, 4);
+    assert!(!h.state().session.sel.is_collapsed(), "the drag selected nothing, so this proves nothing");
+    assert!(activated(&bridge.take_events()).is_empty(), "a drag ending in a mark activated it");
+}
+
+#[test]
+fn a_mark_shows_only_its_first_match_on_its_page_or_in_the_document() {
+    let (mut h, bridge) = embed_app();
+    open_doc(&mut h, &bridge, &clauses(120));
+    let passage = "the supplier shall deliver";
+    let at = |clause: usize| Pos::body(clause, format!("Clause {}. ", clause + 1).len());
+    // No page: the first match in document order, and no other.
+    bridge.send(HostCommand::SetMarks(vec![mark("any", passage)]));
+    frames(&mut h, 3);
+    assert_eq!(marked_at(&mut h, &at(0)), vec!["any".to_string()]);
+    for clause in 1..4 {
+        assert!(marked_at(&mut h, &at(clause)).is_empty(), "clause {} is marked too", clause + 1);
+    }
+    let lines: std::collections::BTreeSet<i32> = mark_rects(&h).iter().map(|(rect, _)| rect.center().y.round() as i32).collect();
+    assert_eq!(lines.len(), 1, "one match, on one line: {lines:?}");
+    // A page: the first match on that page, even with earlier ones on page 1.
+    let on_page_two = clause_starts_on(&mut h, 120, 1);
+    assert!(on_page_two.len() >= 2, "fixture has too few clauses on page 2");
+    bridge.send(HostCommand::JumpTo(JumpTarget::Page { page: 2 }));
+    bridge.send(HostCommand::SetMarks(vec![mark_on("paged", passage, 2)]));
+    frames(&mut h, 4);
+    assert_eq!(marked_at(&mut h, &on_page_two[0]), vec!["paged".to_string()]);
+    assert!(marked_at(&mut h, &on_page_two[1]).is_empty(), "a later match on the page is marked too");
+    bridge.send(HostCommand::JumpTo(JumpTarget::Page { page: 1 }));
+    frames(&mut h, 4);
+    assert!(marked_at(&mut h, &at(0)).is_empty(), "a paged mark lies on page 1");
+    // A page the document lacks, or one without a match, finds nothing.
+    bridge.take_events();
+    bridge.send(HostCommand::SetMarks(vec![mark_on("far", passage, 999), mark_on("max", passage, u32::MAX), mark_on("zero", passage, 0)]));
+    frames(&mut h, 3);
+    assert!(mark_rects(&h).is_empty());
+    assert!(bridge.take_events().is_empty(), "unfound marks are skipped silently");
+}
+
+#[test]
+fn marks_beyond_the_cap_are_dropped_and_the_first_kept() {
+    let (mut h, bridge) = embed_app();
+    open_doc(&mut h, &bridge, &clauses(20));
+    let mut marks: Vec<MarkSpec> = (0..MAX_MARKS).map(|index| mark(&format!("m{index}"), "Clause 1.")).collect();
+    marks.push(mark("late", "Clause 2."));
+    bridge.send(HostCommand::SetMarks(marks));
+    settle_marks(&mut h);
+    let ids = mark_ids(&h);
+    assert_eq!(ids.len(), MAX_MARKS, "every kept mark is painted");
+    assert_eq!(ids.first().map(String::as_str), Some("m0"));
+    assert_eq!(ids.last().map(String::as_str), Some(format!("m{}", MAX_MARKS - 1).as_str()));
+    assert!(!ids.iter().any(|id| id == "late"), "the mark past the cap was kept");
+    assert!(marked_at(&mut h, &Pos::body(1, 0)).is_empty());
+    // The last one sent is on top.
+    let (rect, _) = mark_rects(&h).last().cloned().expect("painted");
+    click(&mut h, rect.center(), egui::PointerButton::Primary);
+    assert_eq!(activated(&bridge.take_events()), vec![format!("m{}", MAX_MARKS - 1)]);
+}
+
+#[test]
+fn a_passage_longer_than_the_cap_is_skipped_silently() {
+    let (mut h, bridge) = embed_app();
+    let long = "x".repeat(MAX_NEEDLE_CHARS + 5);
+    open_doc(&mut h, &bridge, &Document::from_text(&format!("Start\n{long}")));
+    bridge.send(HostCommand::SetMarks(vec![mark("over", &"x".repeat(MAX_NEEDLE_CHARS + 1)), mark("start", "Start")]));
+    frames(&mut h, 3);
+    assert_eq!(mark_ids(&h), vec!["start".to_string()]);
+    assert!(bridge.take_events().is_empty());
+    bridge.send(HostCommand::SetMarks(vec![mark("at", &"X".repeat(MAX_NEEDLE_CHARS))]));
+    frames(&mut h, 3);
+    assert_eq!(mark_ids(&h), vec!["at".to_string()], "a passage at the cap is found");
+}
+
+#[test]
+fn marks_follow_a_changed_document_and_a_new_layout() {
+    let (mut h, bridge) = embed_app();
+    open_doc(&mut h, &bridge, &clauses(20));
+    let clause = "Clause 3. The Supplier shall deliver the goods listed in Schedule 3 within thirty days of the order.";
+    bridge.send(HostCommand::SetMarks(vec![mark("c3", clause)]));
+    frames(&mut h, 3);
+    assert_eq!(marked_at(&mut h, &Pos::body(2, 0)), vec!["c3".to_string()]);
+    let lines_before = mark_rects(&h).len();
+    // The same document without the host's open (rev and layout change): the mark moves with its text.
+    let mut moved = clauses(20);
+    moved.body.insert(0, wordcraft_doc::para_block(wordcraft_doc::Paragraph::with_text("Preamble.", Default::default())));
+    h.state_mut().session.set_document(moved);
+    frames(&mut h, 3);
+    assert_eq!(marked_at(&mut h, &Pos::body(3, 0)), vec!["c3".to_string()], "the mark stayed on the old text");
+    assert!(marked_at(&mut h, &Pos::body(2, 0)).is_empty(), "the stale rectangle is still painted");
+    // A wider page in web view rewraps the clause onto fewer lines: the rectangles follow the layout.
+    h.state_mut().session.view.mode = wordcraft_layout::ViewMode::Web;
+    h.set_size(egui::vec2(2400.0, 800.0));
+    frames(&mut h, 4);
+    assert_eq!(marked_at(&mut h, &Pos::body(3, 0)), vec!["c3".to_string()]);
+    let lines_after = mark_rects(&h).len();
+    assert!(lines_after < lines_before, "the clause wraps as before ({lines_before} lines, now {lines_after})");
+    let app = h.state_mut();
+    let layout = app.session.layout();
+    let end = Pos::body(3, clause.len());
+    let expected = layout.selection_rects(&app.session.doc, &Pos::body(3, 0), &end, 0).len();
+    assert_eq!(lines_after, expected, "the rectangles are the new layout's");
+}
+
+#[test]
+fn comment_balloons_stay_clickable_beside_marked_text() {
+    let mut editing = Session::new(clauses(5));
+    editing.run("select.text", &json!({"text": "Supplier", "occurrence": 3})).unwrap();
+    editing.run("review.newComment", &json!({"text": "Check the supplier"})).unwrap();
+    let (mut h, bridge) = embed_app();
+    open_doc(&mut h, &bridge, &editing.doc);
+    bridge.send(HostCommand::SetMarks(vec![mark("c3", "Clause 3. The Supplier shall deliver")]));
+    frames(&mut h, 3);
+    assert!(!mark_rects(&h).is_empty());
+    let balloon = shapes(&h).iter().find_map(|s| match s {
+        egui::Shape::Text(text) if text.galley.text().contains("Check the supplier") => Some(text.visual_bounding_rect()),
+        _ => None,
+    });
+    let balloon = balloon.expect("the comment's balloon is drawn with marks set");
+    assert!(mark_rects(&h).iter().all(|(rect, _)| !rect.intersects(balloon)), "a mark covers the balloon");
+    h.state_mut().session.sel = Selection::caret(Pos::body(0, 0));
+    frames(&mut h, 2);
+    bridge.take_events();
+    click(&mut h, balloon.center(), egui::PointerButton::Primary);
+    assert!(activated(&bridge.take_events()).is_empty(), "a balloon click activated a mark");
+    assert_eq!(h.state().session.sel.focus.path, Pos::body(2, 0).path, "the balloon's click moves to its comment");
+}

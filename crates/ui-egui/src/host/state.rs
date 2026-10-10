@@ -7,6 +7,7 @@ use wordcraft_doc::Pos;
 use wordcraft_engine::Selection;
 
 use super::bridge::{HostBridge, HostCommand, HostEvent};
+use super::marks::Marks;
 use super::text_match::TextIndex;
 use super::wire::{JumpTarget, occurrence_index, page_index};
 use crate::WordApp;
@@ -53,8 +54,10 @@ pub struct HostState {
     pending_jump: Option<PendingJump>,
     last_view: Option<ViewGeometry>,
     last_page: Option<usize>,
-    /// The document's text as jumps match it; rebuilt when the document changes.
+    /// The document's text as jumps and marks match it; rebuilt when the document changes.
     index: TextIndex,
+    /// The host's marks, and where they were found and painted.
+    pub(crate) marks: Marks,
 }
 
 impl HostState {
@@ -90,6 +93,23 @@ impl HostState {
         self.page_target
     }
 
+    /// Screen rectangles of the marks painted last frame, with their ids, the topmost last (tests).
+    #[doc(hidden)]
+    pub fn mark_rects(&self) -> Vec<(egui::Rect, String)> {
+        self.marks.painted()
+    }
+
+    /// Whether some mark has not been looked for yet (tests).
+    #[doc(hidden)]
+    pub fn marks_pending(&self) -> bool {
+        self.marks.pending()
+    }
+
+    /// Look for the marks not yet found in this document and layout; `true` while some remain.
+    pub(crate) fn resolve_marks(&mut self, doc: &wordcraft_doc::Document, rev: u64, layout: &std::sync::Arc<wordcraft_layout::DocLayout>) -> bool {
+        self.marks.resolve(&mut self.index, doc, rev, layout)
+    }
+
     pub fn new(bridge: HostBridge) -> Self {
         HostState {
             bridge,
@@ -103,6 +123,7 @@ impl HostState {
             last_view: None,
             last_page: None,
             index: TextIndex::default(),
+            marks: Marks::default(),
         }
     }
 }
@@ -118,6 +139,8 @@ pub(crate) fn before_frame(app: &mut WordApp, ctx: &egui::Context) {
         match command {
             HostCommand::Open { name, bytes } => open(app, &mut host, &name, &bytes),
             HostCommand::JumpTo(target) => jump(app, &mut host, target),
+            // Looked for when next painted, against the layout painted then.
+            HostCommand::SetMarks(marks) => host.marks.set(marks),
         }
     }
     app.host = Some(host);
@@ -270,6 +293,8 @@ fn open(app: &mut WordApp, host: &mut HostState, name: &str, bytes: &[u8]) {
             host.last_page = None;
             host.find_query.clear();
             host.find_anchor = None;
+            // Marks belong to the document they were set on.
+            host.marks.clear();
             host.page_target = None;
             host.scroll_queued = true;
             let pages = app.session.layout().pages.len();

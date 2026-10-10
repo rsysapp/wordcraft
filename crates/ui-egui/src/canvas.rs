@@ -298,6 +298,8 @@ pub fn show(app: &mut WordApp, ui: &mut Ui) {
         let n = layout.pages.len();
         app.canvas.textures.retain(|k, _| *k < n);
         app.canvas.page_rects = rects.clone();
+        // embed: host marks, above the page and below the selection and the balloons' leader lines.
+        crate::host::marks::paint(app, &painter, &rects, &layout, geo.scale, &resp);
         balloons(app, ui, &painter, &rects, &layout, geo.scale);
         // Selection.
         if !app.session.sel.is_collapsed() {
