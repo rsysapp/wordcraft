@@ -1,6 +1,8 @@
 //! A view-only session (the embed build's view mode) runs navigation, selection, copy, find and
 //! zoom, and refuses everything else before it starts.
 
+use std::collections::BTreeMap;
+
 use serde_json::json;
 use wordcraft_engine::{CmdError, Session, view_only};
 
@@ -54,6 +56,9 @@ fn the_allow_list_names_only_registered_commands_that_leave_the_document_alone()
 struct Untouched {
     doc_json: String,
     docx: Vec<u8>,
+    /// Not serialised with the document, so compared directly.
+    media: BTreeMap<String, Vec<u8>>,
+    passthrough: BTreeMap<String, Vec<u8>>,
     rev: u64,
     dirty: bool,
     path: Option<std::path::PathBuf>,
@@ -76,6 +81,8 @@ fn untouched(s: &Session) -> Untouched {
     Untouched {
         doc_json: snapshot(s),
         docx: wordcraft_docx::write(&s.doc).expect("document writes as docx"),
+        media: s.doc.media.iter().map(|(name, bytes)| (name.clone(), bytes.as_ref().clone())).collect(),
+        passthrough: s.doc.passthrough.iter().map(|(name, bytes)| (name.clone(), bytes.as_ref().clone())).collect(),
         rev: s.rev(),
         dirty: s.dirty,
         path: s.path.clone(),
@@ -92,6 +99,8 @@ fn changed_fields(before: &Untouched, after: &Untouched) -> Vec<&'static str> {
     let checks = [
         ("document", before.doc_json != after.doc_json),
         ("docx bytes", before.docx != after.docx),
+        ("media", before.media != after.media),
+        ("preserved parts", before.passthrough != after.passthrough),
         ("rev", before.rev != after.rev),
         ("dirty", before.dirty != after.dirty),
         ("path", before.path != after.path),
@@ -115,6 +124,11 @@ fn allowed_commands_leave_document_file_and_settings_alone() {
     // them is noticed.
     let mut s = Session::new(wordcraft_engine::sample::sample_document());
     s.run("text.insert", &json!({"text": "edited"})).expect("insert");
+    // Neither map is serialised with the document, so seed them: an allowed command that dropped
+    // an image or a preserved part must be noticed.
+    s.doc.add_media(vec![0x89, b'P', b'N', b'G', 1, 2, 3, 4], "png");
+    s.doc.passthrough.insert("docProps/custom.xml".to_string(), std::sync::Arc::new(b"<Properties/>".to_vec()));
+    assert!(!s.doc.media.is_empty() && !s.doc.passthrough.is_empty());
     s.path = Some(scratch.clone());
     s.view_only = true;
     for id in view_only::COMMANDS {
