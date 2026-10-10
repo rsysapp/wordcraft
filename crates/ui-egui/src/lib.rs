@@ -96,6 +96,9 @@ pub struct WordApp {
     pub autosave: bool,
     pub word_count: (u64, usize),
     last_autosave: f64,
+    /// embed: title last sent to the window; sent again only when it changes.
+    #[cfg_attr(target_arch = "wasm32", allow(dead_code))]
+    last_title: String,
 }
 
 impl WordApp {
@@ -122,6 +125,7 @@ impl WordApp {
             autosave: true,
             word_count: (0, 0),
             last_autosave: 0.0,
+            last_title: String::new(),
         }
     }
 
@@ -385,8 +389,16 @@ impl WordApp {
         if let Some(url) = self.canvas.open_url.take() {
             ctx.open_url(egui::OpenUrl::new_tab(url));
         }
-        let title = format!("{}{} - WordCraft", self.title_stem(), if self.session.dirty { " •" } else { "" });
-        ctx.send_viewport_cmd(egui::ViewportCommand::Title(title));
+        // embed: only when it changes, and never on the web: eframe's web backend has no window title and
+        // logs a warning for every title command.
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            let title = format!("{}{} - WordCraft", self.title_stem(), if self.session.dirty { " •" } else { "" });
+            if title != self.last_title {
+                ctx.send_viewport_cmd(egui::ViewportCommand::Title(title.clone()));
+                self.last_title = title;
+            }
+        }
         self.frame_ms = now_ms() - t0;
     }
 
@@ -475,13 +487,8 @@ impl WordApp {
 }
 
 pub fn now_ms() -> f64 {
-    #[cfg(not(target_arch = "wasm32"))]
-    {
-        use std::time::{SystemTime, UNIX_EPOCH};
-        SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs_f64() * 1000.0).unwrap_or(0.0)
-    }
-    #[cfg(target_arch = "wasm32")]
-    {
-        0.0
-    }
+    // embed: web-time reads the browser's clock on wasm (std's SystemTime is unavailable there) and the
+    // OS clock elsewhere; without it the web build's status messages never expired.
+    use web_time::{SystemTime, UNIX_EPOCH};
+    SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs_f64() * 1000.0).unwrap_or(0.0)
 }

@@ -5011,6 +5011,7 @@ dependencies = [
  "serde",
  "serde_json",
  "toml",
+ "web-time",
  "wordcraft-doc",
  "wordcraft-engine",
  "wordcraft-fonts",
