@@ -270,11 +270,13 @@ pub fn show(app: &mut WordApp, ui: &mut Ui) {
                 if page.header_story == Some(id) || page.footer_story == Some(id) {
                     let hy = sr.min.y + sect_body.y * geo.scale - 4.0;
                     let fy = sr.min.y + sect_body.bottom() * geo.scale + 4.0;
+                    // embed: on the white page a host accent that is too pale is darkened.
+                    let (line, label_ink) = crate::theme::accent_on_white(ui.ctx()).map_or((t.accent, t.accent_text), |colour| (colour, colour));
                     for (y, label) in [(hy, "Header"), (fy, "Footer")] {
-                        dashed(&painter, pos2(sr.min.x, y), pos2(sr.max.x, y), Stroke::new(1.0, t.accent));
+                        dashed(&painter, pos2(sr.min.x, y), pos2(sr.max.x, y), Stroke::new(1.0, line));
                         let tr = Rect::from_min_size(pos2(sr.min.x + 2.0, if label == "Header" { y } else { y - 18.0 }), vec2(52.0, 18.0));
                         painter.rect_filled(tr, 2.0, t.checked);
-                        painter.text(tr.center(), egui::Align2::CENTER_CENTER, label, regular(11.0), t.accent_text);
+                        painter.text(tr.center(), egui::Align2::CENTER_CENTER, label, regular(11.0), label_ink);
                     }
                 }
             }
@@ -389,6 +391,20 @@ pub fn show(app: &mut WordApp, ui: &mut Ui) {
     }
 }
 
+// embed: balloons belong to the page, which is white in both themes, so their text and author
+// colours are fixed page colours rather than the chrome's tokens (the dark chrome's near-white text
+// would be unreadable on a white card). Every colour has at least 4.5:1 on white and on the markup
+// area's #F3F3F3.
+const BALLOON_INK: Color32 = Color32::from_rgb(0x21, 0x21, 0x21);
+const BALLOON_INK_DIM: Color32 = Color32::from_rgb(0x61, 0x61, 0x61);
+const BALLOON_AUTHORS: [Color32; 5] = [
+    Color32::from_rgb(0x1E, 0x5F, 0xBF),
+    Color32::from_rgb(0xB0, 0x3A, 0x2E),
+    Color32::from_rgb(0x2E, 0x7D, 0x32),
+    Color32::from_rgb(0x8E, 0x44, 0xAD),
+    Color32::from_rgb(0xA0, 0x4A, 0x00),
+];
+
 /// Comment balloons in the markup area right of each page, joined to their anchors.
 fn balloons(app: &mut WordApp, ui: &mut Ui, painter: &egui::Painter, rects: &[Rect], layout: &DocLayout, scale: f32) {
     let mw = markup_width(app);
@@ -404,7 +420,7 @@ fn balloons(app: &mut WordApp, ui: &mut Ui, painter: &egui::Painter, rects: &[Re
         let Some(c) = layout.caret_on(&pos, app.session.page_hint) else { continue };
         by_page.entry(c.page).or_default().push((c.x, c.top + c.height, id, pos));
     }
-    let palette = [t.blue, Color32::from_rgb(0xB0, 0x3A, 0x2E), Color32::from_rgb(0x2E, 0x7D, 0x32), Color32::from_rgb(0x8E, 0x44, 0xAD), t.orange];
+    let palette = BALLOON_AUTHORS;
     let mut authors: Vec<String> = Vec::new();
     let mut clicked: Option<Pos> = None;
     // The markup area extends each page.
@@ -434,8 +450,8 @@ fn balloons(app: &mut WordApp, ui: &mut Ui, painter: &egui::Painter, rects: &[Re
             });
             let color = palette.get(ai % palette.len()).copied().unwrap_or(t.blue);
             let fs = (11.0 * scale / PX_PER_PT).clamp(8.0, 16.0);
-            let head = painter.layout(author.clone(), semibold(fs), t.text, w - 16.0);
-            let body = painter.layout(text.trim().to_string(), regular(fs), if c.resolved { t.text_dim } else { t.text }, w - 16.0);
+            let head = painter.layout(author.clone(), semibold(fs), BALLOON_INK, w - 16.0);
+            let body = painter.layout(text.trim().to_string(), regular(fs), if c.resolved { BALLOON_INK_DIM } else { BALLOON_INK }, w - 16.0);
             let h = head.size().y + body.size().y + 16.0;
             let anchor = pos2(pr.min.x + ax * scale, pr.min.y + ay * scale);
             let top = (anchor.y - 12.0).max(next_y);
@@ -453,8 +469,8 @@ fn balloons(app: &mut WordApp, ui: &mut Ui, painter: &egui::Painter, rects: &[Re
             painter.rect_filled(card, 4.0, if selected { t.checked } else { Color32::WHITE });
             painter.rect_stroke(card, 4.0, Stroke::new(if selected { 1.5 } else { 1.0 }, color), egui::StrokeKind::Inside);
             painter.rect_filled(Rect::from_min_size(card.min, vec2(4.0, h)), egui::CornerRadius { nw: 4, sw: 4, ne: 0, se: 0 }, color);
-            painter.galley(pos2(card.min.x + 10.0, card.min.y + 6.0), head.clone(), t.text);
-            painter.galley(pos2(card.min.x + 10.0, card.min.y + 10.0 + head.size().y), body, t.text);
+            painter.galley(pos2(card.min.x + 10.0, card.min.y + 6.0), head.clone(), BALLOON_INK);
+            painter.galley(pos2(card.min.x + 10.0, card.min.y + 10.0 + head.size().y), body, BALLOON_INK);
             let r = ui.interact(card, ui.id().with(("balloon", *id)), Sense::click());
             if r.hovered() {
                 ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);

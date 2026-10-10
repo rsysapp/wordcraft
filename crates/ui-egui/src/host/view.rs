@@ -269,7 +269,8 @@ fn icon_button(ui: &mut Ui, icon: &str, label: &str, enabled: bool) -> bool {
         ui.painter().rect_filled(rect, 4.0, t.hover);
     }
     let color = if enabled { t.icon } else { t.text_disabled };
-    icons::paint(ui.painter(), Rect::from_center_size(rect.center(), vec2(16.0, 16.0)), icon, color, if enabled { t.accent } else { color });
+    // The icon's own colour throughout: the host's accent is not checked against the bar's background.
+    icons::paint(ui.painter(), Rect::from_center_size(rect.center(), vec2(16.0, 16.0)), icon, color, color);
     let clicked = enabled && response.clicked();
     response.on_hover_text(label);
     clicked

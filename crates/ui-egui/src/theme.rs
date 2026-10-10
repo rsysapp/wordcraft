@@ -129,10 +129,10 @@ impl Tokens {
         if let Some(over) = accent {
             tokens.accent = over.accent;
             tokens.accent_text = over.accent;
-            // Pages are white in both themes, so the selection is judged against white.
-            let tint = over.selection_tint();
+            // Pages are white in both themes, so the selection and the wash are judged against white.
+            let tint = over.on_white();
             tokens.selection = Color32::from_rgba_unmultiplied(tint.r(), tint.g(), tint.b(), if dark { 0x55 } else { 0x48 });
-            tokens.checked = Color32::from_rgba_unmultiplied(over.accent.r(), over.accent.g(), over.accent.b(), 0x30);
+            tokens.checked = Color32::from_rgba_unmultiplied(tint.r(), tint.g(), tint.b(), 0x30);
         }
         tokens
     }
@@ -238,20 +238,22 @@ pub struct AccentOverride {
     pub content: Color32,
 }
 
+// embed: the one rule for an accent drawn on the white page.
 impl AccentOverride {
-    /// The colour the selection is tinted with on the white page: the accent, unless it is so pale
-    /// that a translucent wash of it would vanish on white; then the accent drawn toward the host's
-    /// own text colour.
-    fn selection_tint(self) -> Color32 {
+    /// The accent as it is drawn on a white page: the accent itself, unless it is so pale that a
+    /// line, label or translucent wash of it would vanish on white (under 3:1); then it is mixed
+    /// halfway toward black, which is what contrasts most with white. Not toward the host's text
+    /// colour: a mid-tone accent can come with white text, which would lighten it further.
+    pub fn on_white(self) -> Color32 {
         if contrast_with_white(self.accent) >= 3.0 {
             return self.accent;
         }
-        let half = |a: u8, b: u8| ((u16::from(a) + u16::from(b)) / 2) as u8;
-        Color32::from_rgb(half(self.accent.r(), self.content.r()), half(self.accent.g(), self.content.g()), half(self.accent.b(), self.content.b()))
+        let half = |channel: u8| channel / 2;
+        Color32::from_rgb(half(self.accent.r()), half(self.accent.g()), half(self.accent.b()))
     }
 }
 
-/// WCAG contrast ratio of `colour` against white.
+// embed: WCAG contrast ratio of `colour` against white.
 fn contrast_with_white(colour: Color32) -> f32 {
     let linear = |channel: u8| {
         let value = f32::from(channel) / 255.0;
@@ -281,4 +283,9 @@ pub fn accent_override(ctx: &egui::Context) -> Option<AccentOverride> {
 /// Text colour on the accent (white unless a host page chose another).
 pub fn accent_content(ctx: &egui::Context) -> Color32 {
     accent_override(ctx).map_or(Color32::WHITE, |over| over.content)
+}
+
+/// embed: the host's accent as drawn on the white page (see [`AccentOverride::on_white`]), if it set one.
+pub fn accent_on_white(ctx: &egui::Context) -> Option<Color32> {
+    accent_override(ctx).map(AccentOverride::on_white)
 }

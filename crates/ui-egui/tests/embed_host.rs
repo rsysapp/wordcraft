@@ -1611,7 +1611,11 @@ fn set_theme_applies_dark_mode_and_the_accent_while_pages_stay_white() {
     assert!(h.ctx.global_style().visuals.dark_mode);
     assert_eq!(h.ctx.global_style().visuals.selection.bg_fill, egui::Color32::from_rgba_unmultiplied(0x0f, 0x76, 0x6e, 0x55));
     let painted = shapes(&h);
-    assert!(painted.iter().any(|s| matches!(s, egui::Shape::Rect(r) if r.fill == egui::Color32::WHITE)), "pages must stay white");
+    let page = h.state().canvas.page_rects.first().copied().expect("a page is on screen");
+    assert!(
+        painted.iter().any(|s| matches!(s, egui::Shape::Rect(r) if r.fill == egui::Color32::WHITE && r.rect.expand(0.5).contains_rect(page) && page.expand(0.5).contains_rect(r.rect))),
+        "the page itself must stay white"
+    );
     assert!(painted.iter().any(|s| matches!(s, egui::Shape::Rect(r) if r.fill == teal)), "the page indicator uses the accent");
 }
 
@@ -1790,4 +1794,96 @@ fn clearing_the_accent_restores_the_apps_own_colours() {
     wordcraft_ui_egui::theme::set_accent_override(&h.ctx, None);
     assert_eq!(Tokens::get(&h.ctx).accent, Tokens::light().accent);
     assert_eq!(wordcraft_ui_egui::theme::accent_content(&h.ctx), egui::Color32::WHITE);
+}
+
+#[test]
+fn opening_a_document_after_set_theme_keeps_the_theme() {
+    let (mut h, bridge) = embed_app();
+    bridge.send(HostCommand::SetTheme(theme(true, "#0f766e")));
+    frames(&mut h, 2);
+    for doc in [clauses(5), clauses(120)] {
+        open_doc(&mut h, &bridge, &doc);
+        let tokens = Tokens::get(&h.ctx);
+        assert!(tokens.dark && h.ctx.global_style().visuals.dark_mode, "an open reset the chrome to light");
+        assert_eq!(tokens.accent, egui::Color32::from_rgb(0x0f, 0x76, 0x6e));
+        assert_eq!(h.ctx.theme(), egui::Theme::Dark);
+    }
+}
+
+#[test]
+fn a_mid_tone_accent_gets_a_dark_selection_and_wash_not_a_pale_one() {
+    // #22c55e is 2.3:1 on white; white text on it would be the host's choice, and must not pull the wash toward white.
+    let green = egui::Color32::from_rgb(0x22, 0xc5, 0x5e);
+    for dark in [false, true] {
+        let over = AccentOverride { accent: green, content: egui::Color32::WHITE };
+        let tokens = Tokens::resolve(dark, Some(over));
+        let on_page = blended(tokens.selection, egui::Color32::WHITE);
+        assert!(contrast(on_page, egui::Color32::WHITE) >= 1.25, "dark {dark}: the selection vanishes on the page");
+        assert!(luminance(over.on_white()) < luminance(green), "the page colour must be darker than the accent");
+        assert!(contrast(over.on_white(), egui::Color32::WHITE) >= 3.0, "{:?}", over.on_white());
+        // The wash is the same colour at a lower alpha.
+        let tint = over.on_white();
+        assert_eq!(tokens.checked, egui::Color32::from_rgba_unmultiplied(tint.r(), tint.g(), tint.b(), 0x30));
+    }
+    // An accent that is dark enough is used as it is.
+    let teal = egui::Color32::from_rgb(0x0f, 0x76, 0x6e);
+    assert_eq!(AccentOverride { accent: teal, content: egui::Color32::WHITE }.on_white(), teal);
+}
+
+#[test]
+fn a_dark_chrome_keeps_comment_balloons_readable_on_their_white_cards() {
+    let mut editing = Session::new(clauses(5));
+    editing.run("select.text", &json!({"text": "Supplier", "occurrence": 3})).unwrap();
+    editing.run("review.newComment", &json!({"text": "Check the supplier"})).unwrap();
+    let (mut h, bridge) = embed_app();
+    bridge.send(HostCommand::SetTheme(theme(true, "#0f766e")));
+    open_doc(&mut h, &bridge, &editing.doc);
+    frames(&mut h, 2);
+    assert!(Tokens::get(&h.ctx).dark);
+    let painted = shapes(&h);
+    let area = egui::Color32::from_rgb(0xF3, 0xF3, 0xF3);
+    let texts: Vec<_> = painted
+        .iter()
+        .filter_map(|s| match s {
+            egui::Shape::Text(t) if t.galley.text().contains("Check the supplier") => Some(t.clone()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(texts.len(), 1, "the comment's text is drawn once");
+    let body = &texts[0];
+    let at = body.visual_bounding_rect().center();
+    // The card is the white rectangle under the text.
+    let card = painted
+        .iter()
+        .find_map(|s| match s {
+            egui::Shape::Rect(r) if r.fill == egui::Color32::WHITE && r.rect.contains(at) && r.rect.width() < 400.0 && r.rect.height() < 200.0 => {
+                Some(r.rect)
+            }
+            _ => None,
+        })
+        .expect("a white card under the balloon text");
+    // Every text on the card (the author's name and the comment) is page ink.
+    let mut on_card = 0;
+    for shape in &painted {
+        if let egui::Shape::Text(text) = shape
+            && card.contains(text.visual_bounding_rect().center())
+        {
+            let colour = text.galley.job.sections.first().expect("a section").format.color;
+            assert!(contrast(colour, egui::Color32::WHITE) >= 7.0, "{:?} on its white card: {colour:?}", text.galley.text());
+            assert!(contrast(colour, area) >= 4.5, "{:?} on the markup area: {colour:?}", text.galley.text());
+            on_card += 1;
+        }
+    }
+    assert!(on_card >= 2, "the author and the comment: {on_card}");
+    let bars: Vec<egui::Color32> = painted
+        .iter()
+        .filter_map(|s| match s {
+            egui::Shape::Rect(r) if (r.rect.width() - 4.0).abs() < 0.01 && r.rect.height() > 10.0 => Some(r.fill),
+            _ => None,
+        })
+        .collect();
+    assert!(!bars.is_empty(), "the author bar is drawn");
+    for bar in bars {
+        assert!(contrast(bar, egui::Color32::WHITE) >= 4.5 && contrast(bar, area) >= 4.5, "author colour {bar:?}");
+    }
 }
