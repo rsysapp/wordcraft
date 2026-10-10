@@ -1,0 +1,245 @@
+//! The queues between a host page and the running app. The host side (`EmbeddedEditor`) sends
+//! commands and takes events; the app drains commands in `WordApp::logic` and emits events.
+
+use std::collections::VecDeque;
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
+
+use serde::Serialize;
+
+use super::wire::JumpTarget;
+
+/// What a host page asks of the editor.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum HostCommand {
+    /// Open a document, replacing the open one; answered by `Opened` or `OpenFailed`.
+    Open { name: String, bytes: Vec<u8> },
+}
+
+/// What the editor tells the host page; serialises to the embed API's `EditorEvent`.
+#[derive(Clone, Debug, PartialEq, Serialize)]
+#[serde(tag = "type", rename_all = "camelCase", rename_all_fields = "camelCase")]
+pub enum HostEvent {
+    Opened { pages: u32 },
+    OpenFailed { message: String },
+    PageChanged { page: u32 },
+    Selection { text: String, copy_text: String, page: Option<u32>, x: f32, y: f32 },
+    SelectionCleared,
+    MarkActivated { id: String },
+    JumpNotFound { target: JumpTarget },
+}
+
+#[derive(Default)]
+struct Queues {
+    commands: VecDeque<HostCommand>,
+    events: Vec<HostEvent>,
+    ctx: Option<egui::Context>,
+    /// Set by [`HostBridge::detach`]; checked under the same lock as each queue, so nothing slips
+    /// in after the queues were cleared.
+    detached: bool,
+}
+
+/// Both ends of the host bridge; clones share the same queues. A poisoned lock still holds valid
+/// queues (nothing here panics mid-update), so its contents are used rather than dropped.
+#[derive(Clone, Default)]
+pub struct HostBridge {
+    inner: Arc<Mutex<Queues>>,
+}
+
+impl HostBridge {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    fn lock(&self) -> MutexGuard<'_, Queues> {
+        self.inner.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// App side: the context a command wakes (set once the runner created the app).
+    pub fn set_context(&self, ctx: egui::Context) {
+        let replaced = {
+            let mut queues = self.lock();
+            if queues.detached {
+                return;
+            }
+            queues.ctx.replace(ctx)
+        };
+        // A context can hold the last reference to egui's state, so it is dropped outside our lock.
+        drop(replaced);
+    }
+
+    /// Host side: queue a command and wake the app, which runs it at the start of its next frame.
+    pub fn send(&self, command: HostCommand) {
+        let ctx = {
+            let mut queues = self.lock();
+            if queues.detached {
+                return;
+            }
+            queues.commands.push_back(command);
+            queues.ctx.clone()
+        };
+        // Outside the lock: `request_repaint` takes egui's own lock and may run callbacks, and a
+        // host thread must not hold ours while it waits for that.
+        if let Some(ctx) = ctx {
+            ctx.request_repaint();
+        }
+    }
+
+    /// App side: every command since the last call, oldest first.
+    pub fn take_commands(&self) -> Vec<HostCommand> {
+        self.lock().commands.drain(..).collect()
+    }
+
+    /// App side: tell the host something.
+    pub fn emit(&self, event: HostEvent) {
+        let mut queues = self.lock();
+        if !queues.detached {
+            queues.events.push(event);
+        }
+    }
+
+    /// Host side: every event since the last call, oldest first.
+    pub fn take_events(&self) -> Vec<HostEvent> {
+        std::mem::take(&mut self.lock().events)
+    }
+
+    /// Host side, when the editor is destroyed: drops the app's context and both queues, and makes
+    /// every later call do nothing. The context would otherwise outlive the stopped app through the
+    /// host's copy of the bridge.
+    pub fn detach(&self) {
+        let (ctx, commands, events) = {
+            let mut queues = self.lock();
+            queues.detached = true;
+            (queues.ctx.take(), std::mem::take(&mut queues.commands), std::mem::take(&mut queues.events))
+        };
+        drop((ctx, commands, events));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use serde_json::json;
+
+    use super::*;
+    use crate::host::wire::JumpTarget;
+
+    fn open(name: &str) -> HostCommand {
+        HostCommand::Open { name: name.into(), bytes: vec![1, 2] }
+    }
+
+    /// A context whose repaint callback counts requests. The callback lives as long as the context,
+    /// so the counter's strong count shows whether the context is still alive.
+    fn counting_context() -> (egui::Context, Arc<AtomicUsize>) {
+        let wakes = Arc::new(AtomicUsize::new(0));
+        let ctx = egui::Context::default();
+        let counter = wakes.clone();
+        ctx.set_request_repaint_callback(move |_| {
+            counter.fetch_add(1, Ordering::SeqCst);
+        });
+        (ctx, wakes)
+    }
+
+    #[test]
+    fn events_serialise_to_the_embed_api_shapes() {
+        let cases = [
+            (HostEvent::Opened { pages: 3 }, json!({"type": "opened", "pages": 3})),
+            (HostEvent::OpenFailed { message: "m".into() }, json!({"type": "openFailed", "message": "m"})),
+            (HostEvent::PageChanged { page: 2 }, json!({"type": "pageChanged", "page": 2})),
+            (
+                HostEvent::Selection { text: "a b".into(), copy_text: "a\nb".into(), page: Some(1), x: 10.5, y: 20.0 },
+                json!({"type": "selection", "text": "a b", "copyText": "a\nb", "page": 1, "x": 10.5, "y": 20.0}),
+            ),
+            (
+                HostEvent::Selection { text: "a".into(), copy_text: "a".into(), page: None, x: 0.0, y: 0.0 },
+                json!({"type": "selection", "text": "a", "copyText": "a", "page": null, "x": 0.0, "y": 0.0}),
+            ),
+            (HostEvent::SelectionCleared, json!({"type": "selectionCleared"})),
+            (HostEvent::MarkActivated { id: "t1".into() }, json!({"type": "markActivated", "id": "t1"})),
+            (
+                HostEvent::JumpNotFound { target: JumpTarget::Text { text: "x".into(), page: None, occurrence: 0 } },
+                json!({"type": "jumpNotFound", "target": {"kind": "text", "text": "x", "page": null, "occurrence": 0}}),
+            ),
+            (
+                HostEvent::JumpNotFound { target: JumpTarget::Page { page: u32::MAX } },
+                json!({"type": "jumpNotFound", "target": {"kind": "page", "page": 4294967295u32}}),
+            ),
+        ];
+        for (event, expected) in cases {
+            assert_eq!(serde_json::to_value(&event).unwrap(), expected, "{event:?}");
+        }
+    }
+
+    #[test]
+    fn the_bridge_keeps_order_and_is_shared_by_its_clones() {
+        let host_side = HostBridge::new();
+        let app_side = host_side.clone();
+        host_side.send(open("a.docx"));
+        host_side.send(open("b.docx"));
+        assert_eq!(app_side.take_commands(), vec![open("a.docx"), open("b.docx")]);
+        assert!(app_side.take_commands().is_empty());
+        app_side.emit(HostEvent::PageChanged { page: 1 });
+        app_side.emit(HostEvent::SelectionCleared);
+        assert_eq!(host_side.take_events(), vec![HostEvent::PageChanged { page: 1 }, HostEvent::SelectionCleared]);
+        assert!(host_side.take_events().is_empty());
+    }
+
+    #[test]
+    fn a_command_wakes_the_app_once_it_has_a_context() {
+        let bridge = HostBridge::new();
+        let (ctx, wakes) = counting_context();
+        bridge.send(open("early.docx"));
+        assert_eq!(wakes.load(Ordering::SeqCst), 0, "no app has run a frame yet");
+        bridge.set_context(ctx);
+        bridge.send(open("late.docx"));
+        assert!(wakes.load(Ordering::SeqCst) > 0);
+        assert_eq!(bridge.take_commands(), vec![open("early.docx"), open("late.docx")], "an early command is kept");
+    }
+
+    #[test]
+    fn a_poisoned_lock_does_not_stop_the_bridge() {
+        let bridge = HostBridge::new();
+        bridge.send(open("a.docx"));
+        let poisoner = bridge.clone();
+        let outcome = std::thread::spawn(move || {
+            let _guard = poisoner.inner.lock();
+            std::panic::resume_unwind(Box::new("poison the lock"));
+        })
+        .join();
+        assert!(outcome.is_err() && bridge.inner.is_poisoned(), "the lock is poisoned");
+        bridge.send(open("b.docx"));
+        bridge.emit(HostEvent::SelectionCleared);
+        assert_eq!(bridge.take_commands(), vec![open("a.docx"), open("b.docx")]);
+        assert_eq!(bridge.take_events(), vec![HostEvent::SelectionCleared]);
+        bridge.detach();
+    }
+
+    #[test]
+    fn a_detached_bridge_frees_the_context_and_carries_nothing() {
+        let bridge = HostBridge::new();
+        let (ctx, wakes) = counting_context();
+        bridge.set_context(ctx);
+        assert_eq!(Arc::strong_count(&wakes), 2, "the bridge keeps the context alive");
+        bridge.send(open("a.docx"));
+        bridge.emit(HostEvent::SelectionCleared);
+        let app_side = bridge.clone();
+
+        bridge.detach();
+        assert_eq!(Arc::strong_count(&wakes), 1, "detaching drops the context");
+        assert!(app_side.take_commands().is_empty(), "queued commands are dropped");
+        assert!(bridge.take_events().is_empty(), "queued events are dropped");
+
+        let wakes_before = wakes.load(Ordering::SeqCst);
+        bridge.send(open("b.docx"));
+        app_side.emit(HostEvent::PageChanged { page: 2 });
+        let (late, late_wakes) = counting_context();
+        app_side.set_context(late);
+        bridge.send(open("c.docx"));
+        assert_eq!(wakes.load(Ordering::SeqCst), wakes_before);
+        assert_eq!(late_wakes.load(Ordering::SeqCst), 0);
+        assert_eq!(Arc::strong_count(&late_wakes), 1, "a detached bridge does not keep a late context");
+        assert!(app_side.take_commands().is_empty(), "a detached bridge queues no command");
+        assert!(bridge.take_events().is_empty(), "a detached bridge queues no event");
+        bridge.detach();
+    }
+}

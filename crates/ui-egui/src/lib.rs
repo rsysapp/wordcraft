@@ -11,6 +11,8 @@ pub mod chrome;
 pub mod control;
 pub mod credits;
 pub mod dialogs;
+// embed: the host bridge and view mode for the embed build.
+pub mod host;
 pub mod icons;
 pub mod keys;
 pub mod panes;
