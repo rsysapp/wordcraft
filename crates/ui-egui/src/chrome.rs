@@ -4,7 +4,8 @@ use egui::{Align2, Rect, Sense, Stroke, Ui, pos2, vec2};
 use serde_json::json;
 use wordcraft_doc::StoryRef;
 
-use crate::theme::{Tokens, regular, semibold};
+#[cfg_attr(not(feature = "brand"), allow(unused_imports))] // embed: `medium` is used only by the `brand` Discord button
+use crate::theme::{Tokens, medium, regular, semibold};
 use crate::{WordApp, icons};
 
 fn qat_button(ui: &mut Ui, app: &mut WordApp, icon: &str, tip: &str, id: &str, enabled: bool) {
@@ -95,13 +96,7 @@ pub fn title_bar(app: &mut WordApp, ui: &mut Ui) {
                             egui::Color32::WHITE,
                             egui::Color32::WHITE,
                         );
-                        ui.painter().text(
-                            pos2(r.min.x + 24.0, r.center().y),
-                            Align2::LEFT_CENTER,
-                            "Discord",
-                            crate::theme::medium(11.5),
-                            egui::Color32::WHITE,
-                        );
+                        ui.painter().text(pos2(r.min.x + 24.0, r.center().y), Align2::LEFT_CENTER, "Discord", medium(11.5), egui::Color32::WHITE);
                         if resp.on_hover_text("Join the ArtCraft community on Discord").clicked() {
                             let _ = app.run("ui.discord", json!({}));
                         }
