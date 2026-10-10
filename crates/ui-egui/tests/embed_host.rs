@@ -1397,6 +1397,18 @@ fn a_drag_sends_one_selection_when_released() {
 }
 
 #[test]
+fn selecting_the_same_passage_again_reports_it_again() {
+    let (mut h, bridge) = embed_app();
+    open_doc(&mut h, &bridge, &clauses(20));
+    for round in 1..=2 {
+        let (_, after) = drag_select(&mut h, &bridge, &Pos::body(0, 0), &Pos::body(0, 9));
+        assert_selection_at(&mut h, &after, &Pos::body(0, 9), "Clause 1.");
+        frames(&mut h, 3);
+        assert!(bridge.take_events().is_empty(), "round {round}: re-sent without a new press");
+    }
+}
+
+#[test]
 fn a_selection_across_paragraphs_keeps_line_breaks_in_copy_text_only() {
     let (mut h, bridge) = embed_app();
     open_doc(&mut h, &bridge, &clauses(20));

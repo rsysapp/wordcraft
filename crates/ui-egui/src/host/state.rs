@@ -77,7 +77,8 @@ pub struct HostState {
     /// The chrome theme the host chose, if it did; it outranks the app's own dark setting.
     pub(crate) dark: Option<bool>,
     /// The selection as it last settled: a person's (told to the host or not) or one the editor
-    /// made itself. A selection that differs from it is a person's new one.
+    /// made itself. A selection that differs from it is a person's new one; a pointer press forgets
+    /// a told one (see `settle_selection`).
     settled: Selection,
     /// The host was told of a selection (`selection`) and not yet that it is gone (`selectionCleared`).
     reported: bool,
@@ -225,10 +226,21 @@ pub(crate) fn after_frame(app: &mut WordApp, ctx: &egui::Context) {
 }
 
 /// Tell the host of a person's selection once it settles (no button held: a drag reports on
-/// release, keys at once), never on every frame; and that it is gone when it is.
+/// release, keys at once), never on every frame; and that it is gone when it is. A press forgets
+/// the selection told before, so settling on the same text again is told again.
 fn settle_selection(app: &mut WordApp, host: &mut HostState, ctx: &egui::Context) {
     if std::mem::take(&mut host.clear_reported) && std::mem::take(&mut host.reported) {
         host.bridge.emit(HostEvent::SelectionCleared);
+    }
+    // embed: a press starts a new selection even when it ends on the same text, and the host hides
+    // its toolbar on any input, so the release must be told again. Only a press in the document is
+    // one (the find bar's buttons select nothing), and only a selection the host was told of is
+    // forgotten: one the editor made itself stays unreported.
+    let pressed_in_document = ctx.input(|input| {
+        input.pointer.any_pressed() && input.pointer.press_origin().is_some_and(|at| app.canvas.canvas_rect.is_some_and(|view| view.contains(at)))
+    });
+    if host.reported && pressed_in_document {
+        host.settled = Selection::default();
     }
     if app.session.sel == host.settled || ctx.input(|input| input.pointer.any_down()) {
         return;

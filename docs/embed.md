@@ -162,8 +162,9 @@ script fails if a declaration is missing.
 - **Jumps**: a found jump moves the view and reports `pageChanged`; one that finds nothing answers
   `jumpNotFound` with the target echoed. A newer `jumpTo` replaces one still waiting, which is not
   answered; opening a document answers a waiting jump with `jumpNotFound` before `opened`.
-- **Selection**: sent once a selection settles (pointer released, or a keyboard selection
-  changed); `x`, `y` are CSS pixels from the canvas's top-left at the selection's end. `text` has
+- **Selection**: sent each time a selection settles (pointer released, or a keyboard selection
+  changed), not on every frame, and again when a new press and release ends on the same text as the
+  selection reported before (the host hides its toolbar on any input); `x`, `y` are CSS pixels from the canvas's top-left at the selection's end. `text` has
   whitespace collapsed; `copyText` keeps line breaks; both leave out tracked deletions and hidden
   text. Selections the editor makes itself (a jump, find, its page buttons) are never reported.
   When the editor moves the view that way, or opens a document, a selection it reported is answered
