@@ -67,6 +67,9 @@ pub struct HostState {
     pending_jump: Option<PendingJump>,
     last_view: Option<ViewGeometry>,
     last_page: Option<usize>,
+    /// The host has been sent `opened`. Until then no page is reported: the empty document the
+    /// editor starts with is not one the host opened, so its page 1 would come before any `opened`.
+    opened: bool,
     /// The document's text as jumps and marks match it; rebuilt when the document changes.
     index: TextIndex,
     /// The host's marks, and where they were found and painted.
@@ -152,6 +155,7 @@ impl HostState {
             pending_jump: None,
             last_view: None,
             last_page: None,
+            opened: false,
             index: TextIndex::default(),
             marks: Marks::default(),
             dark: None,
@@ -208,7 +212,8 @@ pub(crate) fn after_frame(app: &mut WordApp, ctx: &egui::Context) {
     follow_the_view(app, &mut host, ctx);
     // The target page is in view too (the jump put its top there, or as near as the end allows), and
     // the host's page indicator should say what the bar says.
-    if let Some(page) = host.current_page(app.canvas.visible_page)
+    if host.opened
+        && let Some(page) = host.current_page(app.canvas.visible_page)
         && host.last_page != Some(page)
     {
         host.last_page = Some(page);
@@ -454,6 +459,7 @@ fn open(app: &mut WordApp, host: &mut HostState, name: &str, bytes: &[u8]) {
             host.page_target = None;
             host.scroll_queued = true;
             let pages = app.session.layout().pages.len();
+            host.opened = true;
             host.bridge.emit(HostEvent::Opened { pages: u32::try_from(pages).unwrap_or(u32::MAX) });
         }
         Err(message) => host.bridge.emit(HostEvent::OpenFailed { message }),

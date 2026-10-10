@@ -21,6 +21,40 @@ fn opening_a_word_document_answers_opened_and_page_one() {
     assert!(!h.state().session.dirty);
 }
 
+/// The embed API sends no `pageChanged` before the first `opened`: the empty document the editor
+/// starts with is not one the host opened.
+#[test]
+fn no_page_changed_comes_before_the_first_opened() {
+    // As right after mount: no frame drained, nothing opened. A page jump would land on the empty
+    // document's one page.
+    let bridge = HostBridge::new();
+    let app = WordApp::new(Session::new(Document::new()), Services::default()).with_host(bridge.clone(), EmbedProfile::View);
+    let mut h = harness(app, 1.0);
+    bridge.set_context(h.ctx.clone());
+    wordcraft_ui_egui::host::prepare_context(&h.ctx);
+    frames(&mut h, 3);
+    bridge.send(HostCommand::JumpTo(JumpTarget::Page { page: 1 }));
+    frames(&mut h, 3);
+    let before = bridge.take_events();
+    assert!(!before.iter().any(|e| matches!(e, HostEvent::PageChanged { .. })), "{before:?}");
+    // A failed open is not an open either.
+    bridge.send(HostCommand::Open { name: "notes.txt".into(), bytes: b"text".to_vec() });
+    frames(&mut h, 3);
+    let failed = bridge.take_events();
+    assert!(matches!(failed.as_slice(), [HostEvent::OpenFailed { .. }]), "{failed:?}");
+    // The first open: `opened` first, then its page.
+    let events = open_doc(&mut h, &bridge, &clauses(120));
+    let count = pages(&mut h) as u32;
+    assert_eq!(events, vec![HostEvent::Opened { pages: count }, HostEvent::PageChanged { page: 1 }]);
+    // And after it, page changes are reported as before.
+    h.state_mut().canvas.scroll_to_doc = Some((2, 0.0));
+    frames(&mut h, 4);
+    assert_eq!(bridge.take_events(), vec![HostEvent::PageChanged { page: 3 }]);
+    bridge.send(HostCommand::JumpTo(JumpTarget::Page { page: 2 }));
+    frames(&mut h, 4);
+    assert_eq!(bridge.take_events(), vec![HostEvent::PageChanged { page: 2 }]);
+}
+
 #[test]
 fn files_that_cannot_be_shown_answer_open_failed_and_keep_the_open_document() {
     let (mut h, bridge) = embed_app();

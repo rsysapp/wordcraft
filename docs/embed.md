@@ -74,8 +74,8 @@ script fails if a declaration is missing.
   theme before the first frame and resolves after it.
 - Set the listener before `open`: events raised while there is no listener are dropped. Events
   arrive after the frame that produced them, so a listener may call the editor, `destroy()`
-  included. `opened` is followed by `pageChanged` for the first page. The empty document the
-  editor starts with may report `pageChanged` 1 before the first `opened`.
+  included. `opened` is followed by `pageChanged` for the first page, and no `pageChanged` comes
+  before the first `opened`.
 - `open` takes `.docx`, `.docm` and `.dotx` files. It replaces the document and clears the marks.
   Of the events one successful open sends, each only when it applies, the order is:
   `selectionCleared` (a selection it reported), then the waiting jump's `jumpNotFound`, then

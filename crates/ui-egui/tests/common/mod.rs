@@ -76,15 +76,22 @@ pub fn viewport_commands(h: &Harness<'_, WordApp>) -> Vec<egui::ViewportCommand>
 
 use wordcraft_ui_egui::host::{EmbedProfile, HostBridge};
 
-/// The embed build's app in view mode with `doc` loaded, and the bridge a host page would hold.
+/// The embed build's app in view mode with `doc` opened by the host (nothing opened for an empty
+/// document), and the bridge a host page would hold.
 pub fn view_app(doc: Document, pixels_per_point: f32) -> (Harness<'static, WordApp>, HostBridge) {
     let bridge = HostBridge::new();
-    let app = WordApp::new(Session::new(doc), Services::default()).with_host(bridge.clone(), EmbedProfile::View);
+    let app = WordApp::new(Session::new(Document::new()), Services::default()).with_host(bridge.clone(), EmbedProfile::View);
     let mut h = harness(app, pixels_per_point);
     bridge.set_context(h.ctx.clone());
     // As the embed crate's app creator does.
     wordcraft_ui_egui::host::prepare_context(&h.ctx);
     frames(&mut h, 2);
+    // Through the host, as the embed build only ever gets a document: the host is told of pages
+    // only after `opened`.
+    if doc != Document::new() {
+        bridge.send(HostCommand::Open { name: "agreement.docx".into(), bytes: docx(&doc) });
+        frames(&mut h, 4);
+    }
     // Start each test with an empty event queue.
     bridge.take_events();
     (h, bridge)
