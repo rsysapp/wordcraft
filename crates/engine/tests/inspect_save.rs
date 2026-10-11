@@ -3,7 +3,7 @@
 //! and nothing else.
 
 use serde_json::json;
-use wordcraft_docx::inspect::{AuthorCount, AuthorRevisions, CommentChanges, INSPECT_LIMITS, Inspection, Resolved, inspect};
+use wordcraft_docx::inspect::{AuthorCount, CommentChanges, INSPECT_LIMITS, Inspection, Resolved, inspect};
 use wordcraft_engine::Session;
 use wordcraft_engine::io::{open_docx_with_limits, save_bytes};
 
@@ -58,7 +58,12 @@ fn a_tracked_insertion_and_deletion_by_the_editor_are_the_editor_s() {
         s.run("text.insert", &json!({"text": "weekly"})).unwrap();
     });
     let inspection = inspect(&base, &edited).unwrap();
-    assert_eq!(inspection.new_revisions, vec![AuthorRevisions { author: EDITOR.into(), insertions: 1, deletions: 1, format_changes: 0 }]);
+    let revisions: Vec<(&str, u32, u32, u32)> =
+        inspection.new_revisions.iter().map(|author| (author.author.as_str(), author.insertions, author.deletions, author.format_changes)).collect();
+    assert_eq!(revisions, vec![(EDITOR, 1, 1, 0)]);
+    let editor = &inspection.new_revisions[0];
+    assert!(editor.earliest_date.is_some() && editor.earliest_date == editor.latest_date && editor.undated == 0);
+    assert_eq!((editor.hidden_text, editor.field_codes, editor.bidi_controls, editor.objects), (0, 0, 0, 0));
     assert_clean(&inspection);
     assert_eq!(inspection.comments, CommentChanges::default());
 }
