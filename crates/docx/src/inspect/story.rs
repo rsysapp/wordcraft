@@ -108,10 +108,14 @@ pub(super) struct Slot {
 #[derive(Clone, Debug, Default, PartialEq, Eq, Hash)]
 pub(super) struct Format {
     pub slots: Vec<Slot>,
-    /// The run is hidden (`w:vanish`, `w:webHidden`, `w:specVanish`).
+    /// The run is hidden (`w:vanish`, `w:webHidden`, `w:specVanish`), directly or through its
+    /// character style, its paragraph's style or the document defaults.
     pub hidden: bool,
     /// The characters are field code (`w:instrText`).
     pub instr: bool,
+    /// The tracked formatting change (author and date) that hides it: one whose recorded old
+    /// properties would leave it shown.
+    pub hidden_by: Option<(u32, u32)>,
 }
 
 impl Format {
@@ -373,12 +377,18 @@ impl Tables {
         usize::try_from(id).ok().and_then(|index| self.formats.get(index))
     }
 
-    fn mark(&mut self, digest: Digest, info: impl FnOnce() -> MarkInfo) -> Result<u32, String> {
+    pub(super) fn mark(&mut self, digest: Digest, info: impl FnOnce() -> MarkInfo) -> Result<u32, String> {
         let id = match self.mark_ids.get(&digest) {
             Some(id) => *id,
             None => {
                 let id = self.next(self.marks.len());
-                self.marks.push(info());
+                // The mark's record, in a vector that grows by doubling, and the comment id it keeps.
+                let info = info();
+                self.pending = self
+                    .pending
+                    .saturating_add(2 * std::mem::size_of::<MarkInfo>() as u64)
+                    .saturating_add(units(info.comment.as_ref().map_or(0, String::len)));
+                self.marks.push(info);
                 self.pending = self.pending.saturating_add(digest.held());
                 self.mark_ids.insert(digest, id);
                 id
@@ -432,7 +442,7 @@ pub(super) struct Revisions {
 const PAIR_BYTES: u64 = 64;
 
 impl Revisions {
-    fn note(&mut self, author: u32, date: u32, kind: RevisionKind, budget: &mut Budget) -> Result<(), String> {
+    pub(super) fn note(&mut self, author: u32, date: u32, kind: RevisionKind, budget: &mut Budget) -> Result<(), String> {
         if !self.by_pair.contains_key(&(author, date)) {
             budget.hold(PAIR_BYTES)?;
         }
@@ -478,6 +488,7 @@ pub(super) fn walk(
     revisions: &mut Revisions,
     items_left: &mut usize,
     most_items: u64,
+    hiding: &StyleHiding,
     budget: &mut Budget,
 ) -> Result<Vec<Item>, String> {
     // Room for every item the tree can make, held and reserved once: a vector growing by doubling
@@ -486,7 +497,8 @@ pub(super) fn walk(
     budget.hold(room.saturating_mul(ITEM_BYTES))?;
     let items = Vec::with_capacity(usize::try_from(room).unwrap_or(0));
     budget.release(room.saturating_mul(ITEM_BYTES).saturating_sub(items_held(&items)));
-    let mut walker = Walker { canon, tables, revisions, items, stack: vec![EMPTY], items_left, budget };
+    let mut walker =
+        Walker { canon, tables, revisions, items, stack: vec![EMPTY], items_left, budget, hiding, paragraph_style: ParagraphStyle::default() };
     let result = walker.root(root);
     let held = items_held(&walker.items);
     match result {
@@ -521,6 +533,8 @@ struct Walker<'a, 'c> {
     stack: Vec<u32>,
     items_left: &'a mut usize,
     budget: &'a mut Budget,
+    hiding: &'a StyleHiding,
+    paragraph_style: ParagraphStyle,
 }
 
 /// The first child of this name, by identity, so a second one is never mistaken for it.
@@ -536,13 +550,84 @@ fn empty_marker(el: &XEl) -> bool {
     matches!(&*el.name, "w:proofErr" | "w:lastRenderedPageBreak") && el.kids.is_empty()
 }
 
-/// Run properties that hide what they format.
+/// Whether run properties say the run is hidden: `Some` when they set it either way.
+fn vanish(properties: Option<&XEl>) -> Option<bool> {
+    let mut said = None;
+    for child in properties?.els() {
+        if matches!(&*child.name, "w:vanish" | "w:webHidden" | "w:specVanish") {
+            let on = !matches!(child.attr("w:val"), Some("0" | "false" | "off"));
+            said = Some(said.unwrap_or(false) || on);
+        }
+    }
+    said
+}
+
+/// Run properties that hide what they format, by themselves.
 fn hides(properties: Option<&XEl>) -> bool {
-    properties.is_some_and(|properties| {
-        properties.els().any(|child| {
-            matches!(&*child.name, "w:vanish" | "w:webHidden" | "w:specVanish") && !matches!(child.attr("w:val"), Some("0" | "false" | "off"))
-        })
-    })
+    vanish(properties).unwrap_or(false)
+}
+
+/// Which styles hide what they format, read from the styles part, and whether the document's
+/// defaults do. Hidden text through a style is hidden text as surely as direct `w:vanish`.
+#[derive(Default)]
+pub(super) struct StyleHiding {
+    /// Style id → whether its own run properties hide (if they say), and the style it is based on.
+    styles: HashMap<String, (Option<bool>, Option<String>)>,
+    default: bool,
+}
+
+/// Memory charged for each style kept, besides its id and base's.
+const STYLE_BYTES: u64 = 160;
+/// The longest style chain followed; a longer one (or a loop) reads as not hiding past it.
+const MAX_STYLE_CHAIN: usize = 32;
+
+impl StyleHiding {
+    pub(super) fn read(root: &XEl, budget: &mut Budget) -> Result<StyleHiding, String> {
+        let mut hiding = StyleHiding::default();
+        for child in root.els() {
+            budget.work(8)?;
+            match &*child.name {
+                "w:docDefaults" => {
+                    let defaults = child.child("w:rPrDefault").and_then(|default| default.child("w:rPr"));
+                    hiding.default = hides(defaults);
+                }
+                "w:style" => {
+                    let Some(id) = child.attr("w:styleId") else { continue };
+                    let based = child.child("w:basedOn").and_then(|based| based.attr("w:val")).map(str::to_string);
+                    budget.hold(STYLE_BYTES.saturating_add(units(id.len().saturating_add(based.as_ref().map_or(0, String::len)))))?;
+                    hiding.styles.insert(id.to_string(), (vanish(child.child("w:rPr")), based));
+                }
+                _ => {}
+            }
+        }
+        Ok(hiding)
+    }
+
+    /// Whether a style (through the styles it is based on) says hidden or shown.
+    fn style(&self, id: Option<&str>) -> Option<bool> {
+        let mut at = id?;
+        for _ in 0..MAX_STYLE_CHAIN {
+            let (own, based) = self.styles.get(at)?;
+            if own.is_some() {
+                return *own;
+            }
+            at = based.as_deref()?;
+        }
+        None
+    }
+
+    /// Whether a run with these direct properties, in a paragraph of this style, is hidden.
+    pub(super) fn effective(&self, properties: Option<&XEl>, paragraph_style: Option<&str>) -> bool {
+        let character_style = properties.and_then(|properties| properties.child("w:rStyle")).and_then(|style| style.attr("w:val"));
+        vanish(properties).or_else(|| self.style(character_style)).or_else(|| self.style(paragraph_style)).unwrap_or(self.default)
+    }
+}
+
+/// A paragraph's style, and the style a tracked change of its properties records before it.
+#[derive(Default)]
+struct ParagraphStyle {
+    now: Option<String>,
+    change: Option<(u32, u32, Option<String>)>,
 }
 
 impl Walker<'_, '_> {
@@ -553,13 +638,9 @@ impl Walker<'_, '_> {
     fn push(&mut self, piece: u32, format: u32) -> Result<(), String> {
         *self.items_left = self.items_left.checked_sub(1).ok_or("more text than an inspection reads")?;
         self.budget.work(3)?;
+        // The room was reserved from a bound on what the tree can make; never grow past it.
         if self.items.len() == self.items.capacity() {
-            // Grow by doubling, the new room held before it is allocated, the old released after.
-            let old = self.items.capacity();
-            let new = old.saturating_mul(2).max(64);
-            self.budget.hold(units(new).saturating_mul(ITEM_BYTES))?;
-            self.items.reserve_exact(new - self.items.len());
-            self.budget.release(units(old).saturating_mul(ITEM_BYTES));
+            return Err("more items than the part can make".into());
         }
         self.tables.charge(self.budget)?;
         let wraps = self.current();
@@ -585,7 +666,7 @@ impl Walker<'_, '_> {
     fn opaque(&mut self, el: &XEl, format: u32) -> Result<(), String> {
         let anchor = matches!(&*el.name, "w:commentRangeStart" | "w:commentRangeEnd" | "w:commentReference");
         // Only an empty anchor is an anchor: anything inside one is content a reader may show.
-        let comment = (anchor && el.kids.is_empty()).then(|| el.attr("w:id").unwrap_or("").to_string());
+        let comment = (anchor && el.kids.is_empty()).then(|| el.attr("w:id").unwrap_or(""));
         let kind = match (&*el.name, el.attr("w:fldCharType")) {
             ("w:fldChar", Some("begin")) => MarkKind::FieldBegin,
             ("w:fldChar", Some("separate")) => MarkKind::FieldSeparate,
@@ -599,7 +680,8 @@ impl Walker<'_, '_> {
         let digest = finish(hasher, self.budget)?;
         let element = el.name.clone();
         let holds = scan(el, self.budget)?;
-        self.mark(digest, || MarkInfo { element, comment, kind, holds }, format)
+        // The id is copied only for a mark the tables do not have yet, which charges it.
+        self.mark(digest, || MarkInfo { element, comment: comment.map(str::to_string), kind, holds }, format)
     }
 
     /// Text where only elements belong: white space is layout, anything else is kept as a mark.
@@ -703,7 +785,8 @@ impl Walker<'_, '_> {
                 let digest = self.canon.digest(change, &|child| !is(child, old_properties), self.budget)?;
                 let extra = self.tables.content(digest);
                 let (author, date, _) = self.note(change, RevisionKind::Format)?;
-                Some(FormatRev { author, date, extra, old, old_hidden: hides(old_properties) })
+                let old_hidden = self.hiding.effective(old_properties, self.paragraph_style.now.as_deref());
+                Some(FormatRev { author, date, extra, old, old_hidden })
             }
             None => None,
         };
@@ -712,7 +795,27 @@ impl Walker<'_, '_> {
 
     fn format(&mut self, mut slots: Vec<Slot>, hidden: bool, instr: bool) -> u32 {
         slots.sort_by_key(|slot| slot.name);
-        self.tables.format(Format { slots, hidden, instr })
+        self.tables.format(Format { slots, hidden, instr, hidden_by: None })
+    }
+
+    /// Whether run properties hide in this paragraph, and which tracked change hides them: the
+    /// run's own (`rev`) or its paragraph's, if its recorded old properties would show the run.
+    fn hiding(&self, properties: Option<&XEl>, rev: Option<&FormatRev>) -> (bool, Option<(u32, u32)>) {
+        let style = self.paragraph_style.now.as_deref();
+        let hidden = self.hiding.effective(properties, style);
+        if !hidden {
+            return (false, None);
+        }
+        if let Some(rev) = rev.filter(|rev| !rev.old_hidden) {
+            return (true, Some((rev.author, rev.date)));
+        }
+        let by_paragraph = self.paragraph_style.change.as_ref().filter(|(_, _, old)| !self.hiding.effective(properties, old.as_deref()));
+        (true, by_paragraph.map(|(author, date, _)| (*author, *date)))
+    }
+
+    fn hidden_format(&mut self, mut slots: Vec<Slot>, hiding: (bool, Option<(u32, u32)>), instr: bool) -> u32 {
+        slots.sort_by_key(|slot| slot.name);
+        self.tables.format(Format { slots, hidden: hiding.0, instr, hidden_by: hiding.1 })
     }
 
     fn root(&mut self, root: &XEl) -> Result<(), String> {
@@ -876,6 +979,16 @@ impl Walker<'_, '_> {
 
     fn paragraph(&mut self, p: &XEl) -> Result<(), String> {
         let properties = first(p, "w:pPr");
+        let style_of = |properties: Option<&XEl>| {
+            properties.and_then(|properties| properties.child("w:pStyle")).and_then(|style| style.attr("w:val")).map(str::to_string)
+        };
+        let change = properties.and_then(|properties| first(properties, "w:pPrChange"));
+        let recorded = change.map(|change| {
+            let author = self.tables.text(change.attr("w:author").unwrap_or(""));
+            let date = self.tables.text(change.attr("w:date").unwrap_or(""));
+            (author, date, style_of(first(change, "w:pPr")))
+        });
+        self.paragraph_style = ParagraphStyle { now: style_of(properties), change: recorded };
         self.children(p, Place::Inline, &[properties])?;
         // The paragraph mark: its own tracked changes sit in `w:pPr/w:rPr`.
         let mark_properties = properties.and_then(|properties| first(properties, "w:rPr"));
@@ -895,7 +1008,9 @@ impl Walker<'_, '_> {
         slots.extend(self.slot("pPr.rPr", mark_properties, "w:rPrChange", "w:rPr", &is_wrap)?);
         slots.extend(self.slot("pPr.sectPr", section, "w:sectPrChange", "w:sectPr", &|_| false)?);
         // A hidden mark hides the paragraph's end: its paragraph runs into the next.
-        let format = self.format(slots, hides(mark_properties), false);
+        let mark_rev = slots.iter().find(|slot| slot.name == "pPr.rPr").and_then(|slot| slot.rev);
+        let hiding = self.hiding(mark_properties, mark_rev.as_ref());
+        let format = self.hidden_format(slots, hiding, false);
         let mut hasher = Hasher::default();
         hasher.field(b'P', &[]);
         self.canon.start_tag(p, &mut hasher);
@@ -914,8 +1029,9 @@ impl Walker<'_, '_> {
             slots.push(Slot { name: "r", value: self.tables.content(digest), rev: None });
         }
         slots.extend(self.slot("rPr", properties, "w:rPrChange", "w:rPr", &|_| false)?);
-        let hidden = hides(properties);
-        let run_format = self.format(slots.clone(), hidden, false);
+        let rev = slots.iter().find(|slot| slot.name == "rPr").and_then(|slot| slot.rev);
+        let hidden = self.hiding(properties, rev.as_ref());
+        let run_format = self.hidden_format(slots.clone(), hidden, false);
         let deleting = self.tables.wraps_of(self.current()).iter().any(|wrap| matches!(wrap.kind, WrapKind::Del | WrapKind::MoveFrom));
         for node in &r.kids {
             match node {
@@ -954,7 +1070,7 @@ impl Walker<'_, '_> {
     }
 
     /// The format of a text element's characters: the run's, and how the element reads.
-    fn text_format(&mut self, child: &XEl, slots: &[Slot], hidden: bool, instr: bool) -> Result<u32, String> {
+    fn text_format(&mut self, child: &XEl, slots: &[Slot], hidden: (bool, Option<(u32, u32)>), instr: bool) -> Result<u32, String> {
         // Text reads exactly as written when it keeps its white space (`xml:space="preserve"`)
         // or has none a reader could trim or collapse; otherwise how it reads is the reader's,
         // so the attribute is kept and any change of it is a change.
@@ -974,7 +1090,7 @@ impl Walker<'_, '_> {
         let digest = finish(hasher, self.budget)?;
         let mut with_text = slots.to_vec();
         with_text.push(Slot { name: "text", value: self.tables.content(digest), rev: None });
-        Ok(self.format(with_text, hidden, instr))
+        Ok(self.hidden_format(with_text, hidden, instr))
     }
 
     fn table(&mut self, table: &XEl) -> Result<(), String> {

@@ -1233,15 +1233,15 @@ fn reports_content_left_in_a_removed_comment_s_anchor() {
 fn holds_little_more_than_a_part_however_it_would_print() {
     let braces = format!("<data>{}</data>", "{".repeat(8 << 20));
     let base = package(&para(&text("Rent.")), &[("customXml/item1.xml", &braces)]);
-    let mut budget = budget::Budget::new(u64::MAX, 40 << 20);
+    let mut budget = budget::Budget::new(u64::MAX, 48 << 20);
     assert!(inspect_budgeted(&base, &base, &INSPECT_LIMITS, MAX_CHANGES, &mut budget).is_ok());
-    assert!(budget.peak() < 24 << 20, "held {}", budget.peak());
+    assert!(budget.peak() < 40 << 20, "held {}", budget.peak());
     // An opaque story element of braces likewise.
     let element = para(&format!(r#"<w:r><w:customThing>{}</w:customThing></w:r>"#, "{".repeat(8 << 20)));
     let story = package(&element, &[]);
-    let mut budget = budget::Budget::new(u64::MAX, 40 << 20);
+    let mut budget = budget::Budget::new(u64::MAX, 48 << 20);
     assert!(inspect_budgeted(&story, &story, &INSPECT_LIMITS, MAX_CHANGES, &mut budget).is_ok());
-    assert!(budget.peak() < 24 << 20, "held {}", budget.peak());
+    assert!(budget.peak() < 40 << 20, "held {}", budget.peak());
 }
 
 /// past the memory budget, the inspection is refused before it allocates past it.
@@ -1586,4 +1586,92 @@ fn refuses_an_element_with_too_many_attributes() {
     let many = custom(format!(r#"<data xmlns:p="urn:x"><e{attributes}/></data>"#));
     let base = package(&para(&text("Rent.")), &[]);
     assert!(matches!(inspect(&base, &many), Err(InspectError::Edited(message)) if message.contains("attributes")));
+}
+
+// ---- Hidden through styles; qualified lists ------------------------------------------------------
+
+fn styled(styles: &str, body: &str) -> Vec<u8> {
+    package(body, &[("word/styles.xml", &format!("<w:styles {W}>{styles}</w:styles>"))])
+}
+
+const HIDDEN_STYLES: &str = r#"<w:style w:type="character" w:styleId="Secret"><w:rPr><w:vanish/></w:rPr></w:style><w:style w:type="paragraph" w:styleId="Hide"><w:rPr><w:vanish/></w:rPr></w:style><w:style w:type="paragraph" w:styleId="Gone"><w:basedOn w:val="Hide"/></w:style>"#;
+
+/// Text hidden through a style counts as hidden text: a character style applied by a tracked
+/// formatting change, a paragraph style (through the style it is based on) applied by one, and an
+/// insertion in a hidden character style.
+#[test]
+fn counts_text_hidden_through_a_style() {
+    let base = styled(HIDDEN_STYLES, &para(&text("Rent.")));
+    let character = styled(
+        HIDDEN_STYLES,
+        &para(&format!(
+            r#"<w:r><w:rPr><w:rStyle w:val="Secret"/><w:rPrChange w:author="{}" w:date="{}"><w:rPr/></w:rPrChange></w:rPr><w:t>Rent.</w:t></w:r>"#,
+            SARI.0, SARI.1
+        )),
+    );
+    assert_eq!(inspect(&base, &character).unwrap().new_revisions[0].hidden_text, 5);
+    let paragraph = styled(
+        HIDDEN_STYLES,
+        &format!(
+            r#"<w:p><w:pPr><w:pStyle w:val="Gone"/><w:pPrChange w:author="{}" w:date="{}"><w:pPr/></w:pPrChange></w:pPr>{}</w:p>"#,
+            SARI.0,
+            SARI.1,
+            text("Rent.")
+        ),
+    );
+    let inspection = inspect(&base, &paragraph).unwrap();
+    // The five characters and the paragraph mark.
+    assert_eq!(inspection.new_revisions[0].hidden_text, 6, "{inspection:#?}");
+    let inserted_secret = styled(
+        HIDDEN_STYLES,
+        &para(&format!("{}{}", text("Rent."), inserted(SARI, r#"<w:r><w:rPr><w:rStyle w:val="Secret"/></w:rPr><w:t>more</w:t></w:r>"#))),
+    );
+    assert_eq!(inspect(&base, &inserted_secret).unwrap().new_revisions[0].hidden_text, 4);
+    // Hidden by the document's defaults too.
+    let defaults = r#"<w:docDefaults><w:rPrDefault><w:rPr><w:vanish/></w:rPr></w:rPrDefault></w:docDefaults>"#;
+    let shown = styled(defaults, &para(&text("Rent.")));
+    let inserted_default = styled(defaults, &para(&format!("{}{}", text("Rent."), inserted(SARI, &text("more")))));
+    assert_eq!(inspect(&shown, &inserted_default).unwrap().new_revisions[0].hidden_text, 4);
+}
+
+/// Prefix lists (`mc:Ignorable` and the like) are kept as namespace numbers, charged as they are
+/// expanded: thousands of them under a long namespace stay small. Lists past 1,024 names, or past
+/// 64 KiB in one element, are refused.
+#[test]
+fn keeps_prefix_lists_small_and_bounded() {
+    let namespace = "{".repeat(4_096);
+    let element = format!(
+        r#"<e mc:Ignorable="{0}" mc:ProcessContent="{1}" mc:MustUnderstand="{0}" xsi:type="p:a"/>"#,
+        vec!["p"; 15].join(" "),
+        vec!["p:a"; 15].join(" ")
+    );
+    let part = |count: usize| {
+        custom(format!(
+            r#"<data xmlns:p="{namespace}" xmlns:mc="http://schemas.openxmlformats.org/markup-compatibility/2006" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance">{}</data>"#,
+            element.repeat(count)
+        ))
+    };
+    // The reviewer's 15.6 KB upload held 2.1 GB against a 12 MB charge: each name's namespace is
+    // now looked up and charged as work, so it stops at the work budget, holding little.
+    let lists = part(8_000);
+    let mut budget = budget::Budget::new(MAX_WORK, 64 << 20);
+    let result = inspect_budgeted(&lists, &lists, &INSPECT_LIMITS, MAX_CHANGES, &mut budget);
+    assert!(matches!(&result, Err(InspectError::Base(message) | InspectError::Edited(message)) if message.contains("work")), "{result:?}");
+    assert!(budget.peak() < 32 << 20, "held {}", budget.peak());
+    // A tenth of it reads, holding a few megabytes.
+    let lists = part(800);
+    let mut budget = budget::Budget::new(MAX_WORK, 64 << 20);
+    let result = inspect_budgeted(&lists, &lists, &INSPECT_LIMITS, MAX_CHANGES, &mut budget);
+    assert!(result.is_ok(), "{result:?}");
+    assert!(budget.peak() < 32 << 20, "held {}", budget.peak());
+    let long = custom(format!(
+        r#"<data xmlns:p="urn:x" xmlns:mc="http://schemas.openxmlformats.org/markup-compatibility/2006"><e mc:Ignorable="{}"/></data>"#,
+        vec!["p"; 1_025].join(" ")
+    ));
+    assert!(matches!(inspect(&lists, &long), Err(InspectError::Edited(message)) if message.contains("list")));
+    let wide = custom(format!(
+        r#"<data xmlns:p="urn:x" xmlns:mc="http://schemas.openxmlformats.org/markup-compatibility/2006"><e mc:Ignorable="{0}" mc:ProcessContent="{0}"/></data>"#,
+        vec![format!("p:{}", "a".repeat(80)); 1_000].join(" ")
+    ));
+    assert!(matches!(inspect(&lists, &wide), Err(InspectError::Edited(message)) if message.contains("list")));
 }

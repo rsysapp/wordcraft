@@ -185,11 +185,6 @@ fn checked(text: &str) -> Result<(), String> {
     if text.chars().all(xml_char) { Ok(()) } else { Err("a character XML does not allow".into()) }
 }
 
-/// XML 1.0 end-of-line handling (2.11): `\r\n` and a lone `\r` read as `\n`.
-fn line_ends(raw: &str) -> String {
-    raw.replace("\r\n", "\n").replace('\r', "\n")
-}
-
 fn entity(name: &str) -> Result<char, String> {
     if let Some(number) = name.strip_prefix('#') {
         let value = match number.strip_prefix('x') {
@@ -213,18 +208,30 @@ fn entity(name: &str) -> Result<char, String> {
 /// then references.
 fn attribute_value(raw: &[u8]) -> Result<String, String> {
     let raw = std::str::from_utf8(raw).map_err(|_| "an attribute value that is not UTF-8".to_string())?;
-    let spaced: String = line_ends(raw).chars().map(|c| if matches!(c, '\t' | '\n') { ' ' } else { c }).collect();
-    let mut out = String::with_capacity(spaced.len());
-    let mut rest = spaced.as_str();
-    while let Some(at) = rest.find(['&', '<']) {
+    // One pass into one string no longer than the raw value: line ends, then literal white space
+    // as spaces (`\r\n` is one), then references.
+    let mut out = String::with_capacity(raw.len());
+    let mut rest = raw;
+    while let Some(at) = rest.find(['&', '<', '\r', '\n', '\t']) {
         out.push_str(rest.get(..at).unwrap_or(""));
         let tail = rest.get(at..).unwrap_or("");
-        if tail.starts_with('<') {
-            return Err("< in an attribute value".into());
+        if let Some(after) = tail.strip_prefix("\r\n") {
+            out.push(' ');
+            rest = after;
+            continue;
         }
-        let end = tail.find(';').ok_or("an unterminated reference")?;
-        out.push(entity(tail.get(1..end).unwrap_or(""))?);
-        rest = tail.get(end + 1..).unwrap_or("");
+        match tail.chars().next() {
+            Some('<') => return Err("< in an attribute value".into()),
+            Some('&') => {
+                let end = tail.find(';').ok_or("an unterminated reference")?;
+                out.push(entity(tail.get(1..end).unwrap_or(""))?);
+                rest = tail.get(end + 1..).unwrap_or("");
+            }
+            _ => {
+                out.push(' ');
+                rest = tail.get(1..).unwrap_or("");
+            }
+        }
     }
     out.push_str(rest);
     checked(&out)?;
@@ -291,6 +298,8 @@ fn parse_into(
         config.allow_dangling_amp = false;
     }
     let mut stack: Vec<XEl> = Vec::new();
+    // What each open element's namespace declarations hold in the reader.
+    let mut open_declarations: Vec<u64> = Vec::new();
     let mut root: Option<XEl> = None;
     loop {
         // Events borrow from the part's bytes: nothing is copied but the text kept.
@@ -303,38 +312,45 @@ fn parse_into(
                 limits.elements_left = limits.elements_left.checked_sub(1).ok_or(super::TOO_MANY_ELEMENTS)?;
                 let name = resolved(result, start.local_name().as_ref(), names, budget)?;
                 charge(budget, held, ELEMENT_BYTES)?;
-                let element = element(&reader, name, start, names, budget, held)?;
+                let mut declarations = 0u64;
+                let element = element(&reader, name, start, names, budget, held, &mut declarations)?;
+                budget.hold(declarations)?;
                 *most_items = most_items.saturating_add(2);
                 if matches!(event, Event::Start(_)) {
                     if stack.len() >= limits.max_depth {
+                        budget.release(declarations);
                         return Err(super::TOO_DEEP.into());
                     }
                     stack.push(element);
+                    open_declarations.push(declarations);
                 } else {
+                    budget.release(declarations);
                     close(&mut stack, &mut root, element);
                 }
             }
             Event::End(_) => {
                 let element = stack.pop().ok_or("an end tag without a start")?;
+                budget.release(open_declarations.pop().unwrap_or(0));
                 close(&mut stack, &mut root, element);
             }
             Event::Text(text) => {
                 let text = text.xml10_content().map_err(|_| "text that is not UTF-8".to_string())?;
                 checked(&text)?;
-                charge(budget, held, super::budget::units(text.len()))?;
+                charge(budget, held, TEXT_FACTOR.saturating_mul(units(text.len())))?;
                 *most_items = most_items.saturating_add(item_bound(&stack, text.len()));
                 push_text(&mut stack, &text)?;
             }
             Event::CData(data) => {
                 let text = data.xml10_content().map_err(|_| "text that is not UTF-8".to_string())?;
                 checked(&text)?;
-                charge(budget, held, super::budget::units(text.len()))?;
+                charge(budget, held, TEXT_FACTOR.saturating_mul(units(text.len())))?;
                 *most_items = most_items.saturating_add(item_bound(&stack, text.len()));
                 push_text(&mut stack, &text)?;
             }
             Event::GeneralRef(reference) => {
                 let name = reference.decode().map_err(|_| "a reference that is not UTF-8".to_string())?;
                 let character = entity(&name)?;
+                charge(budget, held, TEXT_FACTOR.saturating_mul(units(character.len_utf8())))?;
                 *most_items = most_items.saturating_add(1);
                 push_text(&mut stack, character.encode_utf8(&mut [0; 4]))?;
             }
@@ -357,8 +373,16 @@ fn parse_into(
     root.ok_or_else(|| "no root element".to_string())
 }
 
+/// Memory charged per byte of text kept: twice, as a text node built from pieces (text between
+/// references) grows by doubling.
+const TEXT_FACTOR: u64 = 2;
+
+/// Memory charged for each namespace declaration while its element is open, besides its bytes: the
+/// reader's binding record.
+const DECLARATION_BYTES: u64 = 64;
+
 /// The most attributes one element may carry; real ones carry a few dozen.
-const MAX_ATTRIBUTES: usize = 512;
+pub(super) const MAX_ATTRIBUTES: usize = 512;
 
 fn element(
     reader: &NsReader<&[u8]>,
@@ -367,31 +391,46 @@ fn element(
     names: &mut Names,
     budget: &mut Budget,
     held: &mut u64,
+    declarations: &mut u64,
 ) -> Result<XEl, String> {
     let mut attrs: Vec<(Rc<str>, String)> = Vec::new();
     // Names are interned, so one name is one pointer.
     let mut seen: HashSet<*const u8> = HashSet::new();
     let mut declared = 0usize;
+    let mut list_bytes = 0usize;
     for attribute in start.attributes().with_checks(true) {
         let attribute = attribute.map_err(|error| format!("a malformed attribute: {error}"))?;
         if attrs.len().saturating_add(declared) >= MAX_ATTRIBUTES {
             return Err("an element with more attributes than any real one".into());
         }
-        // Held as it is read: its entry, its value, the records the checks keep.
-        charge(budget, held, ATTRIBUTE_BYTES.saturating_add(units(attribute.value.len())))?;
         let key = attribute.key.as_ref();
         if key == b"xmlns" || key.starts_with(b"xmlns:") {
-            // The reader keeps each declaration while its element is open.
+            // The reader keeps each declaration while its element is open (held by the caller
+            // until the element closes); the tree keeps none.
             declared = declared.saturating_add(1);
+            // The reader's binding buffer grows by doubling: twice the bytes.
+            *declarations = declarations
+                .saturating_add(DECLARATION_BYTES)
+                .saturating_add(units(key.len().saturating_add(attribute.value.len())).saturating_mul(2));
             budget.work(4 + units(attribute.value.len()) / 4)?;
             continue;
         }
+        // Held as it is read: its entry and the records the checks keep.
+        charge(budget, held, ATTRIBUTE_BYTES)?;
         let (namespace, local) = reader.resolve_attribute(attribute.key);
         let key = resolved(namespace, local.as_ref(), names, budget)?;
-        let mut value = attribute_value(&attribute.value)?;
-        if holds_prefixes(&name, &key) {
-            value = qualified_list(reader, &key, &value)?;
-        }
+        let value = if holds_prefixes(&name, &key) {
+            // The raw value while it is expanded; the expansion is what is kept.
+            let raw_bytes = units(attribute.value.len());
+            budget.hold(raw_bytes)?;
+            let raw = attribute_value(&attribute.value);
+            let expanded = raw.and_then(|raw| qualified_list(reader, &key, &raw, names, budget, held, &mut list_bytes));
+            budget.release(raw_bytes);
+            expanded?
+        } else {
+            charge(budget, held, units(attribute.value.len()))?;
+            attribute_value(&attribute.value)?
+        };
         let key = names.get(&key, budget)?;
         if !seen.insert(Rc::as_ptr(&key).cast::<u8>()) {
             return Err(format!("the attribute {key} twice"));
@@ -401,34 +440,64 @@ fn element(
     Ok(XEl { name: names.get(&name, budget)?, attrs, kids: Vec::new() })
 }
 
+/// The most names one qualified list holds, and the most bytes all of an element's lists may take
+/// once expanded; real ones hold a few.
+const MAX_LIST_NAMES: usize = 1_024;
+const MAX_LIST_BYTES: usize = 64 * 1024;
+
 /// `p1 p2:local` with each prefix replaced by its namespace in scope (an unprefixed `xsi:type`
-/// takes the default namespace).
-fn qualified_list(reader: &NsReader<&[u8]>, attribute: &str, value: &str) -> Result<String, String> {
-    // Each token's namespace is written with its length before it, so no escaping is needed; the
-    // whole stays short, as these attributes are in any real document.
-    const MAX_LIST: usize = 64 * 1024;
-    let mut out = String::new();
-    for token in value.split_whitespace() {
-        let (prefix, local) = match token.split_once(':') {
-            Some(parts) => parts,
-            None if attribute == "xsi:type" => ("", token),
-            None => (token, ""),
-        };
-        let probe = if prefix.is_empty() { "x".to_string() } else { format!("{prefix}:x") };
-        let (namespace, _) = reader.resolve(QName(probe.as_bytes()), false);
-        let uri = match namespace {
-            ResolveResult::Bound(namespace) => {
-                std::str::from_utf8(namespace.as_ref()).map_err(|_| "a namespace that is not UTF-8".to_string())?.to_string()
-            }
-            ResolveResult::Unbound => String::new(),
-            ResolveResult::Unknown(_) => format!("?{prefix}"),
-        };
-        if out.len().saturating_add(uri.len()).saturating_add(local.len()) > MAX_LIST {
+/// takes the default namespace), written as element names are (`w:local`, `{n}local`), so a
+/// long namespace costs its number, not its length. Each token's expansion is charged, as memory
+/// and as work, before it is made; `spent` counts the element's expanded bytes so far.
+fn qualified_list(
+    reader: &NsReader<&[u8]>,
+    attribute: &str,
+    value: &str,
+    names: &mut Names,
+    budget: &mut Budget,
+    held: &mut u64,
+    spent: &mut usize,
+) -> Result<String, String> {
+    // First the length, so the expansion is charged and allocated once, at its size.
+    let mut length = 0usize;
+    for (count, token) in value.split_whitespace().enumerate() {
+        if count >= MAX_LIST_NAMES {
             return Err(format!("a {attribute} list longer than any real one"));
         }
-        out.push_str(&format!("{}:{uri}{local} ", uri.len()));
+        length = length.saturating_add(qualified_token(reader, attribute, token, names, budget)?.len()).saturating_add(1);
+        if spent.saturating_add(length) > MAX_LIST_BYTES {
+            return Err(format!("a {attribute} list longer than any real one"));
+        }
+    }
+    *spent = spent.saturating_add(length);
+    // Kept in the tree with the attribute: held before it is made.
+    charge(budget, held, units(length))?;
+    let mut out = String::with_capacity(length);
+    for token in value.split_whitespace() {
+        out.push_str(&qualified_token(reader, attribute, token, names, budget)?);
+        out.push(' ');
     }
     Ok(out)
+}
+
+/// One token of a prefix list, its prefix resolved in scope; charged as work.
+fn qualified_token(reader: &NsReader<&[u8]>, attribute: &str, token: &str, names: &mut Names, budget: &mut Budget) -> Result<String, String> {
+    let (prefix, local) = match token.split_once(':') {
+        Some(parts) => parts,
+        None if attribute == "xsi:type" => ("", token),
+        None => (token, ""),
+    };
+    let probe = if prefix.is_empty() { "x".to_string() } else { format!("{prefix}:x") };
+    budget.work(8 + units(token.len()) / 4)?;
+    let (namespace, _) = reader.resolve(QName(probe.as_bytes()), false);
+    match namespace {
+        ResolveResult::Bound(namespace) => {
+            let namespace = namespace.as_ref().to_vec();
+            qualified(&namespace, local, names, budget)
+        }
+        ResolveResult::Unbound => Ok(format!(":{local}")),
+        ResolveResult::Unknown(_) => Ok(format!("?{prefix}:{local}")),
+    }
 }
 
 fn push_text(stack: &mut [XEl], text: &str) -> Result<(), String> {

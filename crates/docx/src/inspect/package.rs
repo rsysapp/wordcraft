@@ -35,10 +35,39 @@ const DESCRIBED_AFTER: u16 = 0x0008;
 /// Extra-field ids: ZIP64 sizes, and Info-ZIP's second spelling of the name.
 const ZIP64_EXTRA: u16 = 0x0001;
 const UNICODE_PATH: u16 = 0x7075;
+/// Memory charged for an open entry stream: its decompressor's state and buffers.
+pub(super) const INFLATE_BYTES: u64 = 128 * 1024;
 /// Work charged for opening one entry's stream (its decompressor and buffers).
 const ENTRY_WORK: u64 = 2_000;
-/// Memory charged for each entry indexed.
-const ENTRY_BYTES: u64 = 192;
+/// Memory charged for each entry, besides three times the directory's bytes (its names and extra
+/// fields, kept by the zip reader, this index and the case-folded check): the zip reader's record,
+/// the layout check's extent, the index entries.
+const ENTRY_BYTES: u64 = 640;
+
+/// How many entries the directory holds and its size in bytes, from the end record (or the ZIP64
+/// end record it points at).
+fn directory_size(bytes: &[u8]) -> Result<(usize, u64), String> {
+    let end = bytes.len().checked_sub(22).ok_or("no zip end record")?;
+    if bytes.get(end..end.saturating_add(4)) != Some(&END_RECORD[..]) {
+        return Err("no zip end record where it must be".into());
+    }
+    let entries = u16_at(bytes, end.saturating_add(10)).ok_or("a cut zip end record")?;
+    let size = u32_at(bytes, end.saturating_add(12)).ok_or("a cut zip end record")?;
+    if entries != u16::MAX && size != u32::MAX {
+        return Ok((usize::from(entries), u64::from(size)));
+    }
+    let locator = end.checked_sub(20).ok_or("a cut ZIP64 locator")?;
+    if bytes.get(locator..locator.saturating_add(4)) != Some(&ZIP64_LOCATOR[..]) {
+        return Err("a ZIP64 end record without its locator".into());
+    }
+    let record = u64_at(bytes, locator.saturating_add(8)).and_then(|at| usize::try_from(at).ok()).ok_or("a cut ZIP64 locator")?;
+    if bytes.get(record..record.saturating_add(4)) != Some(&ZIP64_END_RECORD[..]) {
+        return Err("a ZIP64 locator pointing at no end record".into());
+    }
+    let entries = u64_at(bytes, record.saturating_add(32)).and_then(|count| usize::try_from(count).ok()).ok_or("a cut ZIP64 end record")?;
+    let size = u64_at(bytes, record.saturating_add(40)).ok_or("a cut ZIP64 end record")?;
+    Ok((entries, size))
+}
 
 fn u16_at(bytes: &[u8], at: usize) -> Option<u16> {
     let slice = bytes.get(at..at.checked_add(2)?)?;
@@ -196,7 +225,6 @@ fn check_layout(bytes: &[u8], directory: u64, budget: &mut Budget) -> Result<usi
     let mut extents: Vec<(usize, usize)> = Vec::new();
     while bytes.get(at..at.saturating_add(4)) == Some(&CENTRAL_HEADER[..]) {
         budget.work(1)?;
-        budget.hold(32)?;
         let (central, offset, end) = central_record(bytes, at)?;
         let offset = usize::try_from(offset).map_err(|_| "a zip entry past the file".to_string())?;
         let (local, data) = local_record(bytes, offset)?;
@@ -253,6 +281,12 @@ fn check_layout(bytes: &[u8], directory: u64, budget: &mut Budget) -> Result<usi
 
 impl<'a> StrictPackage<'a> {
     pub(super) fn open(bytes: &'a [u8], limits: &ReadLimits, budget: &mut Budget) -> Result<Self, String> {
+        // What the directory will hold, from its end record, before the zip reader builds it.
+        let (entries, directory_bytes) = directory_size(bytes)?;
+        if entries > MAX_ENTRIES {
+            return Err(format!("{entries} zip entries"));
+        }
+        budget.hold(ENTRY_BYTES.saturating_mul(units(entries)).saturating_add(directory_bytes.saturating_mul(3)))?;
         let mut archive = ZipArchive::new(Cursor::new(bytes)).map_err(|error| format!("not a readable zip package: {error}"))?;
         if archive.len() > MAX_ENTRIES {
             return Err(format!("{} zip entries", archive.len()));
@@ -273,7 +307,16 @@ impl<'a> StrictPackage<'a> {
         let mut folded = BTreeMap::new();
         let mut total: u64 = 0;
         for position in 0..archive.len() {
-            let mut entry = archive.by_index(position).map_err(|error| format!("zip entry {position} unreadable: {error}"))?;
+            // The entry's stream is open only for this turn.
+            budget.hold(INFLATE_BYTES)?;
+            let opened = archive.by_index(position).map_err(|error| format!("zip entry {position} unreadable: {error}"));
+            let mut entry = match opened {
+                Ok(entry) => entry,
+                Err(error) => {
+                    budget.release(INFLATE_BYTES);
+                    return Err(error);
+                }
+            };
             let name = std::str::from_utf8(entry.name_raw()).map_err(|_| format!("zip entry {position} has a name that is not UTF-8"))?.to_string();
             if entry.encrypted() {
                 return Err(format!("zip entry {name} is encrypted"));
@@ -282,6 +325,8 @@ impl<'a> StrictPackage<'a> {
                 if entry.size() != 0 || folder.is_empty() {
                     return Err(format!("zip folder entry {name} holds data"));
                 }
+                drop(entry);
+                budget.release(INFLATE_BYTES);
                 continue;
             }
             check_name(&name)?;
@@ -304,7 +349,8 @@ impl<'a> StrictPackage<'a> {
             if folded.insert(name.to_lowercase(), ()).is_some() {
                 return Err(format!("two parts named {name} apart from case"));
             }
-            budget.hold(ENTRY_BYTES.saturating_add(units(name.len()).saturating_mul(2)))?;
+            drop(entry);
+            budget.release(INFLATE_BYTES);
             index.insert(name, (position, read));
         }
         Ok(StrictPackage { archive, index, max_part: limits.max_part_bytes })
@@ -325,7 +371,7 @@ impl<'a> StrictPackage<'a> {
         if size > self.max_part {
             return Err(format!("part {name} decompresses past the size limit"));
         }
-        budget.hold(size)?;
+        budget.hold(size.saturating_add(INFLATE_BYTES))?;
         let read = (|| -> Result<Vec<u8>, String> {
             let mut entry = self.archive.by_index(position).map_err(|error| format!("zip entry {name} unreadable: {error}"))?;
             let mut bytes = Vec::with_capacity(usize::try_from(size).map_err(|_| "a part too large".to_string())?);
@@ -336,6 +382,7 @@ impl<'a> StrictPackage<'a> {
             budget.work(ENTRY_WORK.saturating_add(size / BYTES_PER_UNIT_INFLATED))?;
             Ok(bytes)
         })();
+        budget.release(INFLATE_BYTES);
         if read.is_err() {
             budget.release(size);
         }
@@ -358,6 +405,23 @@ pub(super) fn same_bytes(
         return Ok(false);
     }
     budget.work(2 * ENTRY_WORK).map_err(InspectError::Edited)?;
+    // Two streams open and two chunks, while the part is compared.
+    let held = 2 * INFLATE_BYTES + 2 * 16 * 1024;
+    budget.hold(held).map_err(InspectError::Edited)?;
+    let same = compare_streams(base, edited, name, base_position, base_size, edited_position, budget);
+    budget.release(held);
+    same
+}
+
+fn compare_streams(
+    base: &mut StrictPackage<'_>,
+    edited: &mut StrictPackage<'_>,
+    name: &str,
+    base_position: usize,
+    base_size: u64,
+    edited_position: usize,
+    budget: &mut Budget,
+) -> Result<bool, InspectError> {
     let unreadable = |error: String| format!("zip entry {name} unreadable: {error}");
     let mut before = base.archive.by_index(base_position).map_err(|error| InspectError::Base(unreadable(error.to_string())))?;
     let mut after = edited.archive.by_index(edited_position).map_err(|error| InspectError::Edited(unreadable(error.to_string())))?;

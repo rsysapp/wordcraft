@@ -227,7 +227,7 @@ fn the_inspection_never_holds_more_than_it_charged() {
     for (name, base, edited) in cases() {
         let baseline = reset_peak();
         let started = Instant::now();
-        let (result, charged) = inspect_measured(&base, &edited);
+        let (result, charged, _work) = inspect_measured(&base, &edited);
         let elapsed = started.elapsed();
         let held = peak().saturating_sub(baseline) as u64;
         let ratio = held as f64 / charged.max(1) as f64;

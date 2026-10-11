@@ -68,6 +68,10 @@ impl Rels {
         Ok(Rels { by_id })
     }
 
+    pub(super) fn len(&self) -> usize {
+        self.by_id.len()
+    }
+
     pub(super) fn set(&self) -> BTreeSet<&Rel> {
         self.by_id.values().collect()
     }
@@ -232,6 +236,10 @@ pub(super) struct Canon<'a> {
 }
 
 /// An attribute's value as compared.
+/// Memory held by canonical hashing, one start tag at a time: its attributes in order, in a vector
+/// that grows by doubling (old and new room meeting while it moves).
+pub(super) const HASHING_BYTES: u64 = 3 * (super::xml::MAX_ATTRIBUTES * std::mem::size_of::<(&'static str, Value<'static>)>()) as u64;
+
 enum Value<'v> {
     Plain(&'v str),
     Rel(&'v str),

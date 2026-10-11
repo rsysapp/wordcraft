@@ -6,9 +6,13 @@ use std::collections::{BTreeMap, HashMap};
 
 use super::budget::{Budget, units};
 
-/// Memory charged for each comment kept, besides its strings and identities; and for each entry of
-/// the paragraph map used while reading.
+/// Memory charged for each comment kept, besides its strings and identities.
 const COMMENT_BYTES: u64 = 320;
+/// Memory charged for each entry of the paragraph map used while reading, besides its strings.
+const MAP_BYTES: u64 = 128;
+/// Memory charged for each attribute copied while a comment's attributes are compared, besides its
+/// value: its entry, in a vector that grows by doubling.
+const ATTRIBUTE_COPY_BYTES: u64 = 2 * std::mem::size_of::<(std::rc::Rc<str>, String)>() as u64;
 use super::digest::{Digest, Hasher};
 use super::opc::{Canon, finish};
 use super::xml::{XEl, XNode, is_space};
@@ -32,6 +36,14 @@ pub(super) type Comments = BTreeMap<String, Comment>;
 
 /// The comments of `w:comments`, with their state from `w15:commentsEx`.
 pub(super) fn read(comments: &XEl, extended: Option<&XEl>, canon: &Canon<'_>, budget: &mut Budget) -> Result<Comments, String> {
+    // The paragraph map lives only while reading: held, then released.
+    let mut map_held = 0u64;
+    let read = read_held(comments, extended, canon, budget, &mut map_held);
+    budget.release(map_held);
+    read
+}
+
+fn read_held(comments: &XEl, extended: Option<&XEl>, canon: &Canon<'_>, budget: &mut Budget, map_held: &mut u64) -> Result<Comments, String> {
     if &*comments.name != "w:comments" {
         return Err("a comments part without w:comments".into());
     }
@@ -47,10 +59,16 @@ pub(super) fn read(comments: &XEl, extended: Option<&XEl>, canon: &Canon<'_>, bu
             XNode::El(el) => return Err(format!("{} in the comments part", el.name)),
         };
         let id = el.attr("w:id").ok_or("a comment without an id")?.to_string();
+        budget.work(200)?;
+        // The attributes copied for the digest, held while it is made.
+        let copied = el.attrs.iter().fold(0u64, |held, (_, value)| held.saturating_add(ATTRIBUTE_COPY_BYTES).saturating_add(units(value.len())));
+        budget.hold(copied)?;
         let without_id =
             XEl { name: el.name.clone(), attrs: el.attrs.iter().filter(|(key, _)| &**key != "w:id").cloned().collect(), kids: Vec::new() };
-        budget.work(200)?;
-        let meta = canon.start_digest(&without_id, budget)?;
+        let meta = canon.start_digest(&without_id, budget);
+        drop(without_id);
+        budget.release(copied);
+        let meta = meta?;
         let mut content = Hasher::default();
         for node in &el.kids {
             match node {
@@ -64,7 +82,9 @@ pub(super) fn read(comments: &XEl, extended: Option<&XEl>, canon: &Canon<'_>, bu
         let strings = id.len().saturating_add(el.attr("w:author").map_or(0, str::len)).saturating_mul(2);
         budget.hold(COMMENT_BYTES.saturating_add(units(strings)).saturating_add(meta.held()).saturating_add(content.held()))?;
         if let Some(paragraph) = el.els().filter(|child| &*child.name == "w:p").last().and_then(|p| p.attr("w14:paraId")) {
-            budget.hold(COMMENT_BYTES.saturating_add(units(paragraph.len().saturating_add(id.len()))))?;
+            let entry = MAP_BYTES.saturating_add(units(paragraph.len().saturating_add(id.len())));
+            budget.hold(entry)?;
+            *map_held = map_held.saturating_add(entry);
             by_paragraph.entry(paragraph.to_string()).and_modify(|entry| *entry = None).or_insert_with(|| Some(id.clone()));
         }
         let comment = Comment { author: el.attr("w:author").unwrap_or("").to_string(), meta, content, done: false, parent: None };

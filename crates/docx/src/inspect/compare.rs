@@ -14,10 +14,14 @@ use std::hash::{BuildHasher, Hasher as _};
 
 use super::LossKind;
 use super::budget::{Budget, units};
-use super::diff::{Step, script};
+use super::diff::{Step, script, script_bytes};
 use super::digest::Hasher;
 use super::opc::finish;
 use super::story::{Context, EMPTY, FormatRev, Item, MARK_BASE, MarkKind, Tables, Wrap, WrapKind, is_bidi_control};
+
+/// Memory charged for the open fields while contexts are worked out: at most `MAX_FIELD_DEPTH`
+/// hashers.
+const FRAMES_BYTES: u64 = 64 * 1024;
 
 /// Fields nested deeper than this are refused: no document needs them, and each open field's code
 /// is followed character by character.
@@ -33,11 +37,29 @@ pub(super) struct Projector<'a> {
     pub new_comments: &'a BTreeSet<String>,
     stacks: HashMap<u32, Option<u32>>,
     formats: HashMap<u32, u32>,
+    /// Memory its caches took since it was last charged.
+    pending: u64,
 }
+
+/// Memory charged for each entry of a cache or map kept while comparing: the entry and its share
+/// of the table's spare room.
+pub(super) const CACHE_BYTES: u64 = 64;
+/// Memory charged for each record an inspection reports or tallies (an added part, a loss, a
+/// changed content type or relationship, an author's counts), besides its strings: the record in
+/// its map or growing vector, and its copy into the answer.
+pub(super) const RECORD_BYTES: u64 = 256;
+/// Memory charged for each change the tally finds resolved: its entry in a set whose nodes may be
+/// half empty.
+const RESOLUTION_BYTES: u64 = 3 * std::mem::size_of::<Resolution>() as u64;
 
 impl<'a> Projector<'a> {
     pub(super) fn new(new_pairs: &'a Pairs, new_comments: &'a BTreeSet<String>) -> Self {
-        Projector { new_pairs, new_comments, stacks: HashMap::new(), formats: HashMap::new() }
+        Projector { new_pairs, new_comments, stacks: HashMap::new(), formats: HashMap::new(), pending: 0 }
+    }
+
+    /// Hold what the caches took since the last charge.
+    pub(super) fn charge(&mut self, budget: &mut Budget) -> Result<(), String> {
+        budget.hold(std::mem::take(&mut self.pending))
     }
 
     pub(super) fn is_new(&self, author: u32, date: u32) -> bool {
@@ -65,6 +87,7 @@ impl<'a> Projector<'a> {
             }
         };
         self.stacks.insert(id, projected);
+        self.pending = self.pending.saturating_add(CACHE_BYTES);
         projected
     }
 
@@ -88,11 +111,14 @@ impl<'a> Projector<'a> {
                     }
                 }
                 format.slots.retain(|slot| slot.value != EMPTY || slot.rev.is_some());
+                // Which change hides it is a fact about the save, not what is compared.
+                format.hidden_by = None;
                 tables.format(format)
             }
             None => id,
         };
         self.formats.insert(id, projected);
+        self.pending = self.pending.saturating_add(CACHE_BYTES);
         projected
     }
 
@@ -117,6 +143,7 @@ impl<'a> Projector<'a> {
         if out_of_work {
             return Err(super::budget::TOO_MUCH_WORK.into());
         }
+        self.charge(budget)?;
         tables.charge(budget)
     }
 }
@@ -153,7 +180,9 @@ pub(super) fn assign_contexts(
     budget: &mut Budget,
 ) -> Result<(), String> {
     // Fields, forwards: an item is outside any field, in a field's code, or in its result.
-    budget.hold(units(items.len()).saturating_mul(4))?;
+    // Each item's field description (four bytes), and the open fields' code so far.
+    let fields_held = units(items.len()).saturating_mul(4).saturating_add(FRAMES_BYTES);
+    budget.hold(fields_held)?;
     let mut fields: Vec<u32> = Vec::with_capacity(items.len());
     let mut frames: Vec<Frame> = Vec::new();
     let mut current = EMPTY;
@@ -222,7 +251,7 @@ pub(super) fn assign_contexts(
         item.context =
             tables.context(Context { field, paragraph: paragraph.0, paragraph_old: paragraph.1, section: section.0, section_old: section.1 });
     }
-    budget.release(units(items.len()).saturating_mul(4));
+    budget.release(fields_held);
     tables.charge(budget)
 }
 
@@ -236,6 +265,9 @@ pub(super) struct Holds {
     pub bidi_controls: u32,
     pub objects: u32,
 }
+
+/// Memory charged for each move followed: its entry and the two hashers of what left and arrived.
+const MOVE_BYTES: u64 = 2 * 512 + 64;
 
 /// The author of the save's innermost insertion around a stack, and the save's move it is in.
 type StackFacts = (Option<u32>, Option<(bool, u32, u32)>);
@@ -251,9 +283,11 @@ pub(super) fn facts(
 ) -> Result<u32, String> {
     let mut stacks: HashMap<u32, StackFacts> = HashMap::new();
     let mut moves: BTreeMap<(u32, u32), (Hasher, Hasher)> = BTreeMap::new();
-    let mut hidden_formats: HashMap<u32, Vec<u32>> = HashMap::new();
     for item in items {
         budget.work(2)?;
+        if !stacks.contains_key(&item.wraps) {
+            budget.hold(CACHE_BYTES)?;
+        }
         let (inserter, moved) = *stacks.entry(item.wraps).or_insert_with(|| {
             let wraps: Vec<Wrap> = tables.wraps_of(item.wraps);
             let new = |wrap: &&Wrap| new_pairs.contains(&(wrap.author, wrap.date));
@@ -266,23 +300,18 @@ pub(super) fn facts(
             (inserter, moved)
         });
         if let Some((arrived, author, date)) = moved {
+            if !moves.contains_key(&(author, date)) {
+                budget.hold(MOVE_BYTES)?;
+            }
             let (from, to) = moves.entry((author, date)).or_default();
             if arrived { to } else { from }.update(&item.piece.to_le_bytes());
         }
-        // A tracked formatting change of the save that hides what it formats.
-        let hiders = hidden_formats.entry(item.format).or_insert_with(|| match tables.format_of(item.format) {
-            Some(format) if format.hidden => format
-                .slots
-                .iter()
-                .filter(|slot| matches!(slot.name, "rPr" | "pPr.rPr"))
-                .filter_map(|slot| slot.rev)
-                .filter(|rev| new_pairs.contains(&(rev.author, rev.date)) && !rev.old_hidden)
-                .map(|rev| rev.author)
-                .collect(),
-            _ => Vec::new(),
-        });
-        for author in hiders.iter() {
-            let entry = holds.entry(*author).or_default();
+        // A tracked formatting change of the save that hides what it formats (directly or
+        // through a style).
+        if let Some((author, date)) = tables.format_of(item.format).and_then(|format| format.hidden_by)
+            && new_pairs.contains(&(author, date))
+        {
+            let entry = holds.entry(author).or_default();
             entry.hidden = entry.hidden.saturating_add(1);
         }
         let Some(author) = inserter else { continue };
@@ -361,6 +390,9 @@ pub(super) fn field_structure(
     };
     for item in items {
         budget.work(3 + units(open.len()))?;
+        if !roles.contains_key(&item.wraps) {
+            budget.hold(CACHE_BYTES)?;
+        }
         let (author, inserted, deleted) = *roles.entry(item.wraps).or_insert_with(|| {
             let wraps = tables.wraps_of(item.wraps);
             let new: Vec<&Wrap> = wraps.iter().filter(|wrap| new_pairs.contains(&(wrap.author, wrap.date))).collect();
@@ -410,6 +442,8 @@ pub(super) enum Resolution {
 /// What the differences mean, summed over every story.
 #[derive(Default)]
 pub(super) struct Tally {
+    /// Memory its sets and maps took since it was last charged.
+    pub pending: u64,
     pub untracked: u32,
     pub altered: u32,
     pub accepted: BTreeSet<Resolution>,
@@ -431,9 +465,9 @@ struct Story<'a> {
     tally: &'a mut Tally,
 }
 
-impl Story<'_> {
+impl<'a> Story<'a> {
     /// The comment a mark anchors, if it is an (empty) comment anchor.
-    fn comment(&self, piece: u32) -> Option<&str> {
+    fn comment(&self, piece: u32) -> Option<&'a str> {
         self.tables.mark_info(piece).and_then(|mark| mark.comment.as_deref())
     }
 
@@ -486,10 +520,9 @@ impl Story<'_> {
             if kept_in_order {
                 for wrap in gone {
                     let resolution = Resolution::Wrap(*wrap);
-                    if wrap.kind.inserts() {
-                        self.tally.accepted.insert(resolution);
-                    } else {
-                        self.tally.rejected.insert(resolution);
+                    let fresh = if wrap.kind.inserts() { self.tally.accepted.insert(resolution) } else { self.tally.rejected.insert(resolution) };
+                    if fresh {
+                        self.tally.pending = self.tally.pending.saturating_add(RESOLUTION_BYTES);
                     }
                 }
             } else {
@@ -511,10 +544,14 @@ impl Story<'_> {
                     // The base's formatting change resolved: accepted keeps the new formatting,
                     // rejected restores the old.
                     (Some(rev), None) if after_value == before_value => {
-                        self.tally.accepted.insert(Resolution::Format(name, *rev));
+                        if self.tally.accepted.insert(Resolution::Format(name, *rev)) {
+                            self.tally.pending = self.tally.pending.saturating_add(RESOLUTION_BYTES);
+                        }
                     }
                     (Some(rev), None) if after_value == rev.old => {
-                        self.tally.rejected.insert(Resolution::Format(name, *rev));
+                        if self.tally.rejected.insert(Resolution::Format(name, *rev)) {
+                            self.tally.pending = self.tally.pending.saturating_add(RESOLUTION_BYTES);
+                        }
                     }
                     _ if before_value != after_value => untracked = true,
                     _ => altered = true,
@@ -523,7 +560,10 @@ impl Story<'_> {
         }
         match comment {
             Some(id) if untracked || altered => {
-                self.tally.comments_altered.insert(id);
+                let held = CACHE_BYTES.saturating_add(units(id.len()));
+                if self.tally.comments_altered.insert(id) {
+                    self.tally.pending = self.tally.pending.saturating_add(held);
+                }
             }
             _ => {
                 if untracked {
@@ -541,22 +581,30 @@ impl Story<'_> {
         if let Some(id) = self.comment(before.piece) {
             // An empty anchor of a removed comment goes with it; any other anchor gone alters its
             // comment.
-            if !self.comments.removed.contains(id) {
-                self.tally.comments_altered.insert(id.to_string());
+            if !self.comments.removed.contains(id) && self.tally.comments_altered.insert(id.to_string()) {
+                self.tally.pending = self.tally.pending.saturating_add(CACHE_BYTES).saturating_add(units(id.len()));
             }
             return;
         }
         match self.tables.wraps_of(before.wraps).last() {
             // Gone with its change: an insertion rejected, a deletion accepted.
-            Some(wrap) if wrap.kind.inserts() => {
-                self.tally.rejected.insert(Resolution::Wrap(*wrap));
-            }
             Some(wrap) => {
-                self.tally.accepted.insert(Resolution::Wrap(*wrap));
+                let fresh = if wrap.kind.inserts() {
+                    self.tally.rejected.insert(Resolution::Wrap(*wrap))
+                } else {
+                    self.tally.accepted.insert(Resolution::Wrap(*wrap))
+                };
+                if fresh {
+                    self.tally.pending = self.tally.pending.saturating_add(RESOLUTION_BYTES);
+                }
             }
             None => match self.tables.mark_info(before.piece) {
                 Some(mark) => {
                     let key = (self.part.to_string(), LossKind::ElementMissing, Some(mark.element.to_string()));
+                    if !self.tally.losses.contains_key(&key) {
+                        self.tally.pending =
+                            self.tally.pending.saturating_add(RECORD_BYTES).saturating_add(units(self.part.len().saturating_add(mark.element.len())));
+                    }
                     let count = self.tally.losses.entry(key).or_default();
                     *count = count.saturating_add(1);
                 }
@@ -570,7 +618,9 @@ impl Story<'_> {
         if let Some(id) = self.comment(after.piece)
             && self.comments.base.contains(id)
         {
-            self.tally.comments_altered.insert(id.to_string());
+            if self.tally.comments_altered.insert(id.to_string()) {
+                self.tally.pending = self.tally.pending.saturating_add(CACHE_BYTES).saturating_add(units(id.len()));
+            }
             return;
         }
         if after.wraps == EMPTY {
@@ -688,7 +738,29 @@ fn compare_tokens(
         (Some(a), Some(b)) => a.hash == b.hash && pieces(base, a) == pieces(edited, b),
         _ => false,
     };
-    let Some(steps) = script(base_tokens.len(), edited_tokens.len(), &same_token, max_changes, budget) else { return false };
+    let steps_held = script_bytes(base_tokens.len(), edited_tokens.len(), max_changes);
+    if !budget.try_hold(steps_held) {
+        return false;
+    }
+    let Some(steps) = script(base_tokens.len(), edited_tokens.len(), &same_token, max_changes, budget) else {
+        budget.release(steps_held);
+        return false;
+    };
+    let done = walk_tokens(base, edited, base_tokens, edited_tokens, steps, max_changes, budget, story);
+    budget.release(steps_held);
+    done
+}
+
+fn walk_tokens(
+    base: &[Item],
+    edited: &[Item],
+    base_tokens: &[Token],
+    edited_tokens: &[Token],
+    steps: Vec<Step>,
+    max_changes: usize,
+    budget: &mut Budget,
+    story: &mut Story<'_>,
+) -> bool {
     // Runs of deleted and inserted tokens between matched ones, compared character by character.
     let mut deleted: Option<(usize, usize)> = None;
     let mut inserted: Option<(usize, usize)> = None;
@@ -726,7 +798,20 @@ fn compare_stretch(base: &[Item], edited: &[Item], max_changes: usize, budget: &
         return true;
     }
     let same = |i: usize, j: usize| matches!((base.get(i), edited.get(j)), (Some(a), Some(b)) if a.piece == b.piece);
-    let Some(steps) = script(base.len(), edited.len(), &same, max_changes, budget) else { return false };
+    let steps_held = script_bytes(base.len(), edited.len(), max_changes);
+    if !budget.try_hold(steps_held) {
+        return false;
+    }
+    let Some(steps) = script(base.len(), edited.len(), &same, max_changes, budget) else {
+        budget.release(steps_held);
+        return false;
+    };
+    let done = tally_steps(base, edited, steps, story);
+    budget.release(steps_held);
+    done
+}
+
+fn tally_steps(base: &[Item], edited: &[Item], steps: Vec<Step>, story: &mut Story<'_>) -> bool {
     for step in steps {
         match step {
             Step::Same { left, right, len } => {

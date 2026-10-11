@@ -60,6 +60,18 @@ pub(super) fn script(n: usize, m: usize, same: &dyn Fn(usize, usize) -> bool, ma
     Some(steps)
 }
 
+/// Memory charged for each row of the trace besides its positions: the row vector's header in the
+/// trace, three times over (the trace grows by doubling, so old and new room meet while it moves).
+const ROW_BYTES: u64 = 3 * std::mem::size_of::<Vec<i64>>() as u64;
+
+/// The memory an edit script of a diff bounded by `max_changes` between `n` and `m` elements
+/// can take: each edit and each run of matches between them, twice (the walk back's steps, made to
+/// size, and their copy with the common prefix and suffix).
+pub(super) fn script_bytes(n: usize, m: usize, max_changes: usize) -> u64 {
+    let steps = units(max_changes.min(n.saturating_add(m))).saturating_mul(2).saturating_add(3);
+    steps.saturating_mul(2 * std::mem::size_of::<Step>() as u64)
+}
+
 /// A position no path reached.
 const NONE: i64 = -1;
 
@@ -110,10 +122,12 @@ fn search(
     for d in 0..=limit {
         let width = usize::try_from(2 * d + 1).ok()?;
         // The frontier is kept for the walk back: held, and worked, before it is allocated.
-        if !work.spend(units(width)) || !work.try_hold(units(width).saturating_mul(8)) {
+        // A row: its x positions and its vector's header in the trace.
+        let row = units(width).saturating_mul(8).saturating_add(ROW_BYTES);
+        if !work.spend(units(width)) || !work.try_hold(row) {
             return None;
         }
-        *held = held.saturating_add(units(width).saturating_mul(8));
+        *held = held.saturating_add(row);
         let mut frontier = vec![NONE; width];
         let mut k = -d;
         while k <= d {
@@ -142,7 +156,9 @@ fn search(
 }
 
 fn backtrack(trace: &[Vec<i64>], n: i64, m: i64) -> Option<Vec<Step>> {
-    let mut steps = Vec::new();
+    // An edit and the run before it per row, and the run before the first edit: made to size, so
+    // the steps never hold more than `script_bytes` charged for them.
+    let mut steps = Vec::with_capacity(trace.len().saturating_mul(2).saturating_add(1));
     let run = |x: i64, y: i64, len: i64| -> Option<Option<Step>> {
         Some((len > 0).then_some(Step::Same { left: usize::try_from(x).ok()?, right: usize::try_from(y).ok()?, len: usize::try_from(len).ok()? }))
     };

@@ -53,6 +53,8 @@ mod diff;
 mod digest;
 mod opc;
 mod package;
+#[doc(hidden)]
+pub mod probe;
 mod story;
 mod xml;
 
@@ -63,11 +65,11 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use crate::package::{ReadLimits, rt};
 use budget::Budget;
-use compare::{CommentIds, Holds, Pairs, Projector, Tally, assign_contexts, compare_story, facts, field_structure};
+use compare::{CommentIds, Holds, Pairs, Projector, RECORD_BYTES, Tally, assign_contexts, compare_story, facts, field_structure};
 use digest::{Digest, Hasher};
 use opc::{Bookmarks, Canon, ContentTypes, Rel, Rels};
 use package::StrictPackage;
-use story::{Item, Revisions, Tables};
+use story::{Item, Revisions, StyleHiding, Tables};
 use xml::{Limits, Names};
 
 /// The most token differences compared in one diff; beyond it the comparison stops and says so, so
@@ -100,10 +102,8 @@ pub const MEMORY_FLOOR: u64 = 384 << 20;
 /// Work charged for each part, besides its bytes: classifying it, its map entries, its tree's setup.
 const PART_WORK: u64 = 2_000;
 
-/// Memory every inspection holds whatever it reads.
-const FIXED_BYTES: u64 = 1 << 20;
-
-/// Memory charged for each part's entries in what a side keeps of it, besides its name.
+/// Memory charged for each part a side keeps, besides its name twice: its entries in the kinds map
+/// and in the stories or canonical map.
 const PART_BYTES: u64 = 384;
 
 /// Why a package over its element budget is unreadable.
@@ -306,19 +306,19 @@ pub fn inspect_within(base: &[u8], edited: &[u8], limits: &ReadLimits, max_chang
     inspect_budgeted(base, edited, limits, max_changes, &mut budget)
 }
 
-/// [`inspect`], also answering the most memory the inspection charged to its budget. For tests that
-/// check, with a counting allocator, that the inspection never holds more than it charged.
+/// [`inspect`], also answering the most memory the inspection charged to its budget and the work it
+/// spent. For tests that check, with a counting allocator, that the inspection never holds more
+/// than it charged, and for measuring the bounds.
 #[doc(hidden)]
-pub fn inspect_measured(base: &[u8], edited: &[u8]) -> (Result<Inspection, InspectError>, u64) {
+pub fn inspect_measured(base: &[u8], edited: &[u8]) -> (Result<Inspection, InspectError>, u64, u64) {
     let mut budget = Budget::new(MAX_WORK, memory_limit(base.len(), edited.len()));
     let result = inspect_budgeted(base, edited, &INSPECT_LIMITS, MAX_CHANGES, &mut budget);
-    (result, budget.peak())
+    (result, budget.peak(), MAX_WORK.saturating_sub(budget.work_left()))
 }
 
 fn inspect_budgeted(base: &[u8], edited: &[u8], limits: &ReadLimits, max_changes: usize, budget: &mut Budget) -> Result<Inspection, InspectError> {
-    // What any inspection holds besides what it charges piece by piece: decompressor windows, the
-    // reader's state, small tables.
-    budget.hold(FIXED_BYTES).map_err(InspectError::Edited)?;
+    // Canonical hashing's working room, held for the whole inspection.
+    budget.hold(opc::HASHING_BYTES).map_err(InspectError::Edited)?;
     let mut names = Names::default();
     let mut tables = Tables::new();
     let base = Side::read(base, limits, &mut names, &mut tables, budget).map_err(InspectError::Base)?;
@@ -362,11 +362,44 @@ struct Side<'a> {
     /// The parts the main part names as its comments and their state.
     comment_parts: BTreeSet<String>,
     comments: comments::Comments,
+    kept: Kept,
+    revisions: Revisions,
+}
+
+/// A part as a side keeps it.
+enum Part {
+    Story(Vec<Item>),
+    /// Its compared form, as a digest.
+    Xml(Digest),
+    Binary,
+}
+
+/// What a side keeps of its parts: how each is compared, and its items or compared form.
+#[derive(Default)]
+struct Kept {
     kinds: BTreeMap<String, Kind>,
     stories: BTreeMap<String, Vec<Item>>,
-    /// Each other XML part's compared form, as a digest.
     canonical: BTreeMap<String, Digest>,
-    revisions: Revisions,
+}
+
+impl Kept {
+    /// Keep a part, its entries charged before they are made.
+    fn keep(&mut self, name: &str, part: Part, budget: &mut Budget) -> Result<(), String> {
+        budget.hold(PART_BYTES.saturating_add(budget::units(name.len()).saturating_mul(2)))?;
+        let kind = match part {
+            Part::Story(items) => {
+                self.stories.insert(name.to_string(), items);
+                Kind::Story
+            }
+            Part::Xml(digest) => {
+                self.canonical.insert(name.to_string(), digest);
+                Kind::Xml
+            }
+            Part::Binary => Kind::Binary,
+        };
+        self.kinds.insert(name.to_string(), kind);
+        Ok(())
+    }
 }
 
 /// The one internal target of `source`'s relationship of `kind`, as a part name; `None` when there
@@ -382,6 +415,13 @@ fn single_target(rels: &BTreeMap<String, Rels>, source: &str, kind: &str) -> Res
     }
     let dir = source.rsplit_once('/').map(|(dir, _)| dir).unwrap_or("");
     Ok(Some(crate::package::resolve(dir, &rel.target)))
+}
+
+/// The part names, copied to be read in turn, and what they hold (released by the caller).
+fn part_names(package: &StrictPackage<'_>, budget: &mut Budget) -> Result<(Vec<String>, u64), String> {
+    let held = names_held(package.names(), 1);
+    budget.hold(held)?;
+    Ok((package.names().map(str::to_string).collect(), held))
 }
 
 /// A part's bytes, held only while it is parsed.
@@ -402,7 +442,7 @@ impl<'a> Side<'a> {
     fn read(bytes: &'a [u8], limits: &ReadLimits, names: &mut Names, tables: &mut Tables, budget: &mut Budget) -> Result<Side<'a>, String> {
         let mut package = StrictPackage::open(bytes, limits, budget)?;
         let mut limits = Limits { elements_left: limits.max_elements, max_depth: limits.max_depth.min(crate::xml::MAX_DEPTH) };
-        let all: Vec<String> = package.names().map(str::to_string).collect();
+        let (all, all_held) = part_names(&package, budget)?;
 
         let parsed = parse_part(&mut package, "[Content_Types].xml", names, &mut limits, budget)?;
         let types = ContentTypes::parse(&parsed.root, budget);
@@ -444,18 +484,24 @@ impl<'a> Side<'a> {
         let app = single_target(&rels, "", rt::APP)?.unwrap_or_else(|| "docProps/app.xml".into());
         let core = single_target(&rels, "", rt::CORE)?.unwrap_or_else(|| "docProps/core.xml".into());
 
+        // What styles hide, read first: the stories' hidden text depends on it.
+        let styles = single_target(&rels, &main, rt::STYLES)?.unwrap_or_else(|| "word/styles.xml".into());
+        let hiding = if package.has(&styles) && opc::is_xml(&styles, types.of(&styles)) {
+            let parsed = parse_part(&mut package, &styles, names, &mut limits, budget)?;
+            let hiding = StyleHiding::read(&parsed.root, budget);
+            budget.release(parsed.held);
+            hiding.map_err(|error| format!("{styles}: {error}"))?
+        } else {
+            StyleHiding::default()
+        };
         let empty = Rels::default();
         let mut revisions = Revisions::default();
-        let mut kinds = BTreeMap::new();
-        let mut stories = BTreeMap::new();
-        let mut canonical = BTreeMap::new();
+        let mut kept = Kept::default();
         let mut items_left = MAX_STORY_ITEMS;
         for name in &all {
             if name == "[Content_Types].xml" || opc::rels_source(name).is_some() || comment_parts.contains(name) {
                 continue;
             }
-            // Its entries in the kinds, stories and canonical maps, and the names they keep.
-            budget.hold(PART_BYTES.saturating_add(budget::units(name.len()).saturating_mul(3)))?;
             budget.work(PART_WORK)?;
             let content_type = types.of(name);
             let part_rels = rels.get(name.as_str()).unwrap_or(&empty);
@@ -463,12 +509,11 @@ impl<'a> Side<'a> {
                 let parsed = parse_part(&mut package, name, names, &mut limits, budget)?;
                 let marks: Bookmarks = opc::bookmarks(&parsed.root);
                 let canon = Canon { rels: part_rels, bookmarks: Some(&marks) };
-                let items = story::walk(&parsed.root, &canon, tables, &mut revisions, &mut items_left, parsed.most_items, budget)
+                let items = story::walk(&parsed.root, &canon, tables, &mut revisions, &mut items_left, parsed.most_items, &hiding, budget)
                     .map_err(|error| format!("{name}: {error}"));
                 drop(parsed.root);
                 budget.release(parsed.held);
-                kinds.insert(name.clone(), Kind::Story);
-                stories.insert(name.clone(), items?);
+                kept.keep(name, Part::Story(items?), budget)?;
             } else if opc::is_xml(name, content_type) {
                 let parsed = parse_part(&mut package, name, names, &mut limits, budget)?;
                 let root = &parsed.root;
@@ -491,10 +536,9 @@ impl<'a> Side<'a> {
                     canon.digest(root, &|_| true, budget)
                 };
                 budget.release(parsed.held);
-                kinds.insert(name.clone(), Kind::Xml);
-                canonical.insert(name.clone(), digest?);
+                kept.keep(name, Part::Xml(digest?), budget)?;
             } else {
-                kinds.insert(name.clone(), Kind::Binary);
+                kept.keep(name, Part::Binary, budget)?;
             }
         }
         let comments = match &comments_part {
@@ -514,7 +558,9 @@ impl<'a> Side<'a> {
             None => comments::Comments::new(),
         };
         tables.charge(budget)?;
-        Ok(Side { package, types, rels, main, comment_parts, comments, kinds, stories, canonical, revisions })
+        drop(all);
+        budget.release(all_held);
+        Ok(Side { package, types, rels, main, comment_parts, comments, kept, revisions })
     }
 
     /// The relationships compared for `source`: the main part's links to its comments parts are
@@ -546,112 +592,29 @@ fn compare(
         }
     }
 
-    // Parts: added, missing, altered.
-    let all: BTreeSet<String> = base.kinds.keys().chain(edited.kinds.keys()).cloned().collect();
-    let mut story_parts = Vec::new();
-    for name in &all {
-        let mut altered = false;
-        match (base.kinds.get(name).copied(), edited.kinds.get(name).copied()) {
-            (None, Some(_)) => inspection.added_parts.push(AddedPart { part: name.clone(), content_type: edited.types.of(name).map(str::to_string) }),
-            (Some(_), None) => {
-                *tally.losses.entry((name.clone(), LossKind::PartMissing, None)).or_default() += 1;
-            }
-            (Some(Kind::Story), Some(Kind::Story)) => story_parts.push(name.clone()),
-            (Some(Kind::Xml), Some(Kind::Xml)) => altered = base.canonical.get(name) != edited.canonical.get(name),
-            (Some(Kind::Binary), Some(Kind::Binary)) => altered = !package::same_bytes(&mut base.package, &mut edited.package, name, budget)?,
-            (Some(_), Some(_)) => altered = true,
-            (None, None) => {}
-        }
-        if altered {
-            *tally.losses.entry((name.clone(), LossKind::PartAltered, None)).or_default() += 1;
-        }
-        if base.kinds.contains_key(name) && edited.kinds.contains_key(name) {
-            let (before, after) = (base.types.of(name), edited.types.of(name));
-            if before != after {
-                inspection.content_types.push(ContentTypeChange {
-                    part: name.clone(),
-                    base: before.map(str::to_string),
-                    edited: after.map(str::to_string),
-                });
-            }
-        }
-    }
-
-    // Relationships.
-    let sources: BTreeSet<String> = base.rels.keys().chain(edited.rels.keys()).cloned().collect();
-    for source in &sources {
-        let (before, after) = (base.relationship_set(source), edited.relationship_set(source));
-        for (change, rel) in
-            before.difference(&after).map(|rel| (Change::Removed, rel)).chain(after.difference(&before).map(|rel| (Change::Added, rel)))
-        {
-            inspection.changed_relationships.push(RelationshipChange {
-                source: source.clone(),
-                change,
-                kind: rel.kind.clone(),
-                target: rel.target.clone(),
-                external: rel.external,
-            });
-        }
-    }
-
-    // Comments.
-    let base_ids: BTreeSet<String> = base.comments.keys().cloned().collect();
-    let edited_ids: BTreeSet<String> = edited.comments.keys().cloned().collect();
-    let removed: BTreeSet<String> = base_ids.difference(&edited_ids).cloned().collect();
-    let new_comments: BTreeSet<String> = edited_ids.difference(&base_ids).cloned().collect();
-    let mut added: BTreeMap<String, u32> = BTreeMap::new();
-    let mut replies: BTreeMap<String, u32> = BTreeMap::new();
-    for id in &new_comments {
-        if let Some(comment) = edited.comments.get(id) {
-            let counts = if comment.parent.is_some() { &mut replies } else { &mut added };
-            let entry = counts.entry(comment.author.clone()).or_default();
-            *entry = entry.saturating_add(1);
-        }
-    }
-    for id in base_ids.intersection(&edited_ids) {
-        if base.comments.get(id) != edited.comments.get(id) {
-            tally.comments_altered.insert(id.clone());
-        }
-    }
-
-    // Revisions: the save's own are those whose author and date the base does not have.
-    let new_pairs: Pairs = edited.revisions.by_pair.keys().filter(|pair| !base.revisions.by_pair.contains_key(*pair)).copied().collect();
-    let mut by_author: BTreeMap<u32, AuthorRevisions> = BTreeMap::new();
-    for ((author, date), counts) in edited.revisions.by_pair.iter().filter(|(pair, _)| new_pairs.contains(*pair)) {
-        let entry =
-            by_author.entry(*author).or_insert_with(|| AuthorRevisions { author: tables.text_of(*author).to_string(), ..AuthorRevisions::default() });
-        entry.insertions = entry.insertions.saturating_add(counts.insertions);
-        entry.deletions = entry.deletions.saturating_add(counts.deletions);
-        entry.format_changes = entry.format_changes.saturating_add(counts.format_changes);
-        let date = tables.text_of(*date);
-        if date.is_empty() {
-            let elements = counts.insertions.saturating_add(counts.deletions).saturating_add(counts.format_changes);
-            entry.undated = entry.undated.saturating_add(elements);
-        } else {
-            if entry.earliest_date.as_deref().is_none_or(|earliest| date < earliest) {
-                entry.earliest_date = Some(date.to_string());
-            }
-            if entry.latest_date.as_deref().is_none_or(|latest| date > latest) {
-                entry.latest_date = Some(date.to_string());
-            }
-        }
-    }
+    let story_parts = compare_parts(&mut base, &mut edited, &mut inspection, &mut tally, budget)?;
+    compare_relationships(&base, &edited, &mut inspection, budget)?;
+    let CommentSets { base_ids, removed, new_comments, added, replies } = compare_comments(&base, &edited, &mut tally, budget)?;
+    let (new_pairs, mut by_author) = new_revisions(&base, &edited, tables, budget)?;
 
     // Stories.
     let ids = CommentIds { base: &base_ids, removed: &removed };
     let mut projector = Projector::new(&new_pairs, &new_comments);
     let mut holds: BTreeMap<u32, Holds> = BTreeMap::new();
     for name in &story_parts {
-        let (Some(mut before), Some(mut after)) = (base.stories.remove(name), edited.stories.remove(name)) else { continue };
+        let (Some(mut before), Some(mut after)) = (base.kept.stories.remove(name), edited.kept.stories.remove(name)) else { continue };
         let held = story::items_held(&before).saturating_add(story::items_held(&after));
         let compared = (|| -> Result<bool, String> {
             assign_contexts(&mut before, tables, &mut |_, format| format, budget)?;
             assign_contexts(&mut after, tables, &mut |tables, format| projector.format(tables, format), budget)?;
+            projector.charge(budget)?;
             let moves = facts(&after, tables, &new_pairs, &mut holds, budget)?;
             let fields = field_structure(&after, tables, &new_pairs, &mut holds, budget)?;
             tally.untracked = tally.untracked.saturating_add(moves).saturating_add(fields);
             projector.project(tables, &mut after, budget)?;
-            Ok(compare_story(name, &before, &after, tables, &ids, max_changes, budget, &mut tally))
+            let complete = compare_story(name, &before, &after, tables, &ids, max_changes, budget, &mut tally);
+            budget.hold(std::mem::take(&mut tally.pending))?;
+            Ok(complete)
         })();
         budget.release(held);
         match compared {
@@ -660,6 +623,9 @@ fn compare(
         }
     }
     for (author, held) in holds {
+        if !by_author.contains_key(&author) {
+            budget.hold(RECORD_BYTES.saturating_add(budget::units(tables.text_of(author).len()))).map_err(InspectError::Edited)?;
+        }
         let entry =
             by_author.entry(author).or_insert_with(|| AuthorRevisions { author: tables.text_of(author).to_string(), ..AuthorRevisions::default() });
         entry.hidden_text = held.hidden;
@@ -673,12 +639,210 @@ fn compare(
     inspection.altered_revisions = tally.altered;
     inspection.untracked_changes = tally.untracked;
     inspection.losses = tally.losses.into_iter().map(|((part, kind, element), count)| Loss { part, kind, element, count }).collect();
-    let altered: BTreeSet<&String> = tally.comments_altered.iter().filter(|id| !removed.contains(*id)).collect();
+    let altered = tally.comments_altered.iter().filter(|id| !removed.contains(*id)).count();
     inspection.comments = CommentChanges {
         added: added.into_iter().map(|(author, count)| AuthorCount { author, count }).collect(),
         replies: replies.into_iter().map(|(author, count)| AuthorCount { author, count }).collect(),
         removed: count(removed.len()),
-        altered: count(altered.len()),
+        altered: count(altered),
     };
     Ok(inspection)
+}
+
+/// Memory charged for each entry of a set or map of names built while comparing, besides the name.
+const SET_ENTRY_BYTES: u64 = 64;
+
+/// Memory charged for each set built while comparing, besides its entries: its first node, which
+/// has room for eleven.
+const SET_NODE_BYTES: u64 = 128;
+
+/// Memory charged for each story both sides have, besides its name: its entry in a vector that grows
+/// by doubling (old and new room meeting while it moves).
+const STORY_PART_BYTES: u64 = 3 * std::mem::size_of::<String>() as u64;
+
+/// Each key of two maps once, in order, without copying them.
+fn union<'k, V, W>(left: &'k BTreeMap<String, V>, right: &'k BTreeMap<String, W>) -> impl Iterator<Item = &'k String> + 'k {
+    let mut left = left.keys().peekable();
+    let mut right = right.keys().peekable();
+    std::iter::from_fn(move || match (left.peek(), right.peek()) {
+        (Some(one), Some(other)) => match one.cmp(other) {
+            std::cmp::Ordering::Less => left.next(),
+            std::cmp::Ordering::Greater => right.next(),
+            std::cmp::Ordering::Equal => {
+                right.next();
+                left.next()
+            }
+        },
+        (Some(_), None) => left.next(),
+        (None, _) => right.next(),
+    })
+}
+
+/// The memory a set of these names takes, `copies` times over.
+fn names_held<'n>(names: impl Iterator<Item = &'n str>, copies: u64) -> u64 {
+    names.fold(0u64, |held, name| held.saturating_add(SET_ENTRY_BYTES).saturating_add(budget::units(name.len()))).saturating_mul(copies)
+}
+
+/// Parts added, missing and altered, and their content types; answers the stories both sides have.
+fn compare_parts(
+    base: &mut Side<'_>,
+    edited: &mut Side<'_>,
+    inspection: &mut Inspection,
+    tally: &mut Tally,
+    budget: &mut Budget,
+) -> Result<Vec<String>, InspectError> {
+    let charge = |budget: &mut Budget, bytes: u64| budget.hold(bytes).map_err(InspectError::Edited);
+    let record =
+        |strings: &[Option<&str>]| strings.iter().flatten().fold(RECORD_BYTES, |held, string| held.saturating_add(budget::units(string.len())));
+    let mut story_parts = Vec::new();
+    for name in union(&base.kept.kinds, &edited.kept.kinds) {
+        let mut altered = false;
+        match (base.kept.kinds.get(name).copied(), edited.kept.kinds.get(name).copied()) {
+            (None, Some(_)) => {
+                let content_type = edited.types.of(name);
+                charge(budget, record(&[Some(name), content_type]))?;
+                inspection.added_parts.push(AddedPart { part: name.clone(), content_type: content_type.map(str::to_string) });
+            }
+            (Some(_), None) => {
+                charge(budget, record(&[Some(name)]))?;
+                *tally.losses.entry((name.clone(), LossKind::PartMissing, None)).or_default() += 1;
+            }
+            (Some(Kind::Story), Some(Kind::Story)) => {
+                charge(budget, STORY_PART_BYTES.saturating_add(budget::units(name.len())))?;
+                story_parts.push(name.clone());
+            }
+            (Some(Kind::Xml), Some(Kind::Xml)) => altered = base.kept.canonical.get(name) != edited.kept.canonical.get(name),
+            (Some(Kind::Binary), Some(Kind::Binary)) => altered = !package::same_bytes(&mut base.package, &mut edited.package, name, budget)?,
+            (Some(_), Some(_)) => altered = true,
+            (None, None) => {}
+        }
+        if altered {
+            charge(budget, record(&[Some(name)]))?;
+            *tally.losses.entry((name.clone(), LossKind::PartAltered, None)).or_default() += 1;
+        }
+        if base.kept.kinds.contains_key(name) && edited.kept.kinds.contains_key(name) {
+            let (before, after) = (base.types.of(name), edited.types.of(name));
+            if before != after {
+                charge(budget, record(&[Some(name), before, after]))?;
+                inspection.content_types.push(ContentTypeChange {
+                    part: name.clone(),
+                    base: before.map(str::to_string),
+                    edited: after.map(str::to_string),
+                });
+            }
+        }
+    }
+    Ok(story_parts)
+}
+
+/// Relationships added and removed, by source part.
+fn compare_relationships(base: &Side<'_>, edited: &Side<'_>, inspection: &mut Inspection, budget: &mut Budget) -> Result<(), InspectError> {
+    let charge = |budget: &mut Budget, bytes: u64| budget.hold(bytes).map_err(InspectError::Edited);
+    for source in union(&base.rels, &edited.rels) {
+        // Both sides' sets, held while they are compared: a node each at least, however few.
+        let count = |side: &Side<'_>| side.rels.get(source).map_or(0, Rels::len);
+        let sets = budget::units(count(base).saturating_add(count(edited))).saturating_mul(SET_ENTRY_BYTES).saturating_add(2 * SET_NODE_BYTES);
+        charge(budget, sets)?;
+        let (before, after) = (base.relationship_set(source), edited.relationship_set(source));
+        for (change, rel) in
+            before.difference(&after).map(|rel| (Change::Removed, rel)).chain(after.difference(&before).map(|rel| (Change::Added, rel)))
+        {
+            let strings = source.len().saturating_add(rel.kind.len()).saturating_add(rel.target.len());
+            charge(budget, RECORD_BYTES.saturating_add(budget::units(strings)))?;
+            inspection.changed_relationships.push(RelationshipChange {
+                source: source.clone(),
+                change,
+                kind: rel.kind.clone(),
+                target: rel.target.clone(),
+                external: rel.external,
+            });
+        }
+        budget.release(sets);
+    }
+    Ok(())
+}
+
+/// The comments of both sides, by id, and the comments the save added, by author.
+struct CommentSets {
+    base_ids: BTreeSet<String>,
+    removed: BTreeSet<String>,
+    new_comments: BTreeSet<String>,
+    added: BTreeMap<String, u32>,
+    replies: BTreeMap<String, u32>,
+}
+
+/// Which comments the save added, removed and altered (the altered in `tally`).
+fn compare_comments(base: &Side<'_>, edited: &Side<'_>, tally: &mut Tally, budget: &mut Budget) -> Result<CommentSets, InspectError> {
+    // Each side's ids, then those only one side has.
+    let ids = names_held(base.comments.keys().chain(edited.comments.keys()).map(String::as_str), 1);
+    budget.hold(ids).map_err(InspectError::Edited)?;
+    let base_ids: BTreeSet<String> = base.comments.keys().cloned().collect();
+    let edited_ids: BTreeSet<String> = edited.comments.keys().cloned().collect();
+    let only = names_held(base_ids.symmetric_difference(&edited_ids).map(String::as_str), 1);
+    budget.hold(only).map_err(InspectError::Edited)?;
+    let removed: BTreeSet<String> = base_ids.difference(&edited_ids).cloned().collect();
+    let new_comments: BTreeSet<String> = edited_ids.difference(&base_ids).cloned().collect();
+    let mut added: BTreeMap<String, u32> = BTreeMap::new();
+    let mut replies: BTreeMap<String, u32> = BTreeMap::new();
+    for id in &new_comments {
+        if let Some(comment) = edited.comments.get(id) {
+            let counts = if comment.parent.is_some() { &mut replies } else { &mut added };
+            if !counts.contains_key(&comment.author) {
+                budget.hold(RECORD_BYTES.saturating_add(budget::units(comment.author.len()))).map_err(InspectError::Edited)?;
+            }
+            let entry = counts.entry(comment.author.clone()).or_default();
+            *entry = entry.saturating_add(1);
+        }
+    }
+    for id in base_ids.intersection(&edited_ids) {
+        if base.comments.get(id) != edited.comments.get(id) && tally.comments_altered.insert(id.clone()) {
+            tally.pending = tally.pending.saturating_add(compare::CACHE_BYTES).saturating_add(budget::units(id.len()));
+        }
+    }
+    budget.hold(std::mem::take(&mut tally.pending)).map_err(InspectError::Edited)?;
+    Ok(CommentSets { base_ids, removed, new_comments, added, replies })
+}
+
+/// The save's own revisions (those whose author and date the base does not have), and what they
+/// come to by author.
+fn new_revisions(
+    base: &Side<'_>,
+    edited: &Side<'_>,
+    tables: &Tables,
+    budget: &mut Budget,
+) -> Result<(Pairs, BTreeMap<u32, AuthorRevisions>), InspectError> {
+    let charge = |budget: &mut Budget, bytes: u64| budget.hold(bytes).map_err(InspectError::Edited);
+    let fresh = |pair: &&(u32, u32)| !base.revisions.by_pair.contains_key(*pair);
+    charge(budget, budget::units(edited.revisions.by_pair.keys().filter(fresh).count()).saturating_mul(SET_ENTRY_BYTES))?;
+    let new_pairs: Pairs = edited.revisions.by_pair.keys().filter(fresh).copied().collect();
+    let mut by_author: BTreeMap<u32, AuthorRevisions> = BTreeMap::new();
+    for ((author, date), counts) in edited.revisions.by_pair.iter().filter(|(pair, _)| new_pairs.contains(*pair)) {
+        if !by_author.contains_key(author) {
+            charge(budget, RECORD_BYTES.saturating_add(budget::units(tables.text_of(*author).len())))?;
+        }
+        let entry =
+            by_author.entry(*author).or_insert_with(|| AuthorRevisions { author: tables.text_of(*author).to_string(), ..AuthorRevisions::default() });
+        entry.insertions = entry.insertions.saturating_add(counts.insertions);
+        entry.deletions = entry.deletions.saturating_add(counts.deletions);
+        entry.format_changes = entry.format_changes.saturating_add(counts.format_changes);
+        let date = tables.text_of(*date);
+        if date.is_empty() {
+            let elements = counts.insertions.saturating_add(counts.deletions).saturating_add(counts.format_changes);
+            entry.undated = entry.undated.saturating_add(elements);
+        } else {
+            // A date kept replaces the one before it: charged before it is made, the old one
+            // released once it is freed.
+            if entry.earliest_date.as_deref().is_none_or(|earliest| date < earliest) {
+                charge(budget, budget::units(date.len()))?;
+                let old = entry.earliest_date.replace(date.to_string());
+                budget.release(budget::units(old.map_or(0, |old| old.len())));
+            }
+            if entry.latest_date.as_deref().is_none_or(|latest| date > latest) {
+                charge(budget, budget::units(date.len()))?;
+                let old = entry.latest_date.replace(date.to_string());
+                budget.release(budget::units(old.map_or(0, |old| old.len())));
+            }
+        }
+    }
+    Ok((new_pairs, by_author))
 }

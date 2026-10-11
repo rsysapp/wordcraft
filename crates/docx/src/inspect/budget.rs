@@ -75,6 +75,19 @@ impl Budget {
         self.held = self.held.saturating_sub(bytes);
     }
 
+    pub(super) fn work_left(&self) -> u64 {
+        self.work_left
+    }
+
+    pub(super) fn held(&self) -> u64 {
+        self.held
+    }
+
+    /// Start measuring the peak again from what is held now.
+    pub(super) fn reset_peak(&mut self) {
+        self.peak = self.held;
+    }
+
     /// The most held at once, for measurements.
     pub(super) fn peak(&self) -> u64 {
         self.peak
