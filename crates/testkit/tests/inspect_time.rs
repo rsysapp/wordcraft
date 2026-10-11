@@ -294,13 +294,45 @@ fn shapes() -> Vec<(&'static str, Vec<u8>, Vec<u8>)> {
     shapes
 }
 
+/// A package whose styles part is `styles`, the same a side: style walks alone.
+fn styled(styles: &str) -> (Vec<u8>, Vec<u8>) {
+    let part = format!(r#"<w:styles xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">{styles}</w:styles>"#).into_bytes();
+    let side = package(&[("word/styles.xml".to_string(), part)]);
+    (side.clone(), side)
+}
+
+/// Shapes that make reading styles do the most it can: the reviewer's chain of long ids (0.28 MB,
+/// 97 s and accepted before style ids were capped), and chains of ids at the longest read.
+fn style_walks() -> Vec<(&'static str, Vec<u8>, Vec<u8>)> {
+    let mut shapes = Vec::new();
+    let style = |id: &str, based: &str| format!(r#"<w:style w:type="character" w:styleId="{id}"><w:basedOn w:val="{based}"/></w:style>"#);
+    let long = |n: usize| format!("{n}{}", "x".repeat(64 << 10));
+    let chain: String = (0..30).map(|n| style(&long(n), &long(n + 1))).collect();
+    let shorts: String = (0..100_000).map(|n| style(&format!("s{n}"), "one")).collect();
+    let (base, edited) = styled(&format!("{chain}{}{shorts}", style("one", &long(0))));
+    shapes.push(("styles: the reviewer's 64 KiB ids", base, edited));
+    let capped = |n: usize| format!("{n:0>256}");
+    let chain: String = (0..30).map(|n| style(&capped(n), &capped(n + 1))).collect();
+    // A quarter part: the whole tree is then held within the memory limit, so the walk runs.
+    let room = (PART / 4).saturating_sub(chain.len() + 1_000) / style("s0000000", "one").len();
+    let shorts: String = (0..room).map(|n| style(&format!("s{n:07}"), "one")).collect();
+    let (base, edited) = styled(&format!("{chain}{}{shorts}", style("one", &capped(0))));
+    shapes.push(("styles: shorts on a chain of 256-byte ids", base, edited));
+    let unit = style(&capped(0), &capped(1)).len();
+    let chained: String = (0..PART / unit).map(|n| style(&capped(n), &capped(n + 1))).collect();
+    let (base, edited) = styled(&chained);
+    shapes.push(("styles: chains of 256-byte ids", base, edited));
+    shapes
+}
+
 #[test]
 #[ignore = "slow and machine-dependent: run in release, by hand"]
 fn the_work_limit_bounds_the_time() {
     let mut worst = (0.0f64, "");
     let mut longest = (0.0f64, "");
     let only = std::env::var("INSPECT_TIME_ONLY").ok();
-    for (name, base, edited) in shapes().into_iter().chain(xml_loops()).filter(|(name, _, _)| only.as_deref().is_none_or(|only| name.contains(only)))
+    for (name, base, edited) in
+        shapes().into_iter().chain(xml_loops()).chain(style_walks()).filter(|(name, _, _)| only.as_deref().is_none_or(|only| name.contains(only)))
     {
         let started = Instant::now();
         let (result, _, work) = inspect_measured(&base, &edited);

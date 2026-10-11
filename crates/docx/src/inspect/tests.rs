@@ -2611,3 +2611,50 @@ fn counts_a_vanish_nested_in_run_properties() {
     let recorded = format!(r#"<w:rPrChange w:id="1" w:author="{}" w:date="{}"><w:rPr><w:vanish/></w:rPr></w:rPrChange>"#, ANA.0, ANA.1);
     assert_hidden(styled_pair("", &inserted_run(&recorded)), 0);
 }
+
+// ---- W1-27: bounded style walks ------------------------------------------------------------------
+
+/// The work reading a styles part spends.
+fn styles_work(styles: &str) -> Result<u64, String> {
+    let xml = format!("<w:styles {W}>{styles}</w:styles>");
+    let mut budget = budget::Budget::new(u64::MAX, u64::MAX);
+    let mut limits = xml::Limits { elements_left: INSPECT_LIMITS.max_elements, max_depth: INSPECT_LIMITS.max_depth };
+    let parsed = xml::parse(xml.as_bytes(), &mut xml::Names::default(), &mut limits, &mut budget)?;
+    let before = budget.work_left();
+    story::StyleHiding::read(&parsed.root, &mut budget).map_err(String::from)?;
+    Ok(before - budget.work_left())
+}
+
+/// Every style id is hashed once and charged per byte, and so is every `basedOn` it names; each
+/// style's chain is then walked once (memoised), however many styles are based on it.
+#[test]
+fn charges_style_ids_per_byte_and_walks_each_chain_once() {
+    let id = |n: usize| format!("{n:0>256}");
+    let count = 2_000;
+    let chained: String =
+        (0..count).map(|n| format!(r#"<w:style w:type="character" w:styleId="{}"><w:basedOn w:val="{}"/></w:style>"#, id(n), id(n + 1))).collect();
+    let work = styles_work(&chained).unwrap();
+    // An id inserted and a base looked up, each hashing its 256 bytes.
+    let hashing = 2 * (2 + 256 / 8);
+    assert!(work >= (count * hashing) as u64, "{work} units for {count} styles");
+    // Many styles based on one at the end of a long chain: each walked once.
+    let head: String =
+        (0..32).map(|n| format!(r#"<w:style w:type="character" w:styleId="H{n}"><w:basedOn w:val="H{}"/></w:style>"#, n + 1)).collect();
+    let shorts = |many: usize| -> String {
+        (0..many).map(|n| format!(r#"<w:style w:type="character" w:styleId="s{n}"><w:basedOn w:val="H0"/></w:style>"#)).collect()
+    };
+    let (few, many) = (styles_work(&format!("{head}{}", shorts(1_000))).unwrap(), styles_work(&format!("{head}{}", shorts(2_000))).unwrap());
+    assert!(many - few < 1_000 * 64, "1,000 more short styles cost {} units", many - few);
+}
+
+/// The reviewer's case, scaled down: styles with 64 KiB ids in a chain, and many short styles based
+/// on one based on its head, are refused before any id is hashed.
+#[test]
+fn refuses_style_ids_past_the_longest() {
+    let long = |n: usize| format!("{n}{}", "x".repeat(64 << 10));
+    let chain: String =
+        (0..30).map(|n| format!(r#"<w:style w:type="character" w:styleId="{}"><w:basedOn w:val="{}"/></w:style>"#, long(n), long(n + 1))).collect();
+    let shorts: String = (0..2_000).map(|n| format!(r#"<w:style w:type="character" w:styleId="s{n}"><w:basedOn w:val="one"/></w:style>"#)).collect();
+    let styles = format!(r#"{chain}<w:style w:type="character" w:styleId="one"><w:basedOn w:val="{}"/></w:style>{shorts}"#, long(0));
+    assert_save_refused(styled_pair(&styles, &para(&format!("{}{}", text("Rent."), ins(SARI, "more")))), "style id of");
+}

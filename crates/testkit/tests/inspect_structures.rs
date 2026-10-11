@@ -104,6 +104,18 @@ fn shapes() -> Vec<(&'static str, Probe)> {
     );
     shapes.push(("comments: attributes copied", Box::new(move |mark| probe::comments(copied.as_bytes(), mark))));
     shapes.push(("styles", Box::new(move |mark| probe::styles(styles.as_bytes(), mark))));
+    // What each style reaches, worked out once (the memo): one chain through every style, so the
+    // walk's path holds them all; as many styles as fill the id table to its resize point, where the
+    // table holds the least room for what it is charged.
+    let chain: String =
+        (0..resize_point(15)).map(|n| format!(r#"<w:style w:type="character" w:styleId="S{n}"><w:basedOn w:val="S{}"/></w:style>"#, n + 1)).collect();
+    let chain = format!(r#"<w:styles {W}>{chain}</w:styles>"#);
+    shapes.push(("styles: one chain walked", Box::new(move |mark| probe::styles(chain.as_bytes(), mark))));
+    let longest: String = (0..resize_point(15))
+        .map(|n| format!(r#"<w:style w:type="paragraph" w:styleId="{n:0>256}"><w:basedOn w:val="{:0>256}"/></w:style>"#, n + 1))
+        .collect();
+    let longest = format!(r#"<w:styles {W}>{longest}</w:styles>"#);
+    shapes.push(("styles: ids at the longest", Box::new(move |mark| probe::styles(longest.as_bytes(), mark))));
     shapes.push(("revision pairs", Box::new(|mark| probe::revision_pairs(200_000, mark))));
 
     shapes.push(("table: short contents", Box::new(|mark| probe::table_entries(Entries::Contents(200), 100_000, mark))));
