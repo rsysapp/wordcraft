@@ -46,9 +46,12 @@ pub(crate) fn set_mode(app: &mut WordApp, host: &mut HostState, request: ModeReq
         host.bridge.emit(HostEvent::ModeChanged { mode: EditorMode::View });
         return;
     };
-    // One date per save: unsaved changes carry the date they were made with, so another date waits
-    // until the document is opened again (embed API 0.2, P6-18). The mode in force stays.
-    if is_dirty(app, host) && host.session_date.as_deref().is_some_and(|made| made != date) {
+    // One date and one author per save: unsaved changes carry the date and the author they were made
+    // with, so another date or author waits until the document is opened again (embed API 0.2,
+    // P6-18, Ruling W3-5). The mode in force stays.
+    let other_date = host.session_date.as_deref().is_some_and(|made| made != date);
+    let other_author = host.session_author.as_ref().is_some_and(|(id, name)| *id != author.id || *name != author.name);
+    if is_dirty(app, host) && (other_date || other_author) {
         host.bridge.emit(HostEvent::EditRefused { code: Refusal::InvalidEditSession.code().to_string() });
         host.bridge.emit(HostEvent::ModeChanged { mode: mode_in_force(host) });
         return;
@@ -59,6 +62,8 @@ pub(crate) fn set_mode(app: &mut WordApp, host: &mut HostState, request: ModeReq
         // The session running: not a new entry, so its history and its own changes stay. The other
         // editor's permissions may have changed; this editor reads none of them.
         edit.permissions = permissions;
+        // Only reached with the same id while dirty (another is refused above).
+        host.session_author = Some((author.id, author.name));
     } else {
         if let Err(error) = app.session.begin_edit(&author.name, &date, rules) {
             log::warn!("embed: {error}");
@@ -71,6 +76,7 @@ pub(crate) fn set_mode(app: &mut WordApp, host: &mut HostState, request: ModeReq
             host.clear_reported_selection();
         }
         host.session_date = Some(date.clone());
+        host.session_author = Some((author.id.clone(), author.name.clone()));
         host.edit = Some(EditSession { permissions, author: author.name, date, rules, rev: app.session.rev(), notice: None });
     }
     host.bridge.emit(HostEvent::ModeChanged { mode: EditorMode::Edit });

@@ -798,3 +798,42 @@ fn accepts_author_fields_it_does_not_read() {
     let request = r#"{"mode":"edit","author":{"id":"u","name":"Sari","email":"sari@example.com"},"revisionDate":"2026-10-10T08:00:00Z","permissions":{"acceptRejectChanges":false,"organizePages":true,"fillForms":true,"redact":true,"stamps":true,"drawing":true}}"#;
     assert!(matches!(parse_mode_request(request), Ok(ModeRequest::Edit { .. })));
 }
+
+// W3-5: the author of unsaved changes is fixed like their date: another author (id or name) is
+// refused while the document is dirty, and starts a new session on a clean one.
+#[test]
+fn refuses_another_author_while_the_document_has_unsaved_changes() {
+    let as_author = |id: &str, name: &str| {
+        HostCommand::SetMode(ModeRequest::Edit {
+            author: AuthorSpec { id: id.into(), name: name.into() },
+            revision_date: DATE.into(),
+            permissions: permissions(false),
+        })
+    };
+    let refused = HostEvent::EditRefused { code: "invalid_edit_session".into() };
+    let (mut harness, bridge) = editing(false);
+    harness.state_mut().run("text.insert", json!({ "text": "abc " })).unwrap();
+    harness.run_steps(2);
+    bridge.take_events();
+    for request in [as_author("u-other", AUTHOR), as_author("u-sari", "Ana Setia")] {
+        bridge.send(request);
+        harness.run_steps(2);
+        assert_eq!(bridge.take_events(), vec![refused.clone(), HostEvent::ModeChanged { mode: EditorMode::Edit }]);
+    }
+    harness.state_mut().run("text.insert", json!({ "text": "x" })).unwrap();
+    assert_eq!(harness.state().session.doc.revisions.last().map(|revision| revision.author.as_str()), Some(AUTHOR));
+    // From view mode too: the mode in force stays.
+    bridge.send(HostCommand::SetMode(ModeRequest::View));
+    harness.run_steps(2);
+    bridge.take_events();
+    bridge.send(as_author("u-ana", "Ana Setia"));
+    harness.run_steps(2);
+    assert_eq!(bridge.take_events(), vec![refused, HostEvent::ModeChanged { mode: EditorMode::View }]);
+    // A clean document takes another author: a new session.
+    let (mut clean, clean_bridge) = editing(false);
+    clean_bridge.send(as_author("u-ana", "Ana Setia"));
+    clean.run_steps(2);
+    assert_eq!(clean_bridge.take_events(), vec![HostEvent::ModeChanged { mode: EditorMode::Edit }]);
+    clean.state_mut().run("text.insert", json!({ "text": "x" })).unwrap();
+    assert_eq!(clean.state().session.doc.revisions.last().map(|revision| revision.author.as_str()), Some("Ana Setia"));
+}

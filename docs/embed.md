@@ -336,14 +336,15 @@ with `view`. Every open, a refused one included, ends edit mode first.
   once, and the editor shows the code's words over the document, at the view's top, or at its bottom
   when the caret's line is under the top, until the document changes or the caret moves. Shift+Tab
   does nothing and says nothing.
-- **One date per save.** While the document has unsaved changes, `setMode` with another
-  `revisionDate` is refused: `editRefused` with `invalid_edit_session`, then `modeChanged` with the
-  mode still in force. The same date continues the work.
-- **Dirty.** `dirtyChanged` compares the document's content version
-  (`Session::content_version`) with the one it had when it opened, so undoing back to the opened
-  document is clean and running out of undo is not. `opened` starts clean again, without a
-  `dirtyChanged`: a host resets its own dirty state on `opened`. A save does not change it (the
-  contract: saving never clears dirty); a host that keeps the saved file opens it again.
+- **One date and one author per save.** While the document has unsaved changes, `setMode` with
+  another `revisionDate`, or another author (id or name), is refused: `editRefused` with
+  `invalid_edit_session`, then `modeChanged` with the mode still in force. The same date and author
+  continue the work; on a clean document another date or author starts a new session.
+- **Dirty: saving never clears it; only `opened` does.** `dirtyChanged` compares the document's
+  content version (`Session::content_version`) with the one it had when it opened, so undoing back
+  to the opened document is clean and running out of undo is not. A save leaves dirty as it is (the
+  contract: saving never clears dirty). The next `opened` starts clean, without a `dirtyChanged`, so
+  a host resets its own dirty state on `opened`; a host that keeps a saved file opens it again.
 - **Saves** are answered when asked: `requestSave` and Ctrl/Cmd+S serialise the document then, before
   a later command of the same frame (an open, a mode change). Two in one frame for the same document
   answer once.

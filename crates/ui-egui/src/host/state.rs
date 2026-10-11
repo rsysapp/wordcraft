@@ -95,8 +95,10 @@ pub struct HostState {
     pub(crate) comment_asked: bool,
     /// The content version the open document had when it opened: it differs from it while dirty.
     pub(crate) opened_version: u64,
-    /// The date of the edit session begun last since the open: unsaved changes carry it.
+    /// The date and the author (id, name) of the edit session begun last since the open: unsaved
+    /// changes carry them.
     pub(crate) session_date: Option<String>,
+    pub(crate) session_author: Option<(String, String)>,
     /// The dirty state the host was last told (`dirtyChanged`); a new document starts clean.
     pub(crate) dirty: bool,
     /// This frame (`Context::cumulative_frame_nr`), and the frame and document revision a save last
@@ -194,6 +196,7 @@ impl HostState {
             comment_asked: false,
             opened_version: 0,
             session_date: None,
+            session_author: None,
             dirty: false,
             frame: 0,
             last_save: None,
@@ -541,6 +544,7 @@ fn open(app: &mut WordApp, host: &mut HostState, name: &str, bytes: &[u8]) {
             // A new document starts clean; `dirtyChanged` reports its edits from here.
             host.opened_version = app.session.content_version();
             host.session_date = None;
+            host.session_author = None;
             host.dirty = false;
             app.session.page_hint = 0;
             app.session.find = Default::default();
