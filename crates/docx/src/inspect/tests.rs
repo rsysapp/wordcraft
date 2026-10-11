@@ -2048,3 +2048,27 @@ fn bounds_attribute_names_and_checks_them_once() {
     let work = parse_work(&format!("<r{attributes}/>")).unwrap();
     assert!(work < 200_000, "work {work}");
 }
+
+/// W1-23 (H1): authors, dates, ids and style names are copied out of the tree into what an
+/// inspection keeps: each is at most 1 KiB, refused before it is copied, and charged as it is.
+#[test]
+fn refuses_kept_values_past_a_kibibyte() {
+    let base = package(&para(&text("Rent.")), &[]);
+    let with_author = |author: &str| package(&para(&format!("{}{}", text("Rent."), ins((author, SARI.1), "more"))), &[]);
+    assert!(inspect(&base, &with_author(&"a".repeat(1_024))).is_ok());
+    let long = inspect(&base, &with_author(&"a".repeat(1_025)));
+    assert!(matches!(&long, Err(InspectError::Edited(message)) if message.contains("w:author")), "{long:?}");
+    let dated = package(&para(&format!("{}{}", text("Rent."), ins((SARI.0, &"2".repeat(1_025)), "more"))), &[]);
+    assert!(matches!(inspect(&base, &dated), Err(InspectError::Edited(message)) if message.contains("w:date")));
+    let styled = package(&format!(r#"<w:p><w:pPr><w:pStyle w:val="{}"/></w:pPr>{}</w:p>"#, "S".repeat(1_025), text("Rent.")), &[]);
+    assert!(matches!(inspect(&base, &styled), Err(InspectError::Edited(message)) if message.contains("style")));
+    let anchored = package(&para(&format!(r#"{}<w:r><w:commentReference w:id="{}"/></w:r>"#, text("Rent."), "1".repeat(1_025))), &[]);
+    assert!(matches!(inspect(&base, &anchored), Err(InspectError::Edited(message)) if message.contains("id")));
+    // Charged before it is copied: one author of 1 KiB is held, not one step later.
+    let mut tables = story::Tables::new();
+    let mut budget = budget::Budget::new(u64::MAX, u64::MAX);
+    tables.charge(&mut budget).unwrap();
+    let before = budget.held();
+    tables.text("a w:author", &"a".repeat(1_024), &mut budget).unwrap();
+    assert!(budget.held() - before >= 1_024, "held {}", budget.held() - before);
+}

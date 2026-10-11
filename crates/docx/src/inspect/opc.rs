@@ -321,10 +321,15 @@ impl Canon<'_> {
 
     /// The start tag: the name and the compared attributes, sorted.
     pub(super) fn start_tag(&self, el: &XEl, hasher: &mut Hasher) {
+        self.start_tag_of(&el.name, el.attrs.iter(), hasher);
+    }
+
+    /// The start tag of an element named `name` with these attributes.
+    pub(super) fn start_tag_of<'e>(&self, name: &str, attrs: impl Iterator<Item = &'e (std::rc::Rc<str>, String)>, hasher: &mut Hasher) {
         let mut attributes: Vec<(&str, Value<'_>)> =
-            el.attrs.iter().filter_map(|(key, value)| Canon::value(&el.name, key, value).map(|value| (&**key, value))).collect();
+            attrs.filter_map(|(key, value)| Canon::value(name, key, value).map(|value| (&**key, value))).collect();
         attributes.sort_by(|a, b| a.0.cmp(b.0));
-        hasher.field(b'<', el.name.as_bytes());
+        hasher.field(b'<', name.as_bytes());
         for (key, value) in &attributes {
             hasher.field(b'@', key.as_bytes());
             self.write_value(value, hasher);

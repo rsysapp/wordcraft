@@ -132,7 +132,7 @@ pub fn table_entries(entries: Entries, count: u32, mark: &mut dyn FnMut()) -> Re
                     tables.content(hasher.finish());
                 }
                 Entries::Texts(size) => {
-                    tables.text(&format!("{n:0size$}"));
+                    tables.text("a text", &format!("{n:0size$}"), budget)?;
                 }
                 Entries::Stacks => {
                     let wrap = Wrap { kind: WrapKind::Ins, author: 0, date: n, extra: 0 };
@@ -277,7 +277,6 @@ pub fn comparison(base: &[u8], edited: &[u8], mark: &mut dyn FnMut()) -> Result<
     measure(&mut budget, mark, |budget| {
         let mut tally = Tally::default();
         compare_story("word/document.xml", &before, &after, &tables, &ids, MAX_CHANGES, budget, &mut tally);
-        budget.hold(std::mem::take(&mut tally.pending))?;
         Ok(Box::new((before, after, tables, tally)))
     })
 }
@@ -382,7 +381,6 @@ pub fn tally(pairs: &[(Vec<u8>, Vec<u8>)], mark: &mut dyn FnMut()) -> Result<Mea
             if !compare_story("word/document.xml", before, after, &tables, &ids, MAX_CHANGES, budget, &mut tally) {
                 return Err("a story over its bounds".into());
             }
-            budget.hold(std::mem::take(&mut tally.pending))?;
         }
         Ok(Box::new((walked, tables, tally)))
     })

@@ -15,6 +15,7 @@ const MAP_BYTES: u64 = table_slot::<(String, Option<String>)>();
 const ATTRIBUTE_COPY_BYTES: u64 = vector_slot::<(std::rc::Rc<str>, String)>();
 use super::digest::{Digest, Hasher};
 use super::opc::{Canon, finish};
+use super::story::kept_value;
 use super::xml::{XEl, XNode, is_space};
 
 /// One comment as compared.
@@ -59,7 +60,8 @@ fn read_held(comments: &XEl, extended: Option<&XEl>, canon: &Canon<'_>, budget: 
             XNode::El(el) if &*el.name == "w:comment" => el,
             XNode::El(el) => return Err(format!("{} in the comments part", el.name)),
         };
-        let id = el.attr("w:id").ok_or("a comment without an id")?.to_string();
+        let id = kept_value("a comment's id", el.attr("w:id").ok_or("a comment without an id")?)?;
+        let author = kept_value("a comment's w:author", el.attr("w:author").unwrap_or(""))?;
         budget.work(200)?;
         // The attributes copied for the digest, held while it is made.
         let copied = el.attrs.iter().fold(0u64, |held, (_, value)| held.saturating_add(ATTRIBUTE_COPY_BYTES).saturating_add(units(value.len())));
@@ -80,18 +82,20 @@ fn read_held(comments: &XEl, extended: Option<&XEl>, canon: &Canon<'_>, budget: 
         }
         let content = finish(content, budget)?;
         // Kept for the whole inspection: the record, its strings and identities, its map entry.
-        let strings = id.len().saturating_add(el.attr("w:author").map_or(0, str::len)).saturating_mul(2);
+        let strings = id.len().saturating_add(author.len()).saturating_mul(2);
         budget.hold(COMMENT_BYTES.saturating_add(units(strings)).saturating_add(meta.held()).saturating_add(content.held()))?;
         if let Some(paragraph) = el.els().filter(|child| &*child.name == "w:p").last().and_then(|p| p.attr("w14:paraId")) {
+            let paragraph = kept_value("a comment paragraph's w14:paraId", paragraph)?;
             let entry = MAP_BYTES.saturating_add(units(paragraph.len().saturating_add(id.len())));
             budget.hold(entry)?;
             *map_held = map_held.saturating_add(entry);
-            by_paragraph.entry(paragraph.to_string()).and_modify(|entry| *entry = None).or_insert_with(|| Some(id.clone()));
+            by_paragraph.entry(paragraph.to_string()).and_modify(|entry| *entry = None).or_insert_with(|| Some(id.to_string()));
         }
-        let comment = Comment { author: el.attr("w:author").unwrap_or("").to_string(), meta, content, done: false, parent: None };
-        if out.insert(id.clone(), comment).is_some() {
+        if out.contains_key(id) {
             return Err(format!("two comments with id {id}"));
         }
+        let comment = Comment { author: author.to_string(), meta, content, done: false, parent: None };
+        out.insert(id.to_string(), comment);
     }
     let Some(extended) = extended else { return Ok(out) };
     if &*extended.name != "w15:commentsEx" {

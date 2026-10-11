@@ -636,9 +636,7 @@ fn compare(
             let fields = field_structure(&after, tables, &new_pairs, &mut holds, budget)?;
             tally.untracked = tally.untracked.saturating_add(moves).saturating_add(fields);
             projector.project(tables, &mut after, budget)?;
-            let complete = compare_story(name, &before, &after, tables, &ids, max_changes, budget, &mut tally);
-            budget.hold(std::mem::take(&mut tally.pending))?;
-            Ok(complete)
+            Ok(compare_story(name, &before, &after, tables, &ids, max_changes, budget, &mut tally))
         })();
         budget.release(held);
         match compared {
@@ -829,11 +827,10 @@ fn compare_comments(base: &Side<'_>, edited: &Side<'_>, tally: &mut Tally, budge
         }
     }
     for id in base_ids.intersection(&edited_ids) {
-        if base.comments.get(id) != edited.comments.get(id) && tally.comments_altered.insert(id.clone()) {
-            tally.pending = tally.pending.saturating_add(compare::ID_BYTES).saturating_add(budget::units(id.len()));
+        if base.comments.get(id) != edited.comments.get(id) && !tally.alter_comment(id, budget) {
+            return Err(InspectError::Edited(budget::TOO_MUCH_MEMORY.into()));
         }
     }
-    budget.hold(std::mem::take(&mut tally.pending)).map_err(InspectError::Edited)?;
     Ok(CommentSets { base_ids, removed, new_comments, added, replies })
 }
 

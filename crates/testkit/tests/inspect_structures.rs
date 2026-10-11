@@ -186,6 +186,11 @@ fn shapes() -> Vec<(&'static str, Probe)> {
         })
         .collect();
     shapes.push(("comparison: tally losses", Box::new(move |mark| probe::tally(&losses, mark))));
+    // One story whose comment anchors, with ids of 1 KiB, are all gone: the tally keeps each id
+    // while the story's tokens and edit script are still held.
+    let anchors: String = (0..4_000).map(|n| format!(r#"<w:r><w:commentReference w:id="{n:01024}"/></w:r>"#)).collect();
+    let (anchored, bare) = (story(&format!("<w:p>{}{anchors}</w:p>", run("x"))), story(&format!("<w:p>{}</w:p>", run("x"))));
+    shapes.push(("comparison: tally of a story's anchors", Box::new(move |mark| probe::comparison(&anchored, &bare, mark))));
 
     let entries: Vec<(String, Vec<u8>)> = (0..20_000).map(|n| (format!("parts/part{n}.bin"), vec![b'x'; 8])).collect();
     let many = zip(&entries, zip::CompressionMethod::Deflated);
@@ -464,7 +469,7 @@ fn compared() -> Vec<(&'static str, Probe)> {
     shapes.push(("revisions compared: pairs", phase(base.clone(), dated, || Phase::Revisions)));
     let authored = revised(&|n| format!("{}{n}", "a".repeat(200)), &|_| "2026-01-01T00:00:00Z".to_string());
     shapes.push(("revisions compared: authors", phase(base.clone(), authored, || Phase::Revisions)));
-    let long_dates = revised(&|n| format!("A{n}"), &|n| format!("2026-01-01T{}{n}", "0".repeat(2_000)));
+    let long_dates = revised(&|n| format!("A{n}"), &|n| format!("2026-01-01T{}{n}", "0".repeat(990)));
     shapes.push(("revisions compared: dates", phase(base, long_dates, || Phase::Revisions)));
     shapes
 }

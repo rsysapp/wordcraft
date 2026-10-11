@@ -13,7 +13,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::hash::{BuildHasher, Hasher as _};
 
 use super::LossKind;
-use super::budget::{Budget, table_slot, tree_slot, units, vector_slot};
+use super::budget::{Budget, table_slot, tree_room, tree_slot, units, vector_slot};
 use super::diff::{Step, script, script_bytes};
 use super::digest::Hasher;
 use super::opc::finish;
@@ -69,6 +69,12 @@ pub(super) const RECORD_BYTES: u64 = larger(
 );
 /// Memory charged for each change the tally finds resolved: its entry in a set.
 const RESOLUTION_BYTES: u64 = tree_slot::<Resolution, ()>();
+
+/// Memory an entry new to one of the tally's maps or sets holds, besides what it owns: its share of
+/// the tree (`slot`), and the tree's first node when it is the first entry.
+fn tree_entry(empty: bool, slot: u64, first: u64) -> u64 {
+    if empty { slot.saturating_add(first) } else { slot }
+}
 
 impl<'a> Projector<'a> {
     pub(super) fn new(new_pairs: &'a Pairs, new_comments: &'a BTreeSet<String>) -> Self {
@@ -484,17 +490,61 @@ pub(super) enum Resolution {
     Format(&'static str, FormatRev),
 }
 
-/// What the differences mean, summed over every story.
+/// What the differences mean, summed over every story. Each entry is charged as it is made, at its
+/// room, before it is kept.
 #[derive(Default)]
 pub(super) struct Tally {
-    /// Memory its sets and maps took since it was last charged.
-    pub pending: u64,
     pub untracked: u32,
     pub altered: u32,
     pub accepted: BTreeSet<Resolution>,
     pub rejected: BTreeSet<Resolution>,
     pub losses: BTreeMap<(String, LossKind, Option<String>), u32>,
     pub comments_altered: BTreeSet<String>,
+}
+
+impl Tally {
+    /// Keep a resolution found, charged first; false when memory ran out.
+    fn resolve(&mut self, accepted: bool, resolution: Resolution, budget: &mut Budget) -> bool {
+        let set = if accepted { &mut self.accepted } else { &mut self.rejected };
+        if set.contains(&resolution) {
+            return true;
+        }
+        if !budget.try_hold(tree_entry(set.is_empty(), RESOLUTION_BYTES, tree_room::<Resolution, ()>())) {
+            return false;
+        }
+        set.insert(resolution);
+        true
+    }
+
+    /// Keep a base comment as altered, its id charged before it is copied; false when memory ran out.
+    pub(super) fn alter_comment(&mut self, id: &str, budget: &mut Budget) -> bool {
+        if self.comments_altered.contains(id) {
+            return true;
+        }
+        let entry = tree_entry(self.comments_altered.is_empty(), ID_BYTES, tree_room::<String, ()>());
+        if !budget.try_hold(entry.saturating_add(units(id.len()))) {
+            return false;
+        }
+        self.comments_altered.insert(id.to_string());
+        true
+    }
+
+    /// Count an element of `part` lost, a new loss charged before it is made; false when memory ran
+    /// out.
+    fn lose(&mut self, part: &str, element: &str, budget: &mut Budget) -> bool {
+        // The key, made to look the loss up (two names, each within a name's limit).
+        let key = (part.to_string(), LossKind::ElementMissing, Some(element.to_string()));
+        if let Some(count) = self.losses.get_mut(&key) {
+            *count = count.saturating_add(1);
+            return true;
+        }
+        let strings = units(part.len().saturating_add(element.len()));
+        if !budget.try_hold(tree_entry(self.losses.is_empty(), RECORD_BYTES, tree_room::<LossKey, u32>()).saturating_add(strings)) {
+            return false;
+        }
+        self.losses.insert(key, 1);
+        true
+    }
 }
 
 /// The comments the tally must know about: those of the base, and those the save removed.
@@ -530,12 +580,13 @@ impl<'a> Story<'a> {
             || !explained(after.section, before.section, before.section_old)
     }
 
-    /// The same piece in both: its wrappers, formatting and context say what happened to it.
-    fn same(&mut self, before: &Item, after: &Item) {
+    /// The same piece in both: its wrappers, formatting and context say what happened to it. False
+    /// when the tally ran out of memory.
+    fn same(&mut self, before: &Item, after: &Item, budget: &mut Budget) -> bool {
         if before == after {
-            return;
+            return true;
         }
-        let comment = self.comment(before.piece).filter(|id| self.comments.base.contains(*id)).map(str::to_string);
+        let comment = self.comment(before.piece).filter(|id| self.comments.base.contains(*id));
         let mut untracked = self.context_changed(before.context, after.context);
         let mut altered = false;
         if before.wraps != after.wraps {
@@ -564,10 +615,8 @@ impl<'a> Story<'a> {
             gone.extend(remaining);
             if kept_in_order {
                 for wrap in gone {
-                    let resolution = Resolution::Wrap(*wrap);
-                    let fresh = if wrap.kind.inserts() { self.tally.accepted.insert(resolution) } else { self.tally.rejected.insert(resolution) };
-                    if fresh {
-                        self.tally.pending = self.tally.pending.saturating_add(RESOLUTION_BYTES);
+                    if !self.tally.resolve(wrap.kind.inserts(), Resolution::Wrap(*wrap), budget) {
+                        return false;
                     }
                 }
             } else {
@@ -588,14 +637,9 @@ impl<'a> Story<'a> {
                 match (before_rev, after_rev) {
                     // The base's formatting change resolved: accepted keeps the new formatting,
                     // rejected restores the old.
-                    (Some(rev), None) if after_value == before_value => {
-                        if self.tally.accepted.insert(Resolution::Format(name, *rev)) {
-                            self.tally.pending = self.tally.pending.saturating_add(RESOLUTION_BYTES);
-                        }
-                    }
-                    (Some(rev), None) if after_value == rev.old => {
-                        if self.tally.rejected.insert(Resolution::Format(name, *rev)) {
-                            self.tally.pending = self.tally.pending.saturating_add(RESOLUTION_BYTES);
+                    (Some(rev), None) if after_value == before_value || after_value == rev.old => {
+                        if !self.tally.resolve(after_value == before_value, Resolution::Format(name, *rev), budget) {
+                            return false;
                         }
                     }
                     _ if before_value != after_value => untracked = true,
@@ -604,12 +648,7 @@ impl<'a> Story<'a> {
             }
         }
         match comment {
-            Some(id) if untracked || altered => {
-                let held = ID_BYTES.saturating_add(units(id.len()));
-                if self.tally.comments_altered.insert(id) {
-                    self.tally.pending = self.tally.pending.saturating_add(held);
-                }
-            }
+            Some(id) if untracked || altered => self.tally.alter_comment(id, budget),
             _ => {
                 if untracked {
                     self.tally.untracked = self.tally.untracked.saturating_add(1);
@@ -617,62 +656,45 @@ impl<'a> Story<'a> {
                 if altered {
                     self.tally.altered = self.tally.altered.saturating_add(1);
                 }
+                true
             }
         }
     }
 
-    /// Base content the edited story no longer has.
-    fn deleted(&mut self, before: &Item) {
+    /// Base content the edited story no longer has. False when the tally ran out of memory.
+    fn deleted(&mut self, before: &Item, budget: &mut Budget) -> bool {
         if let Some(id) = self.comment(before.piece) {
             // An empty anchor of a removed comment goes with it; any other anchor gone alters its
             // comment.
-            if !self.comments.removed.contains(id) && self.tally.comments_altered.insert(id.to_string()) {
-                self.tally.pending = self.tally.pending.saturating_add(ID_BYTES).saturating_add(units(id.len()));
-            }
-            return;
+            return self.comments.removed.contains(id) || self.tally.alter_comment(id, budget);
         }
         match self.tables.wraps_of(before.wraps).last() {
             // Gone with its change: an insertion rejected, a deletion accepted.
-            Some(wrap) => {
-                let fresh = if wrap.kind.inserts() {
-                    self.tally.rejected.insert(Resolution::Wrap(*wrap))
-                } else {
-                    self.tally.accepted.insert(Resolution::Wrap(*wrap))
-                };
-                if fresh {
-                    self.tally.pending = self.tally.pending.saturating_add(RESOLUTION_BYTES);
-                }
-            }
+            Some(wrap) => self.tally.resolve(!wrap.kind.inserts(), Resolution::Wrap(*wrap), budget),
             None => match self.tables.mark_info(before.piece) {
-                Some(mark) => {
-                    let key = (self.part.to_string(), LossKind::ElementMissing, Some(mark.element.to_string()));
-                    if !self.tally.losses.contains_key(&key) {
-                        self.tally.pending =
-                            self.tally.pending.saturating_add(RECORD_BYTES).saturating_add(units(self.part.len().saturating_add(mark.element.len())));
-                    }
-                    let count = self.tally.losses.entry(key).or_default();
-                    *count = count.saturating_add(1);
+                Some(mark) => self.tally.lose(self.part, &mark.element, budget),
+                None => {
+                    self.tally.untracked = self.tally.untracked.saturating_add(1);
+                    true
                 }
-                None => self.tally.untracked = self.tally.untracked.saturating_add(1),
             },
         }
     }
 
-    /// Content the base does not have, after this save's own changes were undone.
-    fn inserted(&mut self, after: &Item) {
+    /// Content the base does not have, after this save's own changes were undone. False when the
+    /// tally ran out of memory.
+    fn inserted(&mut self, after: &Item, budget: &mut Budget) -> bool {
         if let Some(id) = self.comment(after.piece)
             && self.comments.base.contains(id)
         {
-            if self.tally.comments_altered.insert(id.to_string()) {
-                self.tally.pending = self.tally.pending.saturating_add(ID_BYTES).saturating_add(units(id.len()));
-            }
-            return;
+            return self.tally.alter_comment(id, budget);
         }
         if after.wraps == EMPTY {
             self.tally.untracked = self.tally.untracked.saturating_add(1);
         } else {
             self.tally.altered = self.tally.altered.saturating_add(1);
         }
+        true
     }
 }
 
@@ -851,12 +873,12 @@ fn compare_stretch(base: &[Item], edited: &[Item], max_changes: usize, budget: &
         budget.release(steps_held);
         return false;
     };
-    let done = tally_steps(base, edited, steps, story);
+    let done = tally_steps(base, edited, steps, story, budget);
     budget.release(steps_held);
     done
 }
 
-fn tally_steps(base: &[Item], edited: &[Item], steps: Vec<Step>, story: &mut Story<'_>) -> bool {
+fn tally_steps(base: &[Item], edited: &[Item], steps: Vec<Step>, story: &mut Story<'_>, budget: &mut Budget) -> bool {
     for step in steps {
         match step {
             Step::Same { left, right, len } => {
@@ -864,16 +886,22 @@ fn tally_steps(base: &[Item], edited: &[Item], steps: Vec<Step>, story: &mut Sto
                     return false;
                 };
                 for (old, new) in before.iter().zip(after) {
-                    story.same(old, new);
+                    if !story.same(old, new, budget) {
+                        return false;
+                    }
                 }
             }
             Step::Delete(left) => {
                 let Some(before) = base.get(left) else { return false };
-                story.deleted(before);
+                if !story.deleted(before, budget) {
+                    return false;
+                }
             }
             Step::Insert(right) => {
                 let Some(after) = edited.get(right) else { return false };
-                story.inserted(after);
+                if !story.inserted(after, budget) {
+                    return false;
+                }
             }
         }
     }

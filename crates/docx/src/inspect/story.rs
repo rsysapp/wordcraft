@@ -23,6 +23,16 @@ pub(super) const MARK_BASE: u32 = 0x0011_0000;
 /// context: id 0 in each table.
 pub(super) const EMPTY: u32 = 0;
 
+/// The longest attribute value copied out of a tree into what an inspection keeps or works with: an
+/// author, a date, a comment's or a paragraph's id, a style's name. Real ones are a few dozen bytes;
+/// a longer one is refused before it is copied (a style named past it may hide what it formats).
+pub(super) const MAX_KEPT_VALUE: usize = 1_024;
+
+/// `value` if it is no longer than [`MAX_KEPT_VALUE`], else why it is refused.
+pub(super) fn kept_value<'v>(what: &str, value: &'v str) -> Result<&'v str, String> {
+    if value.len() > MAX_KEPT_VALUE { Err(format!("{what} of {} bytes, longer than an inspection keeps", value.len())) } else { Ok(value) }
+}
+
 /// The memory of one item, with an eighth over its 16 bytes for what the allocator keeps beside it
 /// (its vector's spare capacity is charged too, as it grows).
 pub(super) const ITEM_BYTES: u64 = 18;
@@ -274,10 +284,10 @@ impl Tables {
             marks: Vec::new(),
             context_ids: HashMap::new(),
             contexts: Vec::new(),
-            pending: TABLES_ROOM,
+            pending: TABLES_ROOM.saturating_add(TEXT_BYTES).saturating_add(shared_string(0)),
             overflow: false,
         };
-        tables.text("");
+        tables.insert_text("");
         tables.format(Format::default());
         tables.context(Context::default());
         tables
@@ -286,11 +296,17 @@ impl Tables {
     /// The next id for a table of `len` entries, whose entry holds `bytes`, or the last one with the
     /// overflow recorded (the inspection is then refused).
     fn next(&mut self, len: usize, bytes: u64) -> u32 {
+        let id = self.next_id(len);
+        if id != u32::MAX {
+            self.pending = self.pending.saturating_add(bytes);
+        }
+        id
+    }
+
+    /// The next id for a table of `len` entries, or the last one with the overflow recorded.
+    fn next_id(&mut self, len: usize) -> u32 {
         match u32::try_from(len).ok().filter(|id| *id < u32::MAX >> 1) {
-            Some(id) => {
-                self.pending = self.pending.saturating_add(bytes);
-                id
-            }
+            Some(id) => id,
             None => {
                 self.overflow = true;
                 u32::MAX
@@ -320,13 +336,19 @@ impl Tables {
         id
     }
 
-    /// A text kept as written (authors, dates), for reporting.
-    pub(super) fn text(&mut self, text: &str) -> u32 {
+    /// A text kept as written (an author, a date), for reporting: no longer than
+    /// [`MAX_KEPT_VALUE`], and its entry and copy held before it is copied.
+    pub(super) fn text(&mut self, what: &str, text: &str, budget: &mut Budget) -> Result<u32, String> {
+        let text = kept_value(what, text)?;
         if let Some(id) = self.text_ids.get(text) {
-            return *id;
+            return Ok(*id);
         }
-        let id = self.next(self.texts.len(), TEXT_BYTES);
-        self.pending = self.pending.saturating_add(shared_string(text.len()));
+        budget.hold(TEXT_BYTES.saturating_add(shared_string(text.len())))?;
+        Ok(self.insert_text(text))
+    }
+
+    fn insert_text(&mut self, text: &str) -> u32 {
+        let id = self.next_id(self.texts.len());
         let shared: Rc<str> = Rc::from(text);
         self.texts.push(shared.clone());
         self.text_ids.insert(shared, id);
@@ -725,8 +747,10 @@ impl StyleHiding {
     /// Whether a style, or the default style of its kind when none is named or the named one is
     /// missing, may hide.
     fn style(&self, id: Option<&str>, default: bool) -> bool {
-        match id.and_then(|id| self.styles.get(id)) {
-            Some(entry) => entry.hides,
+        match id {
+            // A name longer than any kept value is no style a reader settles: it may hide.
+            Some(id) if id.len() > MAX_KEPT_VALUE => true,
+            Some(id) => self.styles.get(id).map_or(default, |entry| entry.hides),
             None => default,
         }
     }
@@ -795,7 +819,7 @@ impl Walker<'_, '_> {
     fn opaque(&mut self, el: &XEl, format: u32) -> Result<(), String> {
         let anchor = matches!(&*el.name, "w:commentRangeStart" | "w:commentRangeEnd" | "w:commentReference");
         // Only an empty anchor is an anchor: anything inside one is content a reader may show.
-        let comment = (anchor && el.kids.is_empty()).then(|| el.attr("w:id").unwrap_or(""));
+        let comment = (anchor && el.kids.is_empty()).then(|| kept_value("a comment anchor's id", el.attr("w:id").unwrap_or(""))).transpose()?;
         let kind = match (&*el.name, el.attr("w:fldCharType")) {
             ("w:fldChar", Some("begin")) => MarkKind::FieldBegin,
             ("w:fldChar", Some("separate")) => MarkKind::FieldSeparate,
@@ -848,9 +872,15 @@ impl Walker<'_, '_> {
         self.mark(digest, || MarkInfo { element, comment: None, kind, holds: Holds::default() }, EMPTY)
     }
 
+    /// A tracked change's author and date, kept as texts.
+    fn author_date(&mut self, el: &XEl) -> Result<(u32, u32), String> {
+        let author = self.tables.text("a w:author", el.attr("w:author").unwrap_or(""), self.budget)?;
+        let date = self.tables.text("a w:date", el.attr("w:date").unwrap_or(""), self.budget)?;
+        Ok((author, date))
+    }
+
     fn note(&mut self, el: &XEl, kind: RevisionKind) -> Result<(u32, u32, u32), String> {
-        let author = self.tables.text(el.attr("w:author").unwrap_or(""));
-        let date = self.tables.text(el.attr("w:date").unwrap_or(""));
+        let (author, date) = self.author_date(el)?;
         self.revisions.note(author, date, kind, self.budget)?;
         let digest = self.canon.start_digest(el, self.budget)?;
         Ok((author, date, self.tables.content(digest)))
@@ -864,8 +894,7 @@ impl Walker<'_, '_> {
 
     /// A wrapper for a change already noted by its own row.
     fn silent_wrap(&mut self, el: &XEl, kind: WrapKind) -> Result<Wrap, String> {
-        let author = self.tables.text(el.attr("w:author").unwrap_or(""));
-        let date = self.tables.text(el.attr("w:date").unwrap_or(""));
+        let (author, date) = self.author_date(el)?;
         let digest = self.canon.start_digest(el, self.budget)?;
         Ok(Wrap { kind, author, date, extra: self.tables.content(digest) })
     }
@@ -1109,16 +1138,20 @@ impl Walker<'_, '_> {
 
     fn paragraph(&mut self, p: &XEl) -> Result<(), String> {
         let properties = first(p, "w:pPr");
-        let style_of = |properties: Option<&XEl>| {
-            properties.and_then(|properties| properties.child("w:pStyle")).and_then(|style| style.attr("w:val")).map(str::to_string)
+        // The style's name is copied for the paragraph's runs: no longer than a kept value.
+        let style_of = |properties: Option<&XEl>| -> Result<Option<String>, String> {
+            let style = properties.and_then(|properties| properties.child("w:pStyle")).and_then(|style| style.attr("w:val"));
+            style.map(|style| kept_value("a paragraph style's name", style).map(str::to_string)).transpose()
         };
         let change = properties.and_then(|properties| first(properties, "w:pPrChange"));
-        let recorded = change.map(|change| {
-            let author = self.tables.text(change.attr("w:author").unwrap_or(""));
-            let date = self.tables.text(change.attr("w:date").unwrap_or(""));
-            (author, date, style_of(first(change, "w:pPr")))
-        });
-        self.paragraph_style = ParagraphStyle { now: style_of(properties), change: recorded };
+        let recorded = match change {
+            Some(change) => {
+                let (author, date) = self.author_date(change)?;
+                Some((author, date, style_of(first(change, "w:pPr"))?))
+            }
+            None => None,
+        };
+        self.paragraph_style = ParagraphStyle { now: style_of(properties)?, change: recorded };
         self.children(p, Place::Inline, &[properties])?;
         // The paragraph mark: its own tracked changes sit in `w:pPr/w:rPr`.
         let mark_properties = properties.and_then(|properties| first(properties, "w:rPr"));
@@ -1218,9 +1251,9 @@ impl Walker<'_, '_> {
         let mut hasher = Hasher::default();
         hasher.field(b'k', if instr { b"instr" } else { b"text" });
         hasher.field(b'x', if exact { b"" } else { space.unwrap_or("none").as_bytes() });
-        let others =
-            XEl { name: Rc::from("text"), attrs: child.attrs.iter().filter(|(key, _)| &**key != "xml:space").cloned().collect(), kids: Vec::new() };
-        self.canon.start_tag(&others, &mut hasher);
+        // The element's other attributes, read in place (never copied: a value can be as long as
+        // its part), as the start tag of an element named `text`.
+        self.canon.start_tag_of("text", child.attrs.iter().filter(|(key, _)| &**key != "xml:space"), &mut hasher);
         let digest = finish(hasher, self.budget)?;
         let mut with_text = slots.to_vec();
         with_text.push(Slot { name: "text", value: self.tables.content(digest), rev: None });
