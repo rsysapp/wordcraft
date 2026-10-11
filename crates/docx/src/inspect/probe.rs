@@ -85,7 +85,7 @@ pub fn comments(xml: &[u8], mark: &mut dyn FnMut()) -> Result<Measured, String> 
 /// What a styles part's styles hide.
 pub fn styles(xml: &[u8], mark: &mut dyn FnMut()) -> Result<Measured, String> {
     let (root, _names) = parsed(xml)?;
-    measure(&mut unlimited(), mark, |budget| Ok(Box::new(StyleHiding::read(&root, budget)?)))
+    measure(&mut unlimited(), mark, |budget| Ok(Box::new(StyleHiding::read(&root, budget).map_err(String::from)?)))
 }
 
 /// Distinct authors and dates of tracked changes.
@@ -423,8 +423,8 @@ pub fn compared(base: &[u8], edited: &[u8], phase: Phase, mark: &mut dyn FnMut()
     let mut budget = unlimited();
     let mut names = Names::default();
     let mut tables = Tables::new();
-    let mut base = super::Side::read(base, &INSPECT_LIMITS, &mut names, &mut tables, &mut budget)?;
-    let mut edited = super::Side::read(edited, &INSPECT_LIMITS, &mut names, &mut tables, &mut budget)?;
+    let mut base = super::Side::read(base, &INSPECT_LIMITS, &mut names, &mut tables, &mut budget, &mut false)?;
+    let mut edited = super::Side::read(edited, &INSPECT_LIMITS, &mut names, &mut tables, &mut budget, &mut false)?;
     let error = |error: super::InspectError| format!("{error:?}");
     measure(&mut budget, mark, |budget| {
         let mut inspection = super::Inspection::default();

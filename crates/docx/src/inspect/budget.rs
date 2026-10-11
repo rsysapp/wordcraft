@@ -169,6 +169,19 @@ pub(super) const fn table_room<T>() -> u64 {
     4 * (size::<T>() + 1) + 64
 }
 
+/// Memory a hash table made with room for `entries`, and never grown past them, holds: its buckets
+/// for that many at its 7/8 load (a power of two, at least four; eight below eight entries), each an
+/// entry's room and a control byte, and its control bytes' tail and alignment.
+pub(super) fn table_sized<T>(entries: usize) -> u64 {
+    let entries = units(entries);
+    let buckets = match entries {
+        0..4 => 4,
+        4..8 => 8,
+        _ => entries.saturating_mul(8).div_ceil(7).checked_next_power_of_two().unwrap_or(u64::MAX),
+    };
+    buckets.saturating_mul(size::<T>() + 1).saturating_add(64)
+}
+
 /// The most entries a B-tree node holds, and the fewest a node other than the root keeps.
 const TREE_CAPACITY: u64 = 11;
 const TREE_FEWEST: u64 = 5;

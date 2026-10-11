@@ -2359,3 +2359,255 @@ fn charges_the_tally_while_a_story_is_compared() {
     assert_eq!(tally.comments_altered.len(), 1_000);
     assert!(budget.held() - held >= 1_000 * 1_000, "held {} for 1,000 ids of 1,000 bytes", budget.held() - held);
 }
+
+// ---- W1-26: style resolution fails closed (the reviewer's 18 hidden-text cases and the rules) ----
+
+/// Character and paragraph styles that show, and ones that hide.
+const SHOWN_AND_HIDDEN: &str = r#"<w:style w:type="character" w:styleId="Plain"/><w:style w:type="character" w:styleId="Hide"><w:rPr><w:vanish/></w:rPr></w:style><w:style w:type="paragraph" w:styleId="PPlain"/><w:style w:type="paragraph" w:styleId="PHide"><w:rPr><w:vanish/></w:rPr></w:style>"#;
+
+/// The base's paragraph, and the save's body `edited`, each package with these styles.
+fn styled_pair(styles: &str, edited: &str) -> (Vec<u8>, Vec<u8>) {
+    (styled(styles, &para(&text("Rent."))), styled(styles, edited))
+}
+
+/// The save is refused as the save, saying why.
+fn assert_save_refused((base, edited): (Vec<u8>, Vec<u8>), why: &str) {
+    let result = inspect(&base, &edited);
+    assert!(matches!(&result, Err(InspectError::Edited(message)) if message.contains(why)), "expected Edited({why}…): {result:?}");
+}
+
+/// The save's new text is reported hidden: `count` characters and marks.
+fn assert_hidden((base, edited): (Vec<u8>, Vec<u8>), count: u32) {
+    let inspection = inspect(&base, &edited).unwrap();
+    assert_eq!(inspection.new_revisions[0].hidden_text, count, "{inspection:#?}");
+}
+
+/// An inserted run with these run properties after the base's text.
+fn inserted_run(properties: &str) -> String {
+    para(&format!("{}{}", text("Rent."), inserted(SARI, &format!(r#"<w:r><w:rPr>{properties}</w:rPr><w:t>more</w:t></w:r>"#))))
+}
+
+/// An inserted run in a style that hides through `styles`.
+fn inserted_in(style: &str) -> String {
+    inserted_run(&format!(r#"<w:rStyle w:val="{style}"/>"#))
+}
+
+/// `w:vanish` on through a markup-compatibility choice Word takes.
+fn alternate_vanish() -> String {
+    format!(r#"<mc:AlternateContent {MC} {W14}><mc:Choice Requires="w14"><w:vanish/></mc:Choice><mc:Fallback/></mc:AlternateContent>"#)
+}
+
+/// D1: two character styles on an inserted run; Word takes the last.
+#[test]
+fn refuses_a_character_style_named_twice() {
+    let edited = inserted_run(r#"<w:rStyle w:val="Plain"/><w:rStyle w:val="Hide"/>"#);
+    assert_save_refused(styled_pair(SHOWN_AND_HIDDEN, &edited), "w:rStyle twice");
+}
+
+/// D2: two paragraph styles on an inserted paragraph.
+#[test]
+fn refuses_a_paragraph_style_named_twice() {
+    let edited = format!(
+        r#"{}<w:p><w:pPr><w:pStyle w:val="PPlain"/><w:pStyle w:val="PHide"/><w:rPr><w:ins w:id="3" w:author="{}" w:date="{}"/></w:rPr></w:pPr>{}</w:p>"#,
+        para(&text("Rent.")),
+        SARI.0,
+        SARI.1,
+        ins(SARI, "more")
+    );
+    assert_save_refused(styled_pair(SHOWN_AND_HIDDEN, &edited), "w:pStyle twice");
+}
+
+/// E3: an inserted paragraph mark naming two character styles (hidden, its paragraph would run
+/// into the next).
+#[test]
+fn refuses_an_inserted_paragraph_mark_naming_two_styles() {
+    let base = styled(SHOWN_AND_HIDDEN, &para(&text("Rent.Due.")));
+    let edited = styled(
+        SHOWN_AND_HIDDEN,
+        &format!(
+            r#"<w:p><w:pPr><w:rPr><w:ins w:id="3" w:author="{}" w:date="{}"/><w:rStyle w:val="Plain"/><w:rStyle w:val="Hide"/></w:rPr></w:pPr>{}</w:p>{}"#,
+            SARI.0,
+            SARI.1,
+            text("Rent."),
+            para(&text("Due."))
+        ),
+    );
+    assert_save_refused((base, edited), "w:rStyle twice");
+}
+
+/// D15: `w:vanish` inside `mc:AlternateContent` in an inserted run's properties.
+#[test]
+fn refuses_alternate_content_in_run_properties() {
+    assert_save_refused(styled_pair(SHOWN_AND_HIDDEN, &inserted_run(&alternate_vanish())), "mc:AlternateContent inside");
+}
+
+/// D3: a style with two sets of run properties, the second hiding.
+#[test]
+fn refuses_a_style_with_two_run_property_sets() {
+    let styles = r#"<w:style w:type="character" w:styleId="Two"><w:rPr/><w:rPr><w:vanish/></w:rPr></w:style>"#;
+    assert_save_refused(styled_pair(styles, &inserted_in("Two")), "w:rPr twice");
+}
+
+/// D6: a style based on two styles, the second hiding.
+#[test]
+fn refuses_a_style_based_on_two_styles() {
+    let styles =
+        format!(r#"{SHOWN_AND_HIDDEN}<w:style w:type="character" w:styleId="Two"><w:basedOn w:val="Plain"/><w:basedOn w:val="Hide"/></w:style>"#);
+    assert_save_refused(styled_pair(&styles, &inserted_in("Two")), "w:basedOn twice");
+}
+
+/// D4a: document defaults with two run defaults, the second hiding.
+#[test]
+fn refuses_two_run_defaults() {
+    let styles = r#"<w:docDefaults><w:rPrDefault><w:rPr/></w:rPrDefault><w:rPrDefault><w:rPr><w:vanish/></w:rPr></w:rPrDefault></w:docDefaults>"#;
+    assert_save_refused(styled_pair(styles, &para(&format!("{}{}", text("Rent."), ins(SARI, "more")))), "w:rPrDefault twice");
+}
+
+/// D4b: a run default with two sets of run properties, the second hiding.
+#[test]
+fn refuses_a_run_default_with_two_property_sets() {
+    let styles = r#"<w:docDefaults><w:rPrDefault><w:rPr/><w:rPr><w:vanish/></w:rPr></w:rPrDefault></w:docDefaults>"#;
+    assert_save_refused(styled_pair(styles, &para(&format!("{}{}", text("Rent."), ins(SARI, "more")))), "w:rPr twice");
+}
+
+/// D12: `w:vanish` in run properties inside the default paragraph style's paragraph properties
+/// counts.
+#[test]
+fn counts_a_vanish_anywhere_in_a_style() {
+    let styles = r#"<w:style w:type="paragraph" w:default="1" w:styleId="Normal"><w:pPr><w:rPr><w:vanish/></w:rPr></w:pPr></w:style>"#;
+    assert_hidden(styled_pair(styles, &para(&format!("{}{}", text("Rent."), ins(SARI, "more")))), 4);
+}
+
+/// D14: `w:vanish` inside `mc:AlternateContent` in a style's run properties.
+#[test]
+fn refuses_alternate_content_in_a_style() {
+    let styles = format!(r#"<w:style w:type="character" w:styleId="Alt"><w:rPr>{}</w:rPr></w:style>"#, alternate_vanish());
+    assert_save_refused(styled_pair(&styles, &inserted_in("Alt")), "mc:AlternateContent inside");
+}
+
+/// D14b: a whole style inside `mc:AlternateContent`.
+#[test]
+fn refuses_a_style_inside_alternate_content() {
+    let styles = format!(
+        r#"<mc:AlternateContent {MC} {W14}><mc:Choice Requires="w14"><w:style w:type="character" w:styleId="Alt"><w:rPr><w:vanish/></w:rPr></w:style></mc:Choice></mc:AlternateContent>"#
+    );
+    assert_save_refused(styled_pair(&styles, &inserted_in("Alt")), "mc:AlternateContent in the styles part");
+}
+
+/// D14c: the document defaults inside `mc:AlternateContent`.
+#[test]
+fn refuses_document_defaults_inside_alternate_content() {
+    let styles = format!(
+        r#"<mc:AlternateContent {MC} {W14}><mc:Choice Requires="w14"><w:docDefaults><w:rPrDefault><w:rPr><w:vanish/></w:rPr></w:rPrDefault></w:docDefaults></mc:Choice></mc:AlternateContent>"#
+    );
+    assert_save_refused(styled_pair(&styles, &para(&format!("{}{}", text("Rent."), ins(SARI, "more")))), "mc:AlternateContent in the styles part");
+}
+
+/// E5: a style placed inside `w:latentStyles`.
+#[test]
+fn refuses_a_style_inside_the_latent_styles() {
+    let styles = r#"<w:latentStyles w:defLockedState="0"><w:style w:type="character" w:styleId="Latent"><w:rPr><w:vanish/></w:rPr></w:style></w:latentStyles>"#;
+    assert_save_refused(styled_pair(styles, &inserted_in("Latent")), "w:style inside w:latentStyles");
+}
+
+/// D7: a paragraph naming a character style takes the default paragraph style, which hides.
+#[test]
+fn takes_the_default_paragraph_style_for_a_style_of_another_kind() {
+    let styles = r#"<w:style w:type="paragraph" w:default="1" w:styleId="Normal"><w:rPr><w:vanish/></w:rPr></w:style><w:style w:type="character" w:styleId="Plain"/>"#;
+    let paragraph = |runs: &str| format!(r#"<w:p><w:pPr><w:pStyle w:val="Plain"/></w:pPr>{runs}</w:p>"#);
+    let base = styled(styles, &paragraph(&text("Rent.")));
+    let edited = styled(styles, &paragraph(&format!("{}{}", text("Rent."), ins(SARI, "more"))));
+    assert_hidden((base, edited), 4);
+}
+
+/// D10: with no style marked the default, the paragraph style with id `Normal` is the default.
+#[test]
+fn takes_normal_as_the_default_paragraph_style_when_none_is_marked() {
+    let styles = r#"<w:style w:type="paragraph" w:styleId="Normal"><w:rPr><w:vanish/></w:rPr></w:style>"#;
+    assert_hidden(styled_pair(styles, &para(&format!("{}{}", text("Rent."), ins(SARI, "more")))), 4);
+}
+
+/// B1: base text whose run a tracked formatting change gives two character styles.
+#[test]
+fn refuses_base_text_given_two_character_styles_by_a_tracked_change() {
+    let edited = format!(
+        r#"<w:p><w:r><w:rPr><w:rStyle w:val="Plain"/><w:rStyle w:val="Hide"/><w:rPrChange w:id="1" w:author="{}" w:date="{}"><w:rPr/></w:rPrChange></w:rPr><w:t xml:space="preserve">Rent.</w:t></w:r></w:p>"#,
+        SARI.0, SARI.1
+    );
+    assert_save_refused(styled_pair(SHOWN_AND_HIDDEN, &edited), "w:rStyle twice");
+}
+
+/// B2: base text whose run a tracked formatting change gives `w:vanish` in `mc:AlternateContent`.
+#[test]
+fn refuses_base_text_given_alternate_content_by_a_tracked_change() {
+    let edited = format!(
+        r#"<w:p><w:r><w:rPr>{}<w:rPrChange w:id="1" w:author="{}" w:date="{}"><w:rPr/></w:rPrChange></w:rPr><w:t xml:space="preserve">Rent.</w:t></w:r></w:p>"#,
+        alternate_vanish(),
+        SARI.0,
+        SARI.1
+    );
+    assert_save_refused(styled_pair(SHOWN_AND_HIDDEN, &edited), "mc:AlternateContent inside");
+}
+
+/// B3: base text whose paragraph a tracked formatting change gives two paragraph styles.
+#[test]
+fn refuses_base_text_given_two_paragraph_styles_by_a_tracked_change() {
+    let edited = format!(
+        r#"<w:p><w:pPr><w:pStyle w:val="PPlain"/><w:pStyle w:val="PHide"/><w:pPrChange w:id="1" w:author="{}" w:date="{}"><w:pPr/></w:pPrChange></w:pPr>{}</w:p>"#,
+        SARI.0,
+        SARI.1,
+        text("Rent.")
+    );
+    assert_save_refused(styled_pair(SHOWN_AND_HIDDEN, &edited), "w:pStyle twice");
+}
+
+/// What else a styles part may say that a reader takes otherwise is refused: one id defined twice,
+/// a style without an id, an id past 256 bytes (256 is read), a base past it, a type or a default
+/// of an unknown value, two default paragraph styles, the document defaults twice, a `Normal`
+/// that is no paragraph style with no default marked. A styles part that only the base holds
+/// refuses the base.
+#[test]
+fn refuses_unsettled_style_definitions() {
+    let body = para(&format!("{}{}", text("Rent."), ins(SARI, "more")));
+    let long = "s".repeat(256);
+    let (base, edited) = styled_pair(&format!(r#"<w:style w:styleId="{long}"/>"#), &body);
+    assert!(inspect(&base, &edited).is_ok());
+    for (styles, why) in [
+        (
+            r#"<w:style w:type="character" w:styleId="A"/><w:style w:type="character" w:styleId="A"><w:rPr><w:vanish/></w:rPr></w:style>"#
+                .to_string(),
+            "defined twice",
+        ),
+        (r#"<w:style w:type="character"><w:rPr><w:vanish/></w:rPr></w:style>"#.to_string(), "without an id"),
+        (format!(r#"<w:style w:styleId="{long}s"/>"#), "style id of 257 bytes"),
+        (format!(r#"<w:style w:styleId="A"><w:basedOn w:val="{long}s"/></w:style>"#), "based on an id past"),
+        (r#"<w:style w:type="Paragraph" w:styleId="A"/>"#.to_string(), "unknown type"),
+        (r#"<w:style w:type="paragraph" w:default="True" w:styleId="A"/>"#.to_string(), "w:default"),
+        (
+            r#"<w:style w:type="paragraph" w:default="1" w:styleId="A"/><w:style w:type="paragraph" w:default="1" w:styleId="B"/>"#.to_string(),
+            "two default",
+        ),
+        (
+            r#"<w:docDefaults/><w:docDefaults><w:rPrDefault><w:rPr><w:vanish/></w:rPr></w:rPrDefault></w:docDefaults>"#.to_string(),
+            "w:docDefaults twice",
+        ),
+        (r#"<w:style w:type="character" w:styleId="Normal"/>"#.to_string(), "Normal"),
+        (r#"<w:style w:type="character" w:styleId="A"><w:rPr><w:docDefaults/></w:rPr></w:style>"#.to_string(), "w:docDefaults inside"),
+    ] {
+        assert_save_refused(styled_pair(&styles, &body), why);
+    }
+    // Only the base's styles part is unsettled: the base is what cannot be read.
+    let base = styled(r#"<w:style w:type="character"/>"#, &para(&text("Rent.")));
+    let edited = styled("", &body);
+    assert!(matches!(inspect(&base, &edited), Err(InspectError::Base(message)) if message.contains("without an id")));
+}
+
+/// `w:vanish` nested inside an element of run properties (which a reader may process as if it were
+/// not there) can hide; the properties a tracked change records before it are not the run's.
+#[test]
+fn counts_a_vanish_nested_in_run_properties() {
+    let nested = r#"<x:wrap xmlns:x="urn:x"><w:vanish/></x:wrap>"#;
+    assert_hidden(styled_pair("", &inserted_run(nested)), 4);
+    let recorded = format!(r#"<w:rPrChange w:id="1" w:author="{}" w:date="{}"><w:rPr><w:vanish/></w:rPr></w:rPrChange>"#, ANA.0, ANA.1);
+    assert_hidden(styled_pair("", &inserted_run(&recorded)), 0);
+}

@@ -70,7 +70,7 @@ use compare::{CommentIds, Holds, Pairs, Projector, RECORD_BYTES, Tally, assign_c
 use digest::{Digest, Hasher};
 use opc::{Bookmarks, Canon, ContentTypes, Rel, Rels};
 use package::StrictPackage;
-use story::{Item, Revisions, StyleHiding, Tables};
+use story::{Item, Refusal, Revisions, StyleHiding, Tables};
 use xml::{Limits, Names};
 
 /// The most token differences compared in one diff; beyond it the comparison stops and says so, so
@@ -329,8 +329,20 @@ fn inspect_budgeted(base: &[u8], edited: &[u8], limits: &ReadLimits, max_changes
     budget.hold(opc::HASHING_BYTES.saturating_add(FIXED_BYTES)).map_err(InspectError::Edited)?;
     let mut names = Names::default();
     let mut tables = Tables::new();
-    let base = Side::read(base, limits, &mut names, &mut tables, budget).map_err(InspectError::Base)?;
-    let edited = Side::read(edited, limits, &mut names, &mut tables, budget).map_err(InspectError::Edited)?;
+    let mut unsettled_styles = false;
+    let base = match Side::read(base, limits, &mut names, &mut tables, budget, &mut unsettled_styles) {
+        Ok(base) => base,
+        // A save keeps its base's styles: when the save's own cannot be settled either, the save
+        // is what cannot be read for certain, and it is the save that is refused.
+        Err(error) if unsettled_styles => {
+            return Err(match Side::read(edited, limits, &mut names, &mut tables, budget, &mut false) {
+                Err(edited_error) => InspectError::Edited(edited_error),
+                Ok(_) => InspectError::Base(error),
+            });
+        }
+        Err(error) => return Err(InspectError::Base(error)),
+    };
+    let edited = Side::read(edited, limits, &mut names, &mut tables, budget, &mut false).map_err(InspectError::Edited)?;
     let inspection = compare(base, edited, &mut tables, max_changes, budget)?;
     // Ids that ran out would make different pieces read as one; no fact stands then.
     if tables.overflowed() {
@@ -452,7 +464,16 @@ fn parse_part(
 }
 
 impl<'a> Side<'a> {
-    fn read(bytes: &'a [u8], limits: &ReadLimits, names: &mut Names, tables: &mut Tables, budget: &mut Budget) -> Result<Side<'a>, String> {
+    /// A package read; `unsettled_styles` is set when its styles part says what a reader may take
+    /// otherwise, which refuses it.
+    fn read(
+        bytes: &'a [u8],
+        limits: &ReadLimits,
+        names: &mut Names,
+        tables: &mut Tables,
+        budget: &mut Budget,
+        unsettled_styles: &mut bool,
+    ) -> Result<Side<'a>, String> {
         let mut package = StrictPackage::open(bytes, limits, budget)?;
         let mut limits = Limits { elements_left: limits.max_elements, max_depth: limits.max_depth.min(crate::xml::MAX_DEPTH) };
         let (all, all_held) = part_names(&package, budget)?;
@@ -505,7 +526,14 @@ impl<'a> Side<'a> {
             let parsed = parse_part(&mut package, &styles, names, &mut limits, budget)?;
             let hiding = StyleHiding::read(&parsed.root, budget);
             budget.release(parsed.held);
-            hiding.map_err(|error| format!("{styles}: {error}"))?
+            match hiding {
+                Ok(hiding) => hiding,
+                Err(Refusal::Budget(error)) => return Err(format!("{styles}: {error}")),
+                Err(Refusal::Unsettled(error)) => {
+                    *unsettled_styles = true;
+                    return Err(format!("{styles}: {error}"));
+                }
+            }
         } else {
             StyleHiding::default()
         };

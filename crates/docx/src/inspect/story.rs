@@ -11,7 +11,7 @@
 use std::collections::{BTreeMap, HashMap};
 use std::rc::Rc;
 
-use super::budget::{Budget, shared_string, table_room, table_slot, tree_room, tree_slot, units, vector_room, vector_slot};
+use super::budget::{Budget, shared_string, table_room, table_sized, table_slot, tree_room, tree_slot, units, vector_room, vector_slot};
 use super::digest::{Digest, Hasher};
 use super::opc::{Canon, finish};
 use super::xml::{XEl, XNode, is_space};
@@ -231,6 +231,10 @@ fn scan(el: &XEl, around: Around<'_>, budget: &mut Budget) -> Result<Holds, Stri
                     budget.work(1)?;
                     holds.content = true;
                     let mut inner = around;
+                    // Markup-compatibility content inside properties is refused.
+                    if PROPERTY_ELEMENTS.contains(&&*child.name) {
+                        walk_below(child, &[], budget)?;
+                    }
                     match &*child.name {
                         "w:fldChar" | "w:fldSimple" | "w:instrText" | "w:delInstrText" => holds.field_codes = holds.field_codes.saturating_add(1),
                         "w:sym" if is_bidi_symbol(child) => holds.bidi_controls = holds.bidi_controls.saturating_add(1),
@@ -244,8 +248,10 @@ fn scan(el: &XEl, around: Around<'_>, budget: &mut Budget) -> Result<Holds, Stri
                         "w:p" => {
                             budget.work(4)?;
                             let properties = child.child("w:pPr");
-                            inner.paragraph_style =
-                                properties.and_then(|properties| properties.child("w:pStyle")).and_then(|style| style.attr("w:val"));
+                            inner.paragraph_style = match properties {
+                                Some(properties) => once(properties, "w:pStyle", budget)?.and_then(|style| style.attr("w:val")),
+                                None => None,
+                            };
                             // Its mark, hidden through its own run properties or its styles.
                             let mark = properties.and_then(|properties| properties.child("w:rPr"));
                             inner.counted = mark;
@@ -255,14 +261,16 @@ fn scan(el: &XEl, around: Around<'_>, budget: &mut Budget) -> Result<Holds, Stri
                         }
                         "w:tbl" => {
                             budget.work(4)?;
-                            let style =
-                                child.child("w:tblPr").and_then(|properties| properties.child("w:tblStyle")).and_then(|style| style.attr("w:val"));
+                            let style = match child.child("w:tblPr") {
+                                Some(properties) => once(properties, "w:tblStyle", budget)?.and_then(|style| style.attr("w:val")),
+                                None => None,
+                            };
                             inner.in_hiding_table |= around.hiding.table(style, budget)?;
                         }
                         // Run properties a run or a paragraph mark were counted by; any others (a
                         // second set, ones in a recorded change) hide by themselves.
                         "w:rPr" if is(child, around.counted) => {}
-                        "w:rPr" if hides(Some(child)) => holds.hidden = holds.hidden.saturating_add(1),
+                        "w:rPr" if hides(Some(child), budget)? => holds.hidden = holds.hidden.saturating_add(1),
                         _ => {}
                     }
                     children(child, inner, holds, budget)?;
@@ -683,157 +691,326 @@ fn empty_marker(el: &XEl) -> bool {
     matches!(&*el.name, "w:proofErr" | "w:lastRenderedPageBreak") && el.kids.is_empty()
 }
 
-/// Whether run properties say the run is hidden: `Some` when they set it either way.
-fn vanish(properties: Option<&XEl>) -> Option<bool> {
-    let mut said = None;
-    for child in properties?.els() {
-        if matches!(&*child.name, "w:vanish" | "w:webHidden" | "w:specVanish") {
-            let on = !matches!(child.attr("w:val"), Some("0" | "false" | "off"));
-            said = Some(said.unwrap_or(false) || on);
+/// Why styles or properties cannot be read for certain, or that the budget ran out reading them.
+pub(super) enum Refusal {
+    /// The work or memory budget ran out (a budget charge's own message).
+    Budget(String),
+    /// What they say is not settled: a reader may take them otherwise than the inspection.
+    Unsettled(String),
+}
+
+impl From<String> for Refusal {
+    /// Budget charges answer a `String`: the budget ran out.
+    fn from(error: String) -> Refusal {
+        Refusal::Budget(error)
+    }
+}
+
+impl From<Refusal> for String {
+    fn from(refusal: Refusal) -> String {
+        match refusal {
+            Refusal::Budget(error) | Refusal::Unsettled(error) => error,
         }
     }
-    said
+}
+
+/// Run property elements that hide what they format, unless switched off.
+const HIDING: &[&str] = &["w:vanish", "w:webHidden", "w:specVanish"];
+
+/// Whether a hiding element is on: anything but an explicit off (fail closed on odd spellings).
+fn on(el: &XEl) -> bool {
+    !matches!(el.attr("w:val"), Some("0" | "false" | "off"))
+}
+
+/// The child of `el` named `name`, once at most: written twice, a reader may take either, so it is
+/// refused (charged per child looked at).
+fn once<'e>(el: &'e XEl, name: &str, budget: &mut Budget) -> Result<Option<&'e XEl>, Refusal> {
+    let mut found = None;
+    for child in el.els() {
+        budget.work(1)?;
+        if &*child.name == name {
+            if found.is_some() {
+                return Err(Refusal::Unsettled(format!("{name} twice in {}", el.name)));
+            }
+            found = Some(child);
+        }
+    }
+    Ok(found)
+}
+
+/// Everything below `el`, walked once (charged per element): whether any hiding element is on
+/// there. Markup-compatibility content is refused anywhere below (which branch a reader takes is
+/// its own), and so is any element named in `refused`.
+fn walk_below(el: &XEl, refused: &[&str], budget: &mut Budget) -> Result<bool, Refusal> {
+    let mut hides = false;
+    for child in el.els() {
+        budget.work(1)?;
+        if &*child.name == "mc:AlternateContent" || refused.contains(&&*child.name) {
+            return Err(Refusal::Unsettled(format!("{} inside {}", child.name, el.name)));
+        }
+        hides |= HIDING.contains(&&*child.name) && on(child);
+        hides |= walk_below(child, refused, budget)?;
+    }
+    Ok(hides)
+}
+
+/// Property elements in content compared whole: markup-compatibility content inside one is refused.
+const PROPERTY_ELEMENTS: &[&str] = &["w:rPr", "w:pPr", "w:tblPr", "w:trPr", "w:tcPr", "w:tblPrEx", "w:sectPr"];
+
+/// Whether run properties say the run is hidden: `Some` when they set it either way. Their own
+/// hiding elements decide either way; one nested deeper (inside an element a reader may process as
+/// if it were not there, by `mc:ProcessContent`) can only hide. The properties a tracked change
+/// records as before it (`w:rPrChange`) are not the run's: they are judged on their own.
+/// Markup-compatibility content inside them is refused.
+fn vanish(properties: Option<&XEl>, budget: &mut Budget) -> Result<Option<bool>, Refusal> {
+    let Some(properties) = properties else { return Ok(None) };
+    let mut said = None;
+    for child in properties.els() {
+        budget.work(1)?;
+        if &*child.name == "mc:AlternateContent" {
+            return Err(Refusal::Unsettled(format!("mc:AlternateContent inside {}", properties.name)));
+        }
+        if HIDING.contains(&&*child.name) {
+            said = Some(said.unwrap_or(false) || on(child));
+        } else if &*child.name != "w:rPrChange" && walk_below(child, &[], budget)? {
+            said = Some(true);
+        }
+    }
+    Ok(said)
 }
 
 /// Run properties that hide what they format, by themselves.
-fn hides(properties: Option<&XEl>) -> bool {
-    vanish(properties).unwrap_or(false)
+fn hides(properties: Option<&XEl>, budget: &mut Budget) -> Result<bool, Refusal> {
+    Ok(vanish(properties, budget)?.unwrap_or(false))
+}
+
+/// The kinds of style (`w:type`; a style naming none is a paragraph style).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum StyleKind {
+    Paragraph,
+    Character,
+    Table,
+    Numbering,
+}
+
+/// What a style hides, once worked out.
+#[derive(Clone, Copy)]
+struct StyleEntry {
+    kind: StyleKind,
+    /// Anything reachable from it (itself, then the styles it is based on) hides.
+    hides: bool,
 }
 
 /// Which styles may hide what they format, read from the styles part, and whether the document's
 /// defaults and default styles do. Hidden text through a style is hidden text as surely as direct
-/// `w:vanish`, and what cannot be settled counts as hidden: Word's `vanish` is a toggle, so the
-/// levels can cancel, but any `vanish` a run can reach through its styles makes it hidden here. A
-/// reader may show text this reports hidden, never the reverse.
+/// `w:vanish`, and what cannot be settled is refused or counts as hidden: Word's `vanish` is a
+/// toggle, so the levels can cancel, but any `vanish` a run can reach through its styles makes it
+/// hidden here. A reader may show text this reports hidden, never the reverse.
 #[derive(Default)]
 pub(super) struct StyleHiding {
-    /// Style id → what its definitions say.
-    styles: HashMap<String, StyleEntry>,
-    /// The document defaults' run properties hide.
+    /// Style id → its entry in `styles`. Ids are hashed once, here; a chain of styles is walked on
+    /// indices.
+    ids: HashMap<String, usize>,
+    styles: Vec<StyleEntry>,
+    /// The document defaults hide (any hiding element on anywhere in `w:docDefaults`).
     defaults: bool,
-    /// The default paragraph, character and table styles hide (each `w:default` style of its type,
-    /// whichever a reader takes).
+    /// The default paragraph, character and table styles hide.
     default_paragraph: bool,
     default_character: bool,
     default_table: bool,
 }
 
-#[derive(Default)]
-struct StyleEntry {
-    /// Its own run properties, or any of its conditional table formats' (`w:tblStylePr`), hide.
-    own: bool,
-    based: Option<String>,
-    /// Defined twice, based on different styles: which a reader takes is not settled.
-    conflicting: bool,
-    /// Which kinds of default style it is.
-    default_of: u8,
-    /// Anything reachable from it hides: worked out once all styles are read.
-    hides: bool,
-}
-
-const DEFAULT_PARAGRAPH: u8 = 1;
-const DEFAULT_CHARACTER: u8 = 2;
-const DEFAULT_TABLE: u8 = 4;
+/// The longest style id read (in the styles part, and named by a story's properties). A longer one
+/// is refused in the styles part, before it is hashed; one named in a story names no style, and may
+/// hide.
+pub(super) const MAX_STYLE_ID: usize = 256;
 
 /// The longest style chain followed; a longer one (or a loop) reads as hiding, since what lies
 /// past it is unknown.
 const MAX_STYLE_CHAIN: usize = 32;
 
-/// Whether run properties hide what they format, by themselves (any of `w:vanish`, `w:webHidden`,
-/// `w:specVanish` on).
-fn may_hide(properties: Option<&XEl>) -> bool {
-    properties.is_some_and(|properties| {
-        properties.els().any(|child| {
-            matches!(&*child.name, "w:vanish" | "w:webHidden" | "w:specVanish") && !matches!(child.attr("w:val"), Some("0" | "false" | "off"))
-        })
-    })
+/// Where a style stands in the walk that works out what it reaches.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Walk {
+    NotYet,
+    /// On the chain being walked now: met again, the chain loops.
+    Walking,
+    Done,
+}
+
+/// A style as read, while what it reaches is worked out (memoised: each is walked once).
+struct Definition<'x> {
+    based_on: Option<&'x str>,
+    based: Option<usize>,
+    kind: StyleKind,
+    default: bool,
+    own: bool,
+    walk: Walk,
+    /// The styles on its chain, itself included, up to `u8::MAX` (a loop).
+    depth: u8,
+    hides: bool,
+}
+
+/// What a hash-table lookup of a name costs: it hashes and compares every byte.
+fn lookup_work(name: &str) -> u64 {
+    2 + units(name.len()) / 8
+}
+
+/// Elements that stand only directly under the styles part's root: one anywhere else is refused.
+const TOP_LEVEL_ONLY: &[&str] = &["w:style", "w:docDefaults"];
+
+/// A style's children a reader takes one of: written twice, the style is refused.
+const STYLE_ONCE: &[&str] = &["w:basedOn", "w:rPr", "w:pPr", "w:tblPr", "w:trPr", "w:tcPr"];
+
+/// `w:default`'s value, or why it is refused.
+fn on_off(what: &str, value: Option<&str>) -> Result<bool, Refusal> {
+    match value {
+        None | Some("0" | "false" | "off") => Ok(false),
+        Some("1" | "true" | "on") => Ok(true),
+        Some(other) => Err(Refusal::Unsettled(format!("{what} of value {:?}", other.chars().take(16).collect::<String>()))),
+    }
 }
 
 impl StyleHiding {
-    pub(super) fn read(root: &XEl, budget: &mut Budget) -> Result<StyleHiding, String> {
-        // Sized from the styles there are, so the table never grows.
+    pub(super) fn read(root: &XEl, budget: &mut Budget) -> Result<StyleHiding, Refusal> {
+        // Sized from the styles there are, so nothing grows: each held at its exact room.
         let count = root.els().filter(|child| &*child.name == "w:style").count();
         budget.work(units(count))?;
-        budget.hold(
-            units(count).saturating_add(1).saturating_mul(table_slot::<(String, StyleEntry)>()).saturating_add(table_room::<(String, StyleEntry)>()),
-        )?;
-        let mut hiding = StyleHiding { styles: HashMap::with_capacity(count), ..StyleHiding::default() };
+        budget.hold(table_sized::<(String, usize)>(count).saturating_add(units(count).saturating_mul(units(std::mem::size_of::<StyleEntry>()))))?;
+        // The definitions and the chain being walked, held while they are worked out.
+        let working = units(count).saturating_mul(units(std::mem::size_of::<Definition<'_>>() + std::mem::size_of::<usize>()));
+        budget.hold(working)?;
+        let mut hiding = StyleHiding { ids: HashMap::with_capacity(count), styles: Vec::with_capacity(count), ..StyleHiding::default() };
+        let mut definitions: Vec<Definition<'_>> = Vec::with_capacity(count);
+        let (mut defaults_read, mut latent_read) = (false, false);
         for child in root.els() {
             budget.work(8)?;
             match &*child.name {
                 "w:docDefaults" => {
-                    let defaults = child.child("w:rPrDefault").and_then(|default| default.child("w:rPr"));
-                    hiding.defaults |= may_hide(defaults);
+                    if std::mem::replace(&mut defaults_read, true) {
+                        return Err(Refusal::Unsettled("w:docDefaults twice".into()));
+                    }
+                    hiding.defaults = read_defaults(child, budget)?;
+                }
+                "w:latentStyles" => {
+                    if std::mem::replace(&mut latent_read, true) {
+                        return Err(Refusal::Unsettled("w:latentStyles twice".into()));
+                    }
+                    walk_below(child, TOP_LEVEL_ONLY, budget)?;
                 }
                 "w:style" => {
-                    let Some(id) = child.attr("w:styleId") else { continue };
-                    let based = child.child("w:basedOn").and_then(|based| based.attr("w:val"));
-                    let own = may_hide(child.child("w:rPr"))
-                        || child.els().any(|format| &*format.name == "w:tblStylePr" && may_hide(format.child("w:rPr")));
-                    let default_of = match (child.attr("w:default"), child.attr("w:type")) {
-                        (Some("1" | "true" | "on"), Some("paragraph") | None) => DEFAULT_PARAGRAPH,
-                        (Some("1" | "true" | "on"), Some("character")) => DEFAULT_CHARACTER,
-                        (Some("1" | "true" | "on"), Some("table")) => DEFAULT_TABLE,
-                        _ => 0,
-                    };
-                    match hiding.styles.get_mut(id) {
-                        Some(entry) => {
-                            entry.own |= own;
-                            entry.conflicting |= entry.based.as_deref() != based;
-                            entry.default_of |= default_of;
-                        }
-                        None => {
-                            budget.hold(units(id.len().saturating_add(based.map_or(0, str::len))))?;
-                            let entry = StyleEntry { own, based: based.map(str::to_string), default_of, ..StyleEntry::default() };
-                            hiding.styles.insert(id.to_string(), entry);
-                        }
-                    }
+                    let definition = hiding.define(child, definitions.len(), budget)?;
+                    definitions.push(definition);
                 }
-                _ => {}
+                "mc:AlternateContent" => return Err(Refusal::Unsettled("mc:AlternateContent in the styles part".into())),
+                _ => {
+                    walk_below(child, TOP_LEVEL_ONLY, budget)?;
+                }
             }
         }
-        // What each style reaches, worked out once: a run asks a single lookup per style.
-        budget.work(units(hiding.styles.len()).saturating_mul(units(MAX_STYLE_CHAIN)))?;
-        budget.hold(units(hiding.styles.len()))?;
-        let reached: Vec<bool> = hiding.styles.keys().map(|id| hiding.reaches(id)).collect();
-        for (entry, hides) in hiding.styles.values_mut().zip(reached) {
-            entry.hides = hides;
-            hiding.default_paragraph |= hides && entry.default_of & DEFAULT_PARAGRAPH != 0;
-            hiding.default_character |= hides && entry.default_of & DEFAULT_CHARACTER != 0;
-            hiding.default_table |= hides && entry.default_of & DEFAULT_TABLE != 0;
+        // Each `basedOn` looked up once, its name hashed and charged per byte.
+        for definition in &mut definitions {
+            if let Some(name) = definition.based_on {
+                budget.work(lookup_work(name))?;
+                definition.based = hiding.ids.get(name).copied();
+            }
         }
-        budget.release(units(hiding.styles.len()));
+        reach(&mut definitions, budget)?;
+        for (entry, definition) in hiding.styles.iter_mut().zip(&definitions) {
+            entry.hides = definition.hides;
+        }
+        hiding.default_paragraph = hiding.default_of(StyleKind::Paragraph, &definitions, budget)?;
+        hiding.default_character = hiding.default_of(StyleKind::Character, &definitions, budget)?;
+        hiding.default_table = hiding.default_of(StyleKind::Table, &definitions, budget)?;
+        drop(definitions);
+        budget.release(working);
         Ok(hiding)
     }
 
-    /// Whether any style reachable from `id` (itself, then the styles it is based on) hides; a loop
-    /// or a chain past `MAX_STYLE_CHAIN` does.
-    fn reaches(&self, id: &str) -> bool {
-        let mut at = id;
-        for _ in 0..MAX_STYLE_CHAIN {
-            let Some(entry) = self.styles.get(at) else { return false };
-            if entry.own || entry.conflicting {
-                return true;
-            }
-            match entry.based.as_deref() {
-                Some(based) => at = based,
-                None => return false,
-            }
+    /// A `w:style` read: its id interned as `index`, and what it says itself.
+    fn define<'x>(&mut self, style: &'x XEl, index: usize, budget: &mut Budget) -> Result<Definition<'x>, Refusal> {
+        let id = style.attr("w:styleId").ok_or_else(|| Refusal::Unsettled("a style without an id".into()))?;
+        if id.len() > MAX_STYLE_ID {
+            return Err(Refusal::Unsettled(format!("a style id of {} bytes", id.len())));
         }
-        true
+        let kind = match style.attr("w:type") {
+            None | Some("paragraph") => StyleKind::Paragraph,
+            Some("character") => StyleKind::Character,
+            Some("table") => StyleKind::Table,
+            Some("numbering") => StyleKind::Numbering,
+            Some(_) => return Err(Refusal::Unsettled("a style of an unknown type".into())),
+        };
+        let default = on_off("a style's w:default", style.attr("w:default"))?;
+        for name in STYLE_ONCE {
+            once(style, name, budget)?;
+        }
+        let based_on = once(style, "w:basedOn", budget)?.and_then(|based| based.attr("w:val"));
+        if based_on.is_some_and(|name| name.len() > MAX_STYLE_ID) {
+            return Err(Refusal::Unsettled("a style based on an id past the longest".into()));
+        }
+        // Any hiding element on anywhere in it: its run properties, its paragraph properties' run
+        // properties, a conditional table format.
+        let own = walk_below(style, TOP_LEVEL_ONLY, budget)?;
+        budget.work(lookup_work(id))?;
+        if self.ids.contains_key(id) {
+            return Err(Refusal::Unsettled("a style id defined twice".into()));
+        }
+        budget.hold(units(id.len()))?;
+        self.ids.insert(id.to_string(), index);
+        self.styles.push(StyleEntry { kind, hides: false });
+        Ok(Definition { based_on, based: None, kind, default, own, walk: Walk::NotYet, depth: 0, hides: false })
     }
 
-    /// Whether a style, or the default style of its kind when none is named or the named one is
-    /// missing, may hide.
-    fn style(&self, id: Option<&str>, default: bool, budget: &mut Budget) -> Result<bool, String> {
+    /// Whether the default style of `kind` hides: the one style of that kind marking itself the
+    /// default; with none, for paragraphs, the style with id `Normal`, as Word takes it. Two defaults
+    /// of a kind, or a `Normal` of another kind, are refused.
+    fn default_of(&self, kind: StyleKind, definitions: &[Definition<'_>], budget: &mut Budget) -> Result<bool, Refusal> {
+        budget.work(units(definitions.len()))?;
+        let mut defaults = definitions.iter().filter(|definition| definition.kind == kind && definition.default);
+        let found = defaults.next().map(|definition| definition.hides);
+        if defaults.next().is_some() {
+            return Err(Refusal::Unsettled(format!("two default {kind:?} styles")));
+        }
+        Ok(match found {
+            Some(hides) => hides,
+            None if kind == StyleKind::Paragraph => match self.ids.get("Normal").and_then(|index| self.styles.get(*index)) {
+                Some(normal) if normal.kind == StyleKind::Paragraph => normal.hides,
+                Some(_) => return Err(Refusal::Unsettled("a style Normal that is no paragraph style, and no default paragraph style".into())),
+                None => false,
+            },
+            None => false,
+        })
+    }
+
+    /// The entry of a style named by a story, the lookup charged per byte.
+    fn entry(&self, id: &str, budget: &mut Budget) -> Result<Option<StyleEntry>, String> {
+        budget.work(lookup_work(id))?;
+        Ok(self.ids.get(id).and_then(|index| self.styles.get(*index)).copied())
+    }
+
+    /// Whether a paragraph of this style may hide its text. A name past [`MAX_STYLE_ID`] names no
+    /// style a reader settles: it may hide. As Word does, a paragraph naming no style, a missing one
+    /// or one of another kind takes the default paragraph style.
+    fn paragraph(&self, id: Option<&str>, budget: &mut Budget) -> Result<bool, String> {
         Ok(match id {
-            // A name longer than any kept value is no style a reader settles: it may hide.
-            Some(id) if id.len() > MAX_KEPT_VALUE => true,
-            Some(id) => {
-                // The lookup hashes and compares the name.
-                budget.work(2 + units(id.len()) / 8)?;
-                self.styles.get(id).map_or(default, |entry| entry.hides)
-            }
+            Some(id) if id.len() > MAX_STYLE_ID => true,
+            Some(id) => match self.entry(id, budget)? {
+                Some(entry) if entry.kind == StyleKind::Paragraph => entry.hides,
+                _ => self.default_paragraph,
+            },
+            None => self.default_paragraph,
+        })
+    }
+
+    /// Whether a style of `kind` named by a story may hide; the default style of its kind when none
+    /// is named or the named one is missing. One of another kind may hide either way.
+    fn of_kind(&self, kind: StyleKind, id: Option<&str>, default: bool, budget: &mut Budget) -> Result<bool, String> {
+        Ok(match id {
+            Some(id) if id.len() > MAX_STYLE_ID => true,
+            Some(id) => match self.entry(id, budget)? {
+                Some(entry) => entry.hides || (entry.kind != kind && default),
+                None => default,
+            },
             None => default,
         })
     }
@@ -841,7 +1018,7 @@ impl StyleHiding {
     /// Whether a table of this style (the default table style when it names none) may hide its
     /// cells' text.
     pub(super) fn table(&self, style: Option<&str>, budget: &mut Budget) -> Result<bool, String> {
-        self.style(style, self.default_table, budget)
+        self.of_kind(StyleKind::Table, style, self.default_table, budget)
     }
 
     /// Whether a run with these direct properties, in a paragraph of this style, inside a table
@@ -855,15 +1032,71 @@ impl StyleHiding {
         in_hiding_table: bool,
         budget: &mut Budget,
     ) -> Result<bool, String> {
-        if let Some(said) = vanish(properties) {
+        if let Some(said) = vanish(properties, budget)? {
             return Ok(said);
         }
-        let character_style = properties.and_then(|properties| properties.child("w:rStyle")).and_then(|style| style.attr("w:val"));
-        Ok(self.style(character_style, self.default_character, budget)?
-            || self.style(paragraph_style, self.default_paragraph, budget)?
+        let character_style = match properties {
+            Some(properties) => once(properties, "w:rStyle", budget)?.and_then(|style| style.attr("w:val")),
+            None => None,
+        };
+        Ok(self.of_kind(StyleKind::Character, character_style, self.default_character, budget)?
+            || self.paragraph(paragraph_style, budget)?
             || in_hiding_table
             || self.defaults)
     }
+}
+
+/// `w:docDefaults` read: whether any hiding element is on anywhere in it. Each default, and the
+/// properties in it, written twice is refused.
+fn read_defaults(defaults: &XEl, budget: &mut Budget) -> Result<bool, Refusal> {
+    if let Some(run) = once(defaults, "w:rPrDefault", budget)? {
+        once(run, "w:rPr", budget)?;
+    }
+    if let Some(paragraph) = once(defaults, "w:pPrDefault", budget)? {
+        once(paragraph, "w:pPr", budget)?;
+    }
+    walk_below(defaults, TOP_LEVEL_ONLY, budget)
+}
+
+/// What each style reaches, worked out once per style (memoised): a chain is walked up to a style
+/// already worked out, its end, or a loop, then each style on it is settled on the way back. Each
+/// style is walked once, at one unit; a loop or a chain past [`MAX_STYLE_CHAIN`] hides.
+fn reach(definitions: &mut [Definition<'_>], budget: &mut Budget) -> Result<(), Refusal> {
+    // The chain being walked: each style is on it at most once, so it never grows past the count
+    // (charged with the definitions).
+    let mut path: Vec<usize> = Vec::with_capacity(definitions.len());
+    for start in 0..definitions.len() {
+        if definitions.get(start).is_none_or(|definition| definition.walk == Walk::Done) {
+            continue;
+        }
+        path.clear();
+        let mut at = start;
+        let (mut hides, mut depth) = loop {
+            budget.work(1)?;
+            let Some(definition) = definitions.get_mut(at) else { break (true, u8::MAX) };
+            match definition.walk {
+                Walk::Done => break (definition.hides, definition.depth),
+                Walk::Walking => break (true, u8::MAX),
+                Walk::NotYet => {}
+            }
+            definition.walk = Walk::Walking;
+            path.push(at);
+            match definition.based {
+                Some(next) => at = next,
+                None => break (false, 0),
+            }
+        };
+        while let Some(index) = path.pop() {
+            depth = depth.saturating_add(1);
+            if let Some(definition) = definitions.get_mut(index) {
+                hides |= definition.own || usize::from(depth) > MAX_STYLE_CHAIN;
+                definition.hides = hides;
+                definition.depth = depth;
+                definition.walk = Walk::Done;
+            }
+        }
+    }
+    Ok(())
 }
 
 /// A paragraph's style, and the style a tracked change of its properties records before it.
@@ -1030,6 +1263,10 @@ impl Walker<'_, '_> {
         inner: &str,
         skip: &dyn Fn(&XEl) -> bool,
     ) -> Result<Option<Slot>, String> {
+        // Markup-compatibility content anywhere inside properties is refused.
+        if let Some(property) = property {
+            walk_below(property, &[], self.budget)?;
+        }
         let present_counts = matches!(name, "sectPr" | "pPr.sectPr");
         let change = property.map(|property| trailing(property, change_name, &[])).transpose()?.flatten();
         let value = self.value(property, &|child| is(child, change) || skip(child), present_counts)?;
@@ -1245,20 +1482,24 @@ impl Walker<'_, '_> {
 
     fn paragraph(&mut self, p: &XEl) -> Result<(), String> {
         let properties = leading(p, "w:pPr", &[])?;
-        // The style's name is copied for the paragraph's runs: no longer than a kept value.
-        let style_of = |properties: Option<&XEl>| -> Result<Option<String>, String> {
-            let style = properties.and_then(|properties| properties.child("w:pStyle")).and_then(|style| style.attr("w:val"));
+        // The style's name is copied for the paragraph's runs: no longer than a kept value. A style
+        // named twice is refused.
+        let style_of = |properties: Option<&XEl>, budget: &mut Budget| -> Result<Option<String>, String> {
+            let style = match properties {
+                Some(properties) => once(properties, "w:pStyle", budget)?.and_then(|style| style.attr("w:val")),
+                None => None,
+            };
             style.map(|style| kept_value("a paragraph style's name", style).map(str::to_string)).transpose()
         };
         let change = properties.map(|properties| trailing(properties, "w:pPrChange", &[])).transpose()?.flatten();
         let recorded = match change {
             Some(change) => {
                 let (author, date) = self.author_date(change)?;
-                Some((author, date, style_of(leading(change, "w:pPr", &[])?)?))
+                Some((author, date, style_of(leading(change, "w:pPr", &[])?, self.budget)?))
             }
             None => None,
         };
-        self.paragraph_style = ParagraphStyle { now: style_of(properties)?, change: recorded };
+        self.paragraph_style = ParagraphStyle { now: style_of(properties, self.budget)?, change: recorded };
         self.children(p, Place::Inline, &[properties])?;
         // The paragraph mark: its own tracked changes sit in `w:pPr/w:rPr`.
         let mark_properties = properties.map(|properties| trailing(properties, "w:rPr", &["w:sectPr", "w:pPrChange"])).transpose()?.flatten();
@@ -1387,7 +1628,10 @@ impl Walker<'_, '_> {
         }
         let shared: Vec<Wrap> = shared.filter(|first_row| all_alike && !first_row.is_empty()).unwrap_or_default();
         // Text in the table's cells is hidden when its style (or the default table style) may hide.
-        let style = properties.and_then(|properties| properties.child("w:tblStyle")).and_then(|style| style.attr("w:val"));
+        let style = match properties {
+            Some(properties) => once(properties, "w:tblStyle", self.budget)?.and_then(|style| style.attr("w:val")),
+            None => None,
+        };
         let hides = self.hiding.table(style, self.budget)?;
         let depth = self.stack.len();
         for wrap in &shared {
