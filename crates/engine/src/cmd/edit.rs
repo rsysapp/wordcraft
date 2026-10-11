@@ -106,7 +106,8 @@ fn paste_text(s: &mut Session, v: &Value) -> CmdResult {
         Some(t) => t.to_string(),
         None => s.clipboard.as_ref().map(Fragment::plain_text).unwrap_or_default(),
     };
-    super::type_text(s, &text.replace("\r\n", "\r").replace('\n', "\r"))?;
+    // embed: an edit session's refusal names the paste, not typing.
+    super::type_text_as(s, &text.replace("\r\n", "\r").replace('\n', "\r"), "paste")?;
     sel_result(s)
 }
 

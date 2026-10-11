@@ -167,6 +167,9 @@ pub struct Session {
     pub(crate) edit_floor: usize,
     /// embed: why the last command was refused by an edit session (`None` when it was not).
     pub refusal: Option<crate::edit_mode::Refusal>,
+    /// embed: the author `begin_edit` was given. `author` is put back to it before every command of
+    /// the session, so nothing but `begin_edit` names the author of the session's changes.
+    edit_author: String,
 }
 
 /// Maximum undo depth.
@@ -214,6 +217,7 @@ impl Session {
             revision_date: None,
             edit_floor: 0,
             refusal: None,
+            edit_author: String::new(),
         }
     }
 
@@ -331,14 +335,19 @@ impl Session {
     /// Undo and redo start afresh, so neither reaches past the session's start, and the changes this
     /// session makes are told apart by their records, made from here on. Starting again with other
     /// rules or another date ends the session before and starts a new one: one date per save.
-    /// Refused without an author or a valid date, leaving everything as it was.
+    /// Refused without an author or a valid date, leaving everything as it was. The same author,
+    /// date and rules as the session running keep it as it is: that is not a new session.
     pub fn begin_edit(&mut self, author: &str, revision_date: &str, rules: crate::edit_mode::EditRules) -> Result<(), CmdError> {
         let blank = author.trim().is_empty() || author.chars().count() > 255;
         if blank || !crate::edit_mode::is_revision_date(revision_date) {
-            return Err(self.refused("begin_edit", crate::edit_mode::Refusal::InvalidEditSession));
+            return Err(self.refused("begin_edit", crate::edit_mode::Refusal::InvalidEditSession, None));
+        }
+        if self.edit_rules == Some(rules) && self.revision_date.as_deref() == Some(revision_date) && self.edit_author == author {
+            return Ok(());
         }
         self.view_only = false;
         self.author = author.to_string();
+        self.edit_author = author.to_string();
         self.edit_rules = Some(rules);
         self.revision_date = Some(revision_date.to_string());
         self.edit_floor = self.doc.revisions.len();
@@ -357,6 +366,7 @@ impl Session {
         self.edit_rules = None;
         self.revision_date = None;
         self.edit_floor = 0;
+        self.edit_author.clear();
     }
 
     /// embed: the edit session's rules, while one runs.
@@ -370,8 +380,8 @@ impl Session {
     }
 
     /// embed: an edit session's refusal of `id`, recorded where the host reads it.
-    fn refused(&mut self, id: &str, refusal: crate::edit_mode::Refusal) -> CmdError {
-        let error = CmdError::Editing(crate::edit_mode::EditRefusal { refusal, command: id.to_string() });
+    fn refused(&mut self, id: &str, refusal: crate::edit_mode::Refusal, detail: Option<String>) -> CmdError {
+        let error = CmdError::Editing(crate::edit_mode::EditRefusal { refusal, command: id.to_string(), detail });
         self.status = error.to_string();
         self.refusal = Some(refusal);
         error
@@ -401,6 +411,27 @@ impl Session {
     /// control channel). Mutating commands are undoable; a failed command leaves the document as
     /// it was; a panic inside a command becomes an error.
     pub fn run(&mut self, id: &str, params: &Value) -> Result<Value, CmdError> {
+        let result = self.run_command(id, params);
+        // embed: in an edit session every error is a refusal with a stable code, for the host to map
+        // to its own message: an unknown command, bad parameters and a command that does not apply
+        // here (nothing selected, nothing to undo) included.
+        match result {
+            Err(error) if self.edit_rules.is_some() => {
+                use crate::edit_mode::Refusal;
+                let (refusal, detail) = match error {
+                    CmdError::Editing(_) => return Err(error),
+                    CmdError::Unknown(_) => (Refusal::UnknownCommand, None),
+                    CmdError::Params(detail) => (Refusal::InvalidParameters, Some(detail)),
+                    CmdError::Disabled(detail) => (Refusal::NotAvailable, Some(detail)),
+                    CmdError::Failed(detail) => (Refusal::CommandFailed, Some(detail)),
+                };
+                Err(self.refused(id, refusal, detail))
+            }
+            other => other,
+        }
+    }
+
+    fn run_command(&mut self, id: &str, params: &Value) -> Result<Value, CmdError> {
         let reg = self.registry.clone();
         self.refusal = None;
         let Some(spec) = reg.get(id) else { return Err(CmdError::Unknown(id.to_string())) };
@@ -412,29 +443,27 @@ impl Session {
         // a tab character there, never the cell, row, list-level or indent moves `text.tab` makes in
         // the full application (embed API "Keyboard in edit mode").
         if let Some(rules) = self.edit_rules {
-            use crate::edit_mode::{DECIDE, Refusal, TAB, allows, editable_story, tab_params};
+            use crate::edit_mode::{Refusal, TAB, allows, editable_story, refusal_for, tab_params};
             // Tracking is on for the whole session, whatever the document's own setting, so no
             // allowed command can make an untracked change (embed API 0.2, "WordCraft tracks every change").
             self.doc.settings.track_changes = true;
+            // Only `begin_edit` names the session's author, whatever wrote `author` since.
+            if self.author != self.edit_author {
+                self.author.clone_from(&self.edit_author);
+            }
             if id == TAB {
                 return self.run("text.insert", &tab_params());
             }
             if !allows(id, rules) {
-                let refusal = match id {
-                    _ if DECIDE.contains(&id) => Refusal::DecisionNotAllowed,
-                    // Enter: off until the writer records an inserted paragraph mark (Ruling 6C-10).
-                    "text.newParagraph" => Refusal::ParagraphBreakNotSupported,
-                    _ => Refusal::CommandNotAllowed,
-                };
-                return Err(self.refused(id, refusal));
+                return Err(self.refused(id, refusal_for(id, rules), None));
             }
             // Redo replays a whole document state: one a decision made needs the permission now.
             if id == "edit.redo" && !rules.may_decide && self.redo.last().is_some_and(|step| step.decision) {
-                return Err(self.refused(id, Refusal::DecisionNotAllowed));
+                return Err(self.refused(id, Refusal::DecisionNotAllowed, None));
             }
             // Comments and text boxes stay as the file has them (Ruling W2-2).
             if spec.mutates && !(editable_story(&self.doc, self.sel.anchor.story) && editable_story(&self.doc, self.sel.focus.story)) {
-                return Err(self.refused(id, Refusal::OutsideEditableStory));
+                return Err(self.refused(id, Refusal::OutsideEditableStory, None));
             }
         }
         if let Some(why) = (spec.enabled)(self) {
@@ -446,9 +475,14 @@ impl Session {
         {
             let allowed = id.starts_with("review.restrict") || id.starts_with("file.") || id == "edit.undo" || id == "edit.redo";
             let comment_ok = id.starts_with("review.") && (id.contains("Comment") || id == "review.reply");
+            // embed: an edit session's refusal carries its code (`document_protected`).
+            let protected = |session: &mut Session, detail: String| match session.edit_rules {
+                Some(_) => session.refused(id, crate::edit_mode::Refusal::DocumentProtected, Some(detail)),
+                None => CmdError::Disabled(detail),
+            };
             match mode.as_str() {
-                "readOnly" | "forms" if !allowed => return Err(CmdError::Disabled(format!("{id}: the document is protected (read only)"))),
-                "comments" if !allowed && !comment_ok => return Err(CmdError::Disabled(format!("{id}: only comments are allowed in this document"))),
+                "readOnly" | "forms" if !allowed => return Err(protected(self, format!("{id}: the document is protected (read only)"))),
+                "comments" if !allowed && !comment_ok => return Err(protected(self, format!("{id}: only comments are allowed in this document"))),
                 "trackedChanges" => self.doc.settings.track_changes = true,
                 _ => {}
             }

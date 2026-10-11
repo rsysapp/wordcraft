@@ -74,16 +74,31 @@ pub enum Refusal {
     OutsideEditableStory,
     /// `Session::begin_edit` without an author, or without a revision date in UTC whole seconds.
     InvalidEditSession,
+    /// No command has this id.
+    UnknownCommand,
+    /// The command's parameters are missing or malformed.
+    InvalidParameters,
+    /// The command does not apply where the selection is (nothing selected, nothing to undo…).
+    NotAvailable,
+    /// The document's own Restrict Editing setting refuses the change.
+    DocumentProtected,
+    /// The command failed; the document is as it was.
+    CommandFailed,
 }
 
 impl Refusal {
-    pub const ALL: [Refusal; 6] = [
+    pub const ALL: [Refusal; 11] = [
         Refusal::CommandNotAllowed,
         Refusal::DecisionNotAllowed,
         Refusal::ParagraphBreakNotSupported,
         Refusal::CharacterNotAllowed,
         Refusal::OutsideEditableStory,
         Refusal::InvalidEditSession,
+        Refusal::UnknownCommand,
+        Refusal::InvalidParameters,
+        Refusal::NotAvailable,
+        Refusal::DocumentProtected,
+        Refusal::CommandFailed,
     ];
 
     pub const fn code(self) -> &'static str {
@@ -94,6 +109,11 @@ impl Refusal {
             Refusal::CharacterNotAllowed => "character_not_allowed",
             Refusal::OutsideEditableStory => "outside_editable_story",
             Refusal::InvalidEditSession => "invalid_edit_session",
+            Refusal::UnknownCommand => "unknown_command",
+            Refusal::InvalidParameters => "invalid_parameters",
+            Refusal::NotAvailable => "not_available",
+            Refusal::DocumentProtected => "document_protected",
+            Refusal::CommandFailed => "command_failed",
         }
     }
 
@@ -105,21 +125,50 @@ impl Refusal {
             Refusal::CharacterNotAllowed => "the text holds a break or control character that cannot be typed while editing",
             Refusal::OutsideEditableStory => "only the document's text, headers, footers and notes can be edited; comments cannot",
             Refusal::InvalidEditSession => "an edit session needs an author and a revision date in UTC whole seconds",
+            Refusal::UnknownCommand => "there is no such command",
+            Refusal::InvalidParameters => "the command's parameters are missing or malformed",
+            Refusal::NotAvailable => "the command does not apply here",
+            Refusal::DocumentProtected => "the document is protected against this change",
+            Refusal::CommandFailed => "the command failed and the document is as it was",
         }
     }
 }
 
-/// A refusal of an edit session, as [`crate::CmdError::Editing`] carries it.
+/// A refusal of an edit session, as [`crate::CmdError::Editing`] carries it. `detail` is the
+/// command's own error, for logs, when the refusal stands for one.
 #[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
-#[error("{command}: not available while editing [{code}]: {reason}", code = .refusal.code(), reason = .refusal.reason())]
+#[error(
+    "{command}: not available while editing [{code}]: {reason}{detail}",
+    code = .refusal.code(),
+    reason = .refusal.reason(),
+    detail = .detail.as_deref().map(|detail| format!(" ({detail})")).unwrap_or_default()
+)]
 pub struct EditRefusal {
     pub refusal: Refusal,
     pub command: String,
+    pub detail: Option<String>,
+}
+
+impl EditRefusal {
+    pub fn new(refusal: Refusal, command: &str) -> Self {
+        EditRefusal { refusal, command: command.to_string(), detail: None }
+    }
+}
+
+/// Why an edit session with `rules` refuses `id`, a command it does not run (`allows` is false).
+/// The host's own gate and `Session::run` answer the same.
+pub fn refusal_for(id: &str, rules: EditRules) -> Refusal {
+    match id {
+        _ if DECIDE.contains(&id) && !rules.may_decide => Refusal::DecisionNotAllowed,
+        // Enter: off until the writer records an inserted paragraph mark (Ruling 6C-10).
+        "text.newParagraph" => Refusal::ParagraphBreakNotSupported,
+        _ => Refusal::CommandNotAllowed,
+    }
 }
 
 /// The message a command off the allow-list is refused with.
 pub fn refusal(id: &str) -> String {
-    EditRefusal { refusal: Refusal::CommandNotAllowed, command: id.to_string() }.to_string()
+    EditRefusal::new(Refusal::CommandNotAllowed, id).to_string()
 }
 
 /// Why typed or pasted `text` cannot go into an edit session, if it cannot.
@@ -155,7 +204,7 @@ pub fn editable_story(doc: &Document, story: StoryRef) -> bool {
 }
 
 /// Whether `date` is a revision date an edit session stamps: ISO 8601 UTC to the second,
-/// `YYYY-MM-DDTHH:MM:SSZ`, as Word stores it.
+/// `YYYY-MM-DDTHH:MM:SSZ`, as Word stores it, on a day the calendar has.
 pub fn is_revision_date(date: &str) -> bool {
     let bytes = date.as_bytes();
     let shape = bytes.len() == 20
@@ -167,10 +216,14 @@ pub fn is_revision_date(date: &str) -> bool {
             _ => byte.is_ascii_digit(),
         });
     let number = |range: std::ops::Range<usize>| date.get(range).and_then(|part| part.parse::<u32>().ok()).unwrap_or(u32::MAX);
-    shape
-        && (1..=12).contains(&number(5..7))
-        && (1..=31).contains(&number(8..10))
-        && number(11..13) < 24
-        && number(14..16) < 60
-        && number(17..19) < 60
+    let (year, month) = (number(0..4), number(5..7));
+    let leap = year % 4 == 0 && (year % 100 != 0 || year % 400 == 0);
+    // A real calendar day: 2026-02-31 is no date, 2028-02-29 is.
+    let days = match month {
+        2 if leap => 29,
+        2 => 28,
+        4 | 6 | 9 | 11 => 30,
+        _ => 31,
+    };
+    shape && (1..=12).contains(&month) && (1..=days).contains(&number(8..10)) && number(11..13) < 24 && number(14..16) < 60 && number(17..19) < 60
 }

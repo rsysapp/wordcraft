@@ -448,6 +448,12 @@ mod saves {
             (EDITOR, "2026-10-10T08:00:00+07:00"),
             (EDITOR, "2026-13-10T08:00:00Z"),
             (EDITOR, "2026-10-10T24:00:00Z"),
+            // Days the calendar does not have.
+            (EDITOR, "2026-02-31T08:00:00Z"),
+            (EDITOR, "2026-04-31T08:00:00Z"),
+            (EDITOR, "2026-02-29T08:00:00Z"),
+            (EDITOR, "1900-02-29T08:00:00Z"),
+            (EDITOR, "2026-10-00T08:00:00Z"),
         ] {
             let refused = s.begin_edit(author, date, EditRules { may_decide: true });
             assert_eq!(refused.as_ref().map_err(CmdError::edit_refusal), Err(Some(Refusal::InvalidEditSession)), "{author:?} {date:?}");
@@ -462,15 +468,108 @@ mod saves {
     }
 
     #[test]
+    fn leap_days_are_revision_dates() {
+        let mut s = Session::new(Document::from_text("Rent is due."));
+        for date in ["2028-02-29T08:00:00Z", "2000-02-29T23:59:59Z", "2026-12-31T00:00:00Z"] {
+            assert!(edit_mode::is_revision_date(date), "{date}");
+            assert!(s.begin_edit(EDITOR, date, EditRules { may_decide: false }).is_ok(), "{date}");
+        }
+    }
+
+    // W3: an edit session answers every error with a code the host maps, not only its own rules.
+    #[test]
+    fn every_error_in_an_edit_session_carries_a_code() {
+        let mut s = Session::new(Document::from_text("Rent is due."));
+        start_editing(&mut s, false);
+        for (id, params, refusal) in [
+            ("no.suchCommand", json!({}), Refusal::UnknownCommand),
+            ("select.text", json!({}), Refusal::InvalidParameters),
+            ("edit.cut", json!({}), Refusal::NotAvailable),
+        ] {
+            let refused = s.run(id, &params);
+            assert_eq!(refused.as_ref().map_err(CmdError::edit_refusal), Err(Some(refusal)), "{id}: {refused:?}");
+            assert_eq!(s.refusal, Some(refusal), "{id}");
+            assert!(s.status.contains(refusal.code()), "{id}: {}", s.status);
+        }
+        // The document's own Restrict Editing.
+        let mut doc = Document::from_text("Rent is due.");
+        doc.settings.protection = Some("readOnly".into());
+        let mut protected = Session::new(doc);
+        start_editing(&mut protected, false);
+        let refused = protected.run("text.insert", &json!({"text": "x"}));
+        assert_eq!(refused.as_ref().map_err(CmdError::edit_refusal), Err(Some(Refusal::DocumentProtected)), "{refused:?}");
+        assert_eq!(protected.doc.plain_text(StoryRef::Body), "Rent is due.");
+        // Outside an edit session the errors are as they always were.
+        let mut full = Session::new(Document::from_text("Rent is due."));
+        assert!(matches!(full.run("no.suchCommand", &json!({})), Err(CmdError::Unknown(_))));
+        assert!(matches!(full.run("edit.cut", &json!({})), Err(CmdError::Disabled(_))));
+    }
+
+    #[test]
+    fn a_refused_paste_names_the_paste() {
+        let mut s = Session::new(Document::from_text("Rent is due."));
+        start_editing(&mut s, false);
+        let refused = s.run("edit.pasteText", &json!({"text": "a\nb"})).unwrap_err().to_string();
+        assert!(refused.starts_with("paste: "), "{refused}");
+        let typed = s.run("text.insert", &json!({"text": "a\rb"})).unwrap_err().to_string();
+        assert!(typed.starts_with("typing: "), "{typed}");
+    }
+
+    // W3: the same author, date and rules again is the session running, not a new one.
+    #[test]
+    fn beginning_the_same_session_again_keeps_it() {
+        let mut s = Session::new(Document::from_text(""));
+        start_editing(&mut s, false);
+        s.run("text.insert", &json!({"text": "abc"})).unwrap();
+        start_editing(&mut s, false);
+        assert!(s.can_undo(), "history stays");
+        s.run("select.all", &json!({})).unwrap();
+        s.run("text.delete", &json!({})).unwrap();
+        assert!(!s.doc.plain_text(StoryRef::Body).contains("abc"), "the insertion is still this session's own");
+        // Another date is another session.
+        s.run("edit.undo", &json!({})).unwrap();
+        s.begin_edit(EDITOR, "2026-10-11T08:00:00Z", EditRules { may_decide: false }).unwrap();
+        assert!(!s.can_undo());
+        s.run("select.all", &json!({})).unwrap();
+        s.run("text.delete", &json!({})).unwrap();
+        assert!(s.doc.plain_text(StoryRef::Body).contains("abc"), "an earlier session's insertion is marked deleted");
+    }
+
+    // W3: only `begin_edit` names the author of a session's changes, whatever writes `author`.
+    #[test]
+    fn the_session_s_author_is_the_one_begin_edit_was_given() {
+        let mut s = Session::new(Document::from_text("Rent is due."));
+        start_editing(&mut s, false);
+        s.author = "Someone Else".into();
+        s.run("text.insert", &json!({"text": "Monthly: "})).unwrap();
+        assert_eq!(s.doc.revisions.last().map(|revision| revision.author.as_str()), Some(EDITOR));
+        assert!(s.run("file.setAuthor", &json!({"name": "Someone Else"})).is_err());
+        s.end_edit();
+        s.author = "Someone Else".into();
+        s.run("text.insert", &json!({"text": "x"})).unwrap();
+        assert_eq!(s.author, "Someone Else", "outside a session the application's own name stands");
+    }
+
+    #[test]
     fn every_refusal_has_its_own_stable_code() {
         let codes: Vec<&str> = Refusal::ALL.iter().map(|refusal| refusal.code()).collect();
         let mut unique = codes.clone();
         unique.sort_unstable();
         unique.dedup();
         assert_eq!(unique.len(), codes.len());
-        for code in
-            ["paragraph_break_not_supported", "character_not_allowed", "outside_editable_story", "decision_not_allowed", "command_not_allowed"]
-        {
+        for code in [
+            "paragraph_break_not_supported",
+            "character_not_allowed",
+            "outside_editable_story",
+            "decision_not_allowed",
+            "command_not_allowed",
+            "invalid_edit_session",
+            "unknown_command",
+            "invalid_parameters",
+            "not_available",
+            "document_protected",
+            "command_failed",
+        ] {
             assert!(codes.contains(&code), "{code}");
         }
     }

@@ -133,12 +133,17 @@ fn track_delete(s: &mut Session, a: &Pos, b: &Pos) -> Result<Pos, CmdError> {
 
 /// Insert typed text at the caret (replacing the selection), with pending formatting and track changes.
 pub fn type_text(s: &mut Session, text: &str) -> Result<(), CmdError> {
+    type_text_as(s, text, "typing")
+}
+
+/// `type_text`, naming what put the text in (`typing`, `paste`) when an edit session refuses it.
+pub fn type_text_as(s: &mut Session, text: &str, what: &str) -> Result<(), CmdError> {
     // embed: an edit session cannot save a new paragraph as a tracked change yet (`edit_mode::COMMANDS`),
     // and types no break or control character the reader would not see as typed text.
     if s.edit_rules.is_some()
         && let Err(refusal) = crate::edit_mode::check_text(text)
     {
-        return Err(CmdError::Editing(crate::edit_mode::EditRefusal { refusal, command: "typing".into() }));
+        return Err(CmdError::Editing(crate::edit_mode::EditRefusal::new(refusal, what)));
     }
     let mut props = s.typing_props();
     delete_selection(s)?;

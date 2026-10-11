@@ -289,10 +289,12 @@ not followed.
 
 The engine's side of API 0.2's edit mode is in place; the host bridge (`setMode`, the edit strip,
 saving) is not yet. `Session::begin_edit(author, revisionDate, rules)` is the only way into an
-edit session. It refuses a blank author or a date that is not UTC whole seconds
-(`2026-10-10T08:00:00Z`), forces tracking on and clears undo and redo, so neither reaches past the
-session's start. Starting again with other rules or another date starts a new session, so one save
-carries one date. In a session, `Session::run` runs only `wordcraft_engine::edit_mode`'s
+edit session. It refuses a blank author or a date that is not UTC whole seconds on a calendar day
+(`2026-10-10T08:00:00Z`; `2026-02-31T08:00:00Z` is refused), forces tracking on and clears undo and
+redo, so neither reaches past the session's start. Starting again with another author, other rules
+or another date starts a new session, so one save carries one date; starting again with the same
+ones keeps the session running. Only `begin_edit` names the session's author: `Session::author` is
+put back to it before every command of the session, whatever wrote it since. In a session, `Session::run` runs only `wordcraft_engine::edit_mode`'s
 allow-list: typing, deleting, line breaks, nonbreaking spaces and hyphens, Tab as a tracked tab
 character, cut, paste as plain text, undo, redo and moving between changes; accepting and rejecting
 only with the permission to decide. Every change is a tracked change by the session's author,
@@ -303,7 +305,8 @@ tracked. Only the main text, headers, footers, footnotes and endnotes are edited
 text boxes stay as the file has them.
 
 A refusal is `CmdError::Editing`, with a stable code in `edit_mode::Refusal::code`, also left in
-`Session::refusal` and `Session::status`, for the host to map to its own message:
+`Session::refusal` and `Session::status`, for the host to map to its own message. In an edit
+session every error `Session::run` answers is one, so the host never parses an error's text:
 
 | Code | Refused |
 |---|---|
@@ -313,6 +316,11 @@ A refusal is `CmdError::Editing`, with a stable code in `edit_mode::Refusal::cod
 | `character_not_allowed` | typed or pasted page or column breaks, other control characters, and directional formatting characters |
 | `outside_editable_story` | an edit with the selection in a comment or a text box |
 | `invalid_edit_session` | `begin_edit` without an author or a valid date |
+| `unknown_command` | a command id nothing registers |
+| `invalid_parameters` | missing or malformed parameters |
+| `not_available` | a command that does not apply where the selection is (Cut with nothing selected) |
+| `document_protected` | a change the document's own Restrict Editing setting refuses |
+| `command_failed` | a command that failed; the document is as it was |
 
 **Known limitation: new paragraphs.** API 0.2 lists new paragraphs among edit mode's edits, but
 Enter is not available in edit mode yet, and pasted text with paragraph breaks is refused. The
