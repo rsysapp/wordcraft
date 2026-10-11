@@ -171,9 +171,9 @@ pub enum ModeRequest {
     },
 }
 
-/// The person editing: their display name authors every tracked change of the session.
+/// The person editing: their display name authors every tracked change of the session. Other
+/// fields a host sends are ignored, as the embed API allows.
 #[derive(Clone, Debug, PartialEq, Eq, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct AuthorSpec {
     pub id: String,
     pub name: String,

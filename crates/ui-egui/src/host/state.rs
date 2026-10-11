@@ -90,14 +90,21 @@ pub struct HostState {
     /// succeeded (a refused open leaves nothing to edit).
     pub(crate) file_name: String,
     pub(crate) file_open: bool,
-    /// A save or a comment asked for during the frame, answered after it (`edit::after_frame`).
-    pub(crate) save_asked: bool,
+    /// A comment asked for during the frame, answered after it once its page is drawn
+    /// (`edit::after_frame`).
     pub(crate) comment_asked: bool,
-    /// An edit session that ended (or was begun again, which clears undo) had changed the opened
-    /// document: undoing what the next one did does not make it clean.
-    pub(crate) edited: bool,
+    /// The content version the open document had when it opened: it differs from it while dirty.
+    pub(crate) opened_version: u64,
+    /// The date of the edit session begun last since the open: unsaved changes carry it.
+    pub(crate) session_date: Option<String>,
     /// The dirty state the host was last told (`dirtyChanged`); a new document starts clean.
     pub(crate) dirty: bool,
+    /// This frame (`Context::cumulative_frame_nr`), and the frame and document revision a save last
+    /// answered: two requests in one frame for the same document answer once.
+    pub(crate) frame: u64,
+    pub(crate) last_save: Option<(u64, u64)>,
+    /// Rows of the view bar while editing: the edit strip goes on a second row when one is too narrow.
+    pub(crate) bar_rows: u8,
 }
 
 impl HostState {
@@ -184,10 +191,13 @@ impl HostState {
             edit: None,
             file_name: String::new(),
             file_open: false,
-            save_asked: false,
             comment_asked: false,
-            edited: false,
+            opened_version: 0,
+            session_date: None,
             dirty: false,
+            frame: 0,
+            last_save: None,
+            bar_rows: 1,
         }
     }
 
@@ -211,6 +221,7 @@ impl HostState {
 pub(crate) fn before_frame(app: &mut WordApp, ctx: &egui::Context) {
     // Taken out while commands run, so they can borrow the rest of the app.
     let Some(mut host) = app.host.take() else { return };
+    host.frame = ctx.cumulative_frame_nr();
     // Read before the canvas's scroll area consumes the frame's scroll delta.
     if host.page_target.is_some() && scrolled_by_person(ctx, app.canvas.canvas_rect, app.canvas.focused) {
         host.page_target = None;
@@ -231,8 +242,8 @@ pub(crate) fn before_frame(app: &mut WordApp, ctx: &egui::Context) {
             HostCommand::SetMarks(marks) => host.marks.set(marks),
             HostCommand::SetTheme(theme) => set_theme(app, &mut host, ctx, &theme),
             HostCommand::SetMode(request) => super::edit::set_mode(app, &mut host, request),
-            // Answered after the frame, once: two requests in one frame answer once.
-            HostCommand::RequestSave => host.save_asked = true,
+            // Answered here, before any later command of the frame changes the document or the mode.
+            HostCommand::RequestSave => super::edit::save(app, &mut host),
         }
     }
     app.host = Some(host);
@@ -526,10 +537,11 @@ fn open(app: &mut WordApp, host: &mut HostState, name: &str, bytes: &[u8]) {
             }
             host.file_open = true;
             host.file_name = name.to_string();
-            // A new document starts clean; `dirtyChanged` reports its edits from here.
-            host.edited = false;
-            host.dirty = false;
             app.session.set_document(doc);
+            // A new document starts clean; `dirtyChanged` reports its edits from here.
+            host.opened_version = app.session.content_version();
+            host.session_date = None;
+            host.dirty = false;
             app.session.page_hint = 0;
             app.session.find = Default::default();
             app.canvas.scroll_to_doc = Some((0, 0.0));

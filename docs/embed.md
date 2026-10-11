@@ -292,11 +292,13 @@ come with the 0.2 release). `Session::begin_edit(author, revisionDate, rules)` i
 edit session. It refuses a blank author or a date that is not UTC whole seconds on a calendar day
 (`2026-10-10T08:00:00Z`; `2026-02-31T08:00:00Z` is refused), forces tracking on and clears undo and
 redo, so neither reaches past the session's start. Starting again with another author, other rules
-or another date starts a new session, so one save carries one date; starting again with the same
-ones keeps the session running. Only `begin_edit` names the session's author: `Session::author` is
+or another date starts a new session; starting again with the same ones keeps the session running.
+The engine does not keep one date per save by itself: the host bridge refuses another date while
+the document has unsaved changes (below). Only `begin_edit` names the session's author: `Session::author` is
 put back to it before every command of the session, whatever wrote it since. In a session, `Session::run` runs only `wordcraft_engine::edit_mode`'s
 allow-list: typing, deleting, line breaks, nonbreaking spaces and hyphens, Tab as a tracked tab
-character, cut, paste as plain text, undo, redo and moving between changes; accepting and rejecting
+character, cut, paste as plain text, undo, redo, moving between changes, and going into a header or
+footer the document already has and back (making a new one is refused); accepting and rejecting
 only with the permission to decide. Every change is a tracked change by the session's author,
 dated with its date. A change counts as the session's own only when the session made its revision
 record, whatever a file revision's author or date. Deleting the session's own insertion removes
@@ -306,7 +308,9 @@ text boxes stay as the file has them.
 
 A refusal is `CmdError::Editing`, with a stable code in `edit_mode::Refusal::code`, also left in
 `Session::refusal` and `Session::status`, for the host to map to its own message. In an edit
-session every error `Session::run` answers is one, so the host never parses an error's text:
+session every error `Session::run` answers is one, so the host never parses an error's text. A
+search or a move that finds nothing (`edit.find`, `edit.findNext`, `edit.findPrevious`,
+`edit.goto`, `review.nextChange`, `review.previousChange`) refuses no edit and is no refusal:
 
 | Code | Refused |
 |---|---|
@@ -326,15 +330,31 @@ The host bridge (`crates/ui-egui/src/host/edit.rs`) begins the engine's session 
 edit mode: `setMode` with the author, date (to the second) and rules already running keeps the
 session. A malformed request is refused before it is queued; a request queued with a date the
 calendar lacks, or with no document open (none yet, or the last open failed), answers `modeChanged`
-with `view`. Every open, a refused one included, ends edit mode first. A refusal while editing (Enter,
-a formatting shortcut) is shown over the top of the document, in words mapped from its code, until
-the document next changes; the contract has no event for it, so the host page is not told.
+with `view`. Every open, a refused one included, ends edit mode first.
+
+- **Refusals.** Each refused action (a key, a paste, a strip button) sends `editRefused` with its code
+  once, and the editor shows the code's words over the document, at the view's top, or at its bottom
+  when the caret's line is under the top, until the document changes or the caret moves. Shift+Tab
+  does nothing and says nothing.
+- **One date per save.** While the document has unsaved changes, `setMode` with another
+  `revisionDate` is refused: `editRefused` with `invalid_edit_session`, then `modeChanged` with the
+  mode still in force. The same date continues the work.
+- **Dirty.** `dirtyChanged` compares the document's content version
+  (`Session::content_version`) with the one it had when it opened, so undoing back to the opened
+  document is clean and running out of undo is not. `opened` starts clean again, without a
+  `dirtyChanged`: a host resets its own dirty state on `opened`. A save does not change it (the
+  contract: saving never clears dirty); a host that keeps the saved file opens it again.
+- **Saves** are answered when asked: `requestSave` and Ctrl/Cmd+S serialise the document then, before
+  a later command of the same frame (an open, a mode change). Two in one frame for the same document
+  answer once.
+- **The edit strip** follows the zoom controls, and wraps onto a second row of the view bar when the
+  bar is too narrow for it and the find controls.
 
 **Known limitation: new paragraphs.** API 0.2 lists new paragraphs among edit mode's edits, but
 Enter is not available in edit mode yet, and pasted text with paragraph breaks is refused. The
 Word writer does not yet record an inserted paragraph mark as a tracked change, so a new paragraph
-would be saved untracked. Enter returns once it does; until then the host shows the
-`paragraph_break_not_supported` refusal. Line breaks (Shift+Enter) work.
+would be saved untracked. Enter returns once it does; until then it is refused with
+`paragraph_break_not_supported` (`editRefused`). Line breaks (Shift+Enter) work.
 
 ## Branding
 

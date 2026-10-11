@@ -209,12 +209,12 @@ fn the_same_edit_request_again_keeps_the_session() {
     assert!(body(&harness).starts_with("Rent"), "{:?}", body(&harness));
 }
 
-// A new date is a new session: its history starts afresh, but the document still differs from what
-// was opened, so it stays dirty.
+// A new date on a clean document is a new session: its history starts afresh.
 #[test]
-fn another_date_begins_a_new_session_and_the_document_stays_dirty() {
+fn another_date_on_a_clean_document_begins_a_new_session() {
     let (mut harness, bridge) = editing(false);
     harness.state_mut().run("text.insert", json!({ "text": "abc " })).unwrap();
+    harness.state_mut().run("edit.undo", json!({})).unwrap();
     harness.run_steps(2);
     bridge.take_events();
     bridge.send(edit_on("2026-10-11T08:00:00Z", false));
@@ -222,12 +222,41 @@ fn another_date_begins_a_new_session_and_the_document_stays_dirty() {
     assert_eq!(bridge.take_events(), vec![HostEvent::ModeChanged { mode: EditorMode::Edit }]);
     assert!(!harness.state().session.can_undo());
     assert_eq!(harness.state().session.revision_date(), Some("2026-10-11T08:00:00Z"));
-    // Leaving and coming back is a new entry as well; the edits are still unsaved.
+}
+
+// W3-3 (P6-18): one date per save. Unsaved changes keep the date they were made with: another date
+// is refused, in edit mode and on coming back to it, and the mode in force stays.
+#[test]
+fn refuses_another_date_while_the_document_has_unsaved_changes() {
+    let refused = HostEvent::EditRefused { code: "invalid_edit_session".into() };
+    let (mut harness, bridge) = editing(false);
+    harness.state_mut().run("text.insert", json!({ "text": "abc " })).unwrap();
+    harness.run_steps(2);
+    bridge.take_events();
+    bridge.send(edit_on("2026-10-11T08:00:00Z", false));
+    harness.run_steps(2);
+    assert_eq!(bridge.take_events(), vec![refused.clone(), HostEvent::ModeChanged { mode: EditorMode::Edit }]);
+    assert_eq!(harness.state().session.revision_date(), Some(DATE));
+    assert!(harness.state().session.can_undo(), "the session running goes on");
     bridge.send(HostCommand::SetMode(ModeRequest::View));
+    harness.run_steps(2);
+    bridge.take_events();
+    bridge.send(edit_on("2026-10-11T08:00:00Z", false));
+    harness.run_steps(2);
+    assert_eq!(bridge.take_events(), vec![refused, HostEvent::ModeChanged { mode: EditorMode::View }]);
+    // The same date is the same unsaved work: editing goes on, still dirty.
     bridge.send(edit(false));
     harness.run_steps(2);
     let events = bridge.take_events();
+    assert_eq!(events.first(), Some(&HostEvent::ModeChanged { mode: EditorMode::Edit }), "{events:?}");
     assert!(!events.contains(&HostEvent::DirtyChanged { dirty: false }), "{events:?}");
+    // A new open is clean, so a new date is fine again.
+    bridge.send(HostCommand::Open { name: "lease.docx".into(), bytes: docx("Rent is due monthly.") });
+    bridge.send(edit_on("2026-10-11T08:00:00Z", false));
+    harness.run_steps(3);
+    let events = bridge.take_events();
+    assert!(events.contains(&HostEvent::ModeChanged { mode: EditorMode::Edit }), "{events:?}");
+    assert_eq!(refusals(&events), 0, "{events:?}");
 }
 
 // D4: real input, not `run()`. eframe focuses its text agent, which IME and on-screen keyboards
@@ -261,10 +290,13 @@ fn keeps_tab_for_a_tab_character_and_lets_escape_through_harmlessly() {
     assert!(body(&harness).starts_with("\tRent"), "{:?}", body(&harness));
     assert!(harness.state().canvas.focused, "Tab stays in the editor");
     let before = common::doc_json(&harness);
+    bridge.take_events();
     harness.key_press_modifiers(egui::Modifiers::SHIFT, egui::Key::Tab);
     harness.run_steps(2);
     assert_eq!(common::doc_json(&harness), before, "Shift+Tab changes no list level or indent");
-    bridge.take_events();
+    // W3-3: and does nothing else: no refusal, told or shown.
+    assert_eq!(harness.state().session.refusal, None);
+    assert!(bridge.take_events().is_empty());
     harness.key_press(egui::Key::Escape);
     harness.run_steps(2);
     assert_eq!(common::doc_json(&harness), before);
@@ -281,15 +313,17 @@ fn claims_no_ime_in_view_mode() {
 
 #[test]
 fn refuses_edits_outside_edit_mode_s_list_through_the_app() {
-    let (mut harness, _bridge) = editing(true);
+    let (mut harness, bridge) = editing(true);
     let before = common::doc_json(&harness);
-    for id in
-        ["edit.pasteFormat", "edit.replaceAll", "text.backTab", "para.indent", "review.trackChanges", "file.saveAs", "file.exportPdf", "ui.backstage"]
-    {
+    let ids = ["edit.pasteFormat", "edit.replaceAll", "para.indent", "review.trackChanges", "file.saveAs", "file.exportPdf", "ui.backstage"];
+    for id in ids {
         assert!(harness.state_mut().run(id, json!({})).is_err(), "{id}");
         assert_eq!(harness.state().session.refusal, Some(Refusal::CommandNotAllowed), "{id}");
     }
     assert_eq!(common::doc_json(&harness), before);
+    // W3-1: the host hears each refusal once, by its code.
+    let told = HostEvent::EditRefused { code: "command_not_allowed".into() };
+    assert_eq!(bridge.take_events(), vec![told; ids.len()]);
 }
 
 // W3 obligation 3: every refusal carries a code the host can map, the app's own gate's included.
@@ -319,15 +353,17 @@ fn a_refused_paste_names_the_paste() {
 }
 
 // Ruling W2-4: Enter is not available in edit mode yet. The key still does something visible: the
-// strip says why, until the document next changes.
+// editor says why, until the document changes or the caret moves.
 #[test]
 fn says_why_enter_did_nothing() {
-    let (mut harness, _bridge) = editing(false);
+    let (mut harness, bridge) = editing(false);
     focus_canvas(&mut harness);
     let before = common::doc_json(&harness);
     harness.key_press(egui::Key::Enter);
     harness.run_steps(2);
     assert_eq!(common::doc_json(&harness), before);
+    // W3-1: the host hears it once, by its code, to say it in its own words.
+    assert_eq!(bridge.take_events(), vec![HostEvent::EditRefused { code: "paragraph_break_not_supported".into() }]);
     assert_eq!(harness.state().session.refusal, Some(Refusal::ParagraphBreakNotSupported));
     let notice = "New paragraphs cannot be added while editing yet. Shift+Enter adds a line break.";
     assert!(common::drawn_text(&harness).contains(notice), "the refusal is shown");
@@ -495,4 +531,270 @@ fn a_save_through_the_host_passes_the_save_inspector() {
     assert_eq!((revisions.earliest_date.as_deref(), revisions.latest_date.as_deref(), revisions.undated), (Some(DATE), Some(DATE), 0));
     assert_eq!(revisions.format_changes, 0);
     assert_eq!((revisions.hidden_text, revisions.field_codes, revisions.bidi_controls, revisions.objects), (0, 0, 0, 0));
+}
+
+// ---- Fix round 1 (Rulings W3-1 to W3-3) ----
+
+const ENTER_NOTICE: &str = "New paragraphs cannot be added while editing yet. Shift+Enter adds a line break.";
+
+fn refusals(events: &[HostEvent]) -> usize {
+    events.iter().filter(|event| matches!(event, HostEvent::EditRefused { .. })).count()
+}
+
+// W3-1: a paste refused inside the gate's own rewrite (Ctrl/⌘+V to plain paste) is one action.
+#[test]
+fn tells_the_host_of_a_refused_paste_once() {
+    let (mut harness, bridge) = editing(false);
+    focus_canvas(&mut harness);
+    harness.event(egui::Event::Paste("weekly\nor daily".into()));
+    harness.run_steps(2);
+    assert_eq!(bridge.take_events(), vec![HostEvent::EditRefused { code: "paragraph_break_not_supported".into() }]);
+}
+
+// W3-1: searching and moving through changes that find nothing refuse no edit.
+#[test]
+fn navigation_that_finds_nothing_tells_and_shows_nothing() {
+    let (mut harness, bridge) = editing(false);
+    for (id, params) in [
+        ("edit.findNext", json!({ "text": "absent" })),
+        ("edit.findPrevious", json!({ "text": "absent" })),
+        ("edit.goto", json!({ "bookmark": "absent" })),
+        ("review.nextChange", json!({})),
+        ("review.previousChange", json!({})),
+    ] {
+        let _ = harness.state_mut().run(id, params);
+        assert_eq!(harness.state().session.refusal, None, "{id}");
+    }
+    harness.run_steps(2);
+    let events = bridge.take_events();
+    assert_eq!(refusals(&events), 0, "{events:?}");
+    assert!(!common::drawn_text(&harness).contains("while editing"), "no notice");
+}
+
+// W3-3: the notice ends when the caret moves, not only when the document changes.
+#[test]
+fn a_caret_move_ends_the_notice() {
+    let (mut harness, _bridge) = editing(false);
+    focus_canvas(&mut harness);
+    harness.key_press(egui::Key::Enter);
+    harness.run_steps(2);
+    assert!(common::drawn_text(&harness).contains(ENTER_NOTICE));
+    harness.key_press(egui::Key::ArrowRight);
+    harness.run_steps(3);
+    assert!(!common::drawn_text(&harness).contains(ENTER_NOTICE));
+}
+
+// W3-3: the notice never covers the line being edited: with the caret's line at the view's top, it
+// goes to the bottom.
+#[test]
+fn the_notice_never_covers_the_caret_s_line() {
+    let (mut harness, bridge) = common::view_app(Document::from_text(""), 1.0);
+    let text = common::clauses(60);
+    bridge.send(HostCommand::Open { name: "lease.docx".into(), bytes: common::docx(&text) });
+    harness.run_steps(4);
+    bridge.send(edit(false));
+    harness.run_steps(2);
+    focus_canvas(&mut harness);
+    let at = wordcraft_engine::doc::Pos::body(20, 0);
+    let (page, top) = {
+        let app = harness.state_mut();
+        app.session.sel = wordcraft_engine::Selection::caret(at.clone());
+        let layout = app.session.layout();
+        let caret = layout.caret_on(&at, app.session.page_hint).unwrap();
+        (caret.page, caret.top)
+    };
+    harness.state_mut().canvas.scroll_to_doc = Some((page, (top - 2.0).max(0.0)));
+    harness.run_steps(3);
+    harness.key_press(egui::Key::Enter);
+    harness.run_steps(3);
+    assert!(common::drawn_text(&harness).contains(ENTER_NOTICE));
+    let notice = harness.ctx.memory(|memory| memory.area_rect(egui::Id::new("embed_edit_notice"))).expect("the notice is shown");
+    let app = harness.state_mut();
+    let layout = app.session.layout();
+    let caret = layout.caret_on(&app.session.sel.focus, app.session.page_hint).unwrap();
+    let line_top = wordcraft_ui_egui::canvas::page_to_screen(app, caret.page, caret.x, caret.top).unwrap().y;
+    let line_bottom = wordcraft_ui_egui::canvas::page_to_screen(app, caret.page, caret.x, caret.top + caret.height).unwrap().y;
+    let view = app.canvas.canvas_rect.unwrap();
+    assert!(line_top < view.top() + 60.0, "the caret's line is at the view's top: {line_top} in {view:?}");
+    assert!(notice.bottom() < line_top || notice.top() > line_bottom, "{notice:?} covers {line_top}..{line_bottom}");
+}
+
+/// A lease with a header, made before it is opened: edit mode never makes one.
+fn with_header() -> Vec<u8> {
+    let mut session = wordcraft_engine::Session::new(Document::from_text("Rent is due monthly."));
+    session.run("insert.header", &json!({ "text": "Lease of the warehouse" })).unwrap();
+    session.run("insert.closeHeader", &json!({})).unwrap();
+    wordcraft_engine::io::save_bytes("lease.docx", &session.doc).unwrap()
+}
+
+// W3-3: a header the document has is entered, typed into (tracked) and left with Escape; one it has
+// not is never made.
+#[test]
+fn enters_an_existing_header_and_leaves_it_with_escape() {
+    let (mut harness, bridge) = common::view_app(Document::from_text(""), 1.0);
+    bridge.send(HostCommand::Open { name: "lease.docx".into(), bytes: with_header() });
+    harness.run_steps(3);
+    bridge.send(edit(false));
+    harness.run_steps(2);
+    focus_canvas(&mut harness);
+    bridge.take_events();
+    harness.state_mut().run("insert.editHeader", json!({})).unwrap();
+    harness.run_steps(2);
+    let story = harness.state().session.sel.focus.story;
+    assert!(matches!(story, StoryRef::Part(_)), "{story:?}");
+    harness.event(egui::Event::Text(" draft".into()));
+    harness.run_steps(2);
+    assert!(harness.state().session.doc.plain_text(story).contains("warehouse draft"));
+    assert_eq!(harness.state().session.doc.revisions.last().map(|revision| revision.author.as_str()), Some(AUTHOR));
+    harness.key_press(egui::Key::Escape);
+    harness.run_steps(2);
+    assert_eq!(harness.state().session.sel.focus.story, StoryRef::Body);
+    assert_eq!(refusals(&bridge.take_events()), 0);
+
+    let (mut bare, bare_bridge) = editing(false);
+    let parts = bare.state().session.doc.parts.len();
+    assert!(bare.state_mut().run("insert.editHeader", json!({})).is_err());
+    assert_eq!(bare.state().session.doc.parts.len(), parts, "no header was made");
+    assert_eq!(bare_bridge.take_events(), vec![HostEvent::EditRefused { code: "command_not_allowed".into() }]);
+}
+
+// W3-2: a save holds the document as it was when asked, whatever the same frame does next.
+#[test]
+fn answers_a_save_before_a_later_open_and_mode_change_in_the_same_frame() {
+    let (mut harness, bridge) = editing(false);
+    harness.state_mut().run("text.insert", json!({ "text": "Monthly " })).unwrap();
+    harness.run_steps(2);
+    bridge.take_events();
+    bridge.send(HostCommand::RequestSave);
+    bridge.send(HostCommand::Open { name: "other.docx".into(), bytes: docx("Other.") });
+    bridge.send(edit(false));
+    harness.run_steps(2);
+    let events = bridge.take_events();
+    let at = |wanted: fn(&HostEvent) -> bool| events.iter().position(wanted);
+    let saved = at(|event| matches!(event, HostEvent::SaveRequested { .. }));
+    let opened = at(|event| matches!(event, HostEvent::Opened { .. }));
+    assert!(saved.is_some() && saved < opened, "{events:?}");
+    let Some(HostEvent::SaveRequested { file_name, bytes }) = saved.and_then(|index| events.get(index)) else { unreachable!() };
+    assert_eq!(file_name, "lease.docx");
+    let reopened = wordcraft_engine::io::open_bytes("lease.docx", bytes).unwrap();
+    assert!(reopened.plain_text(StoryRef::Body).starts_with("Monthly Rent"), "the save holds the edited lease");
+    assert!(events.contains(&HostEvent::ModeChanged { mode: EditorMode::Edit }), "{events:?}");
+    assert_eq!(harness.state().session.revision_date(), Some(DATE));
+}
+
+#[test]
+fn answers_a_save_before_a_later_switch_to_view_mode() {
+    let (mut harness, bridge) = editing(false);
+    harness.state_mut().run("text.insert", json!({ "text": "Monthly " })).unwrap();
+    harness.run_steps(2);
+    bridge.take_events();
+    bridge.send(HostCommand::RequestSave);
+    bridge.send(HostCommand::SetMode(ModeRequest::View));
+    harness.run_steps(2);
+    let events = bridge.take_events();
+    assert!(matches!(events.first(), Some(HostEvent::SaveRequested { .. })), "{events:?}");
+    assert_eq!(events.get(1), Some(&HostEvent::ModeChanged { mode: EditorMode::View }));
+}
+
+#[test]
+fn takes_the_save_shortcut_as_a_save_request_and_never_downloads() {
+    let (mut harness, bridge) = editing(false);
+    focus_canvas(&mut harness);
+    harness.key_press_modifiers(egui::Modifiers::COMMAND, egui::Key::S);
+    harness.run_steps(2);
+    let events = bridge.take_events();
+    assert_eq!(events.iter().filter(|event| matches!(event, HostEvent::SaveRequested { .. })).count(), 1, "{events:?}");
+}
+
+#[test]
+fn says_there_is_nothing_to_save_in_view_mode() {
+    let (mut harness, bridge) = opened();
+    bridge.send(HostCommand::RequestSave);
+    harness.run_steps(2);
+    assert_eq!(bridge.take_events(), vec![HostEvent::SaveFailed { message: "Nothing to save: the document is open for viewing only.".into() }]);
+}
+
+#[test]
+fn answers_two_save_requests_in_one_frame_once() {
+    let (mut harness, bridge) = editing(false);
+    bridge.send(HostCommand::RequestSave);
+    bridge.send(HostCommand::RequestSave);
+    harness.run_steps(2);
+    assert_eq!(bridge.take_events().iter().filter(|event| matches!(event, HostEvent::SaveRequested { .. })).count(), 1);
+}
+
+#[test]
+fn reports_dirty_on_the_first_change_and_clean_after_undoing_it() {
+    let (mut harness, bridge) = editing(false);
+    harness.state_mut().run("text.insert", json!({ "text": "x" })).unwrap();
+    harness.run_steps(2);
+    assert_eq!(bridge.take_events(), vec![HostEvent::DirtyChanged { dirty: true }]);
+    harness.state_mut().run("edit.undo", json!({})).unwrap();
+    harness.run_steps(2);
+    assert_eq!(bridge.take_events(), vec![HostEvent::DirtyChanged { dirty: false }]);
+}
+
+// W3-3: dirty is whether the document differs from what was opened, not how deep undo goes: past
+// the undo limit, undoing everything left still leaves a changed document.
+#[test]
+fn stays_dirty_when_undo_runs_out_before_the_opened_document() {
+    let (mut harness, bridge) = editing(false);
+    for _ in 0..520 {
+        harness.state_mut().run("text.insert", json!({ "text": "x" })).unwrap();
+        harness.state_mut().run("caret.left", json!({})).unwrap();
+    }
+    harness.run_steps(2);
+    while harness.state().session.can_undo() {
+        harness.state_mut().run("edit.undo", json!({})).unwrap();
+    }
+    harness.run_steps(2);
+    assert!(body(&harness).contains('x'), "the oldest edits are beyond undo");
+    let events = bridge.take_events();
+    assert!(events.contains(&HostEvent::DirtyChanged { dirty: true }), "{events:?}");
+    assert!(!events.contains(&HostEvent::DirtyChanged { dirty: false }), "{events:?}");
+}
+
+#[test]
+fn turns_the_comment_command_into_a_comment_request_on_the_selection() {
+    let (mut harness, bridge) = editing(false);
+    harness.state_mut().run("select.all", json!({})).unwrap();
+    harness.run_steps(2);
+    bridge.take_events();
+    harness.state_mut().run("review.newComment", json!({ "text": "" })).unwrap();
+    harness.run_steps(3);
+    let events = bridge.take_events();
+    assert!(
+        events.iter().any(|event| matches!(event, HostEvent::CommentRequested { text, .. } if text.contains("Rent is due monthly"))),
+        "{events:?}"
+    );
+    // Nothing was written into the file.
+    assert!(harness.state().session.doc.comments.is_empty());
+}
+
+// W3-3: the edit strip wraps onto a second row when the bar is too narrow for it and find.
+#[test]
+fn wraps_the_edit_strip_in_a_narrow_view_bar() {
+    let (mut harness, _bridge) = editing(true);
+    harness.set_size(egui::vec2(760.0, 800.0));
+    harness.run_steps(4);
+    let strip = ["Undo", "Redo", "Previous change", "Next change", "Accept", "Reject", "Accept all", "Reject all"];
+    let find = harness.get_by_label("Next match").rect();
+    for label in strip {
+        let rect = harness.get_by_label(label).rect();
+        assert!(rect.top() >= find.bottom(), "{label} is on the second row, below find {find:?}: {rect:?}");
+        assert!(rect.right() <= 760.0, "{label} is inside the window: {rect:?}");
+        assert!(!rect.intersects(find), "{label} {rect:?} overlaps find {find:?}");
+    }
+    harness.set_size(egui::vec2(1800.0, 800.0));
+    harness.run_steps(4);
+    let accept_all = harness.get_by_label("Accept all").rect();
+    let find = harness.get_by_label("Next match").rect();
+    assert!((accept_all.center().y - find.center().y).abs() < 2.0, "one row when it fits: {accept_all:?}, find {find:?}");
+}
+
+#[test]
+fn accepts_author_fields_it_does_not_read() {
+    use wordcraft_ui_egui::host::wire::parse_mode_request;
+    let request = r#"{"mode":"edit","author":{"id":"u","name":"Sari","email":"sari@example.com"},"revisionDate":"2026-10-10T08:00:00Z","permissions":{"acceptRejectChanges":false,"organizePages":true,"fillForms":true,"redact":true,"stamps":true,"drawing":true}}"#;
+    assert!(matches!(parse_mode_request(request), Ok(ModeRequest::Edit { .. })));
 }

@@ -77,6 +77,10 @@ pub enum HostEvent {
         x: f32,
         y: f32,
     },
+    /// An action refused in edit mode, once per action, by its stable code (`edit_mode::Refusal`).
+    EditRefused {
+        code: String,
+    },
 }
 
 /// The mode in force, as `modeChanged` names it.
@@ -229,6 +233,7 @@ mod tests {
             // The bytes travel outside JSON (the embed crate sets them on the event object).
             (HostEvent::SaveRequested { file_name: "a.docx".into(), bytes: vec![1, 2] }, json!({"type": "saveRequested", "fileName": "a.docx"})),
             (HostEvent::SaveFailed { message: "m".into() }, json!({"type": "saveFailed", "message": "m"})),
+            (HostEvent::EditRefused { code: "command_not_allowed".into() }, json!({"type": "editRefused", "code": "command_not_allowed"})),
             (
                 HostEvent::CommentRequested { text: "a b".into(), copy_text: "a\nb".into(), page: Some(1), x: 1.0, y: 2.0 },
                 json!({"type": "commentRequested", "text": "a b", "copyText": "a\nb", "page": 1, "x": 1.0, "y": 2.0}),

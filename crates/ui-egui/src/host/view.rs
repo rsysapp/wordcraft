@@ -18,20 +18,59 @@ pub fn show(app: &mut WordApp, ui: &mut Ui) {
     super::edit::notice(app, ui.ctx());
 }
 
+/// One row of the view bar.
+const BAR_HEIGHT: f32 = 34.0;
+/// What the find controls take at the bar's right: the field, its two buttons and the match count.
+const FIND_WIDTH: f32 = 320.0;
+
 fn bar(app: &mut WordApp, ui: &mut Ui) {
     let t = Tokens::get(ui.ctx());
+    let editing = app.host.as_ref().is_some_and(|host| host.edit.is_some());
+    let rows = if editing { app.host.as_ref().map_or(1, |host| host.bar_rows.clamp(1, 2)) } else { 1 };
     egui::Panel::top("embed_view_bar")
-        .exact_size(34.0)
+        .exact_size(BAR_HEIGHT * f32::from(rows))
         .frame(egui::Frame::NONE.fill(t.ribbon).inner_margin(egui::Margin::symmetric(8, 0)).stroke(Stroke::new(1.0, t.border)))
         .show(ui, |ui| {
-            ui.horizontal_centered(|ui| {
+            if !editing {
+                ui.horizontal_centered(|ui| {
+                    ui.spacing_mut().item_spacing = vec2(4.0, 0.0);
+                    page_controls(app, ui);
+                    ui.separator();
+                    zoom_controls(app, ui);
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| find_controls(app, ui));
+                });
+                return;
+            }
+            // Edit mode: the edit strip follows the zoom controls when the row has room for it and
+            // the find controls, and wraps onto a second row when it has not.
+            let width = ui.available_width();
+            let row = egui::Layout::left_to_right(egui::Align::Center);
+            let mut inline = true;
+            ui.allocate_ui_with_layout(vec2(width, BAR_HEIGHT), row, |ui| {
                 ui.spacing_mut().item_spacing = vec2(4.0, 0.0);
                 page_controls(app, ui);
                 ui.separator();
                 zoom_controls(app, ui);
-                super::edit::strip(app, ui);
+                inline = ui.available_width() >= super::edit::strip_width(app, ui) + FIND_WIDTH;
+                if inline {
+                    super::edit::strip(app, ui, true);
+                }
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| find_controls(app, ui));
             });
+            if !inline {
+                ui.allocate_ui_with_layout(vec2(width, BAR_HEIGHT), row, |ui| {
+                    ui.spacing_mut().item_spacing = vec2(4.0, 0.0);
+                    super::edit::strip(app, ui, false);
+                });
+            }
+            // The panel takes the new row count from the next frame on.
+            let wanted = if inline { 1 } else { 2 };
+            if let Some(host) = app.host.as_mut()
+                && host.bar_rows != wanted
+            {
+                host.bar_rows = wanted;
+                ui.ctx().request_repaint();
+            }
         });
 }
 

@@ -6,6 +6,7 @@
 
 use egui::Ui;
 use serde_json::{Value, json};
+use wordcraft_engine::Selection;
 use wordcraft_engine::edit_mode::{self, EditRefusal, EditRules, Refusal};
 
 use super::bridge::{EditorMode, HostEvent};
@@ -22,8 +23,13 @@ pub(crate) struct EditSession {
     rules: EditRules,
     /// The document revision last seen: a change drops a jump's page target (`follow_typing`).
     rev: u64,
-    /// The last refusal, shown in the strip until the document next changes.
-    notice: Option<Refusal>,
+    /// The last refusal and where the caret was then: shown until the document changes or the caret
+    /// moves.
+    notice: Option<(Refusal, Selection)>,
+}
+
+fn mode_in_force(host: &HostState) -> EditorMode {
+    if host.edit.is_some() { EditorMode::Edit } else { EditorMode::View }
 }
 
 pub(crate) fn set_mode(app: &mut WordApp, host: &mut HostState, request: ModeRequest) {
@@ -40,6 +46,13 @@ pub(crate) fn set_mode(app: &mut WordApp, host: &mut HostState, request: ModeReq
         host.bridge.emit(HostEvent::ModeChanged { mode: EditorMode::View });
         return;
     };
+    // One date per save: unsaved changes carry the date they were made with, so another date waits
+    // until the document is opened again (embed API 0.2, P6-18). The mode in force stays.
+    if is_dirty(app, host) && host.session_date.as_deref().is_some_and(|made| made != date) {
+        host.bridge.emit(HostEvent::EditRefused { code: Refusal::InvalidEditSession.code().to_string() });
+        host.bridge.emit(HostEvent::ModeChanged { mode: mode_in_force(host) });
+        return;
+    }
     let rules = EditRules { may_decide: permissions.accept_reject_changes };
     let running = host.edit.as_mut().filter(|edit| edit.author == author.name && edit.date == date && edit.rules == rules);
     if let Some(edit) = running {
@@ -47,8 +60,6 @@ pub(crate) fn set_mode(app: &mut WordApp, host: &mut HostState, request: ModeReq
         // editor's permissions may have changed; this editor reads none of them.
         edit.permissions = permissions;
     } else {
-        // A new session clears undo history: what the one running changed is still a change.
-        host.edited |= host.edit.is_some() && app.session.can_undo();
         if let Err(error) = app.session.begin_edit(&author.name, &date, rules) {
             log::warn!("embed: {error}");
             leave(app, host);
@@ -59,6 +70,7 @@ pub(crate) fn set_mode(app: &mut WordApp, host: &mut HostState, request: ModeReq
             // A selection the host was told of goes first (embed API 0.2, "Entering edit mode").
             host.clear_reported_selection();
         }
+        host.session_date = Some(date.clone());
         host.edit = Some(EditSession { permissions, author: author.name, date, rules, rev: app.session.rev(), notice: None });
     }
     host.bridge.emit(HostEvent::ModeChanged { mode: EditorMode::Edit });
@@ -66,12 +78,17 @@ pub(crate) fn set_mode(app: &mut WordApp, host: &mut HostState, request: ModeReq
 
 fn leave(app: &mut WordApp, host: &mut HostState) {
     if host.edit.take().is_some() {
-        host.edited |= app.session.can_undo();
         // The selection made while editing is reported only once the person changes it.
         host.settle_quietly(&app.session.sel);
     }
     app.session.end_edit();
     app.session.view_only = true;
+}
+
+/// Whether the document differs from what was opened: its content version, not the undo depth,
+/// which the undo limit and a new session's start both cut short.
+fn is_dirty(app: &WordApp, host: &HostState) -> bool {
+    app.session.content_version() != host.opened_version
 }
 
 /// A document always opens in view mode; the host hears so first when it was editing. Every open
@@ -87,10 +104,12 @@ pub(crate) fn before_open(app: &mut WordApp, host: &mut HostState) {
 /// Edit mode's gate in front of `WordApp::run`; `Some` answers without running the command.
 pub(crate) fn gate(app: &mut WordApp, id: &str, params: &Value, rules: EditRules) -> Option<Result<Value, String>> {
     match id {
-        // The editor's own save shortcut: the host decides what a save becomes.
+        // The editor's own save shortcut: the host decides what a save becomes. Answered now, with
+        // the document as it is now.
         "file.save" => {
-            if let Some(host) = app.host.as_mut() {
-                host.save_asked = true;
+            if let Some(mut host) = app.host.take() {
+                save(app, &mut host);
+                app.host = Some(host);
             }
             Some(Ok(json!({})))
         }
@@ -103,6 +122,9 @@ pub(crate) fn gate(app: &mut WordApp, id: &str, params: &Value, rules: EditRules
         }
         // Ctrl/⌘+V: rich paste would bring formatting nobody tracked.
         "edit.paste" => Some(app.run("edit.pasteText", params.clone())),
+        // Shift+Tab does nothing in edit mode (embed API 0.2, "Keyboard in edit mode"): no list
+        // level or indent, and nothing to tell either.
+        "text.backTab" => Some(Ok(json!({}))),
         // The engine's session runs the rest, Tab as a tracked tab (`edit_mode::TAB`), and refuses
         // with a code what it does not allow.
         _ if edit_mode::allows(id, rules) => None,
@@ -127,17 +149,19 @@ fn refuse(app: &mut WordApp, id: &str, refusal: Refusal) -> String {
     message
 }
 
-/// After a command `WordApp::run` refused: the strip shows an edit session's refusal.
+/// After a command `WordApp::run` refused: the host hears the refusal's code once (`editRefused`)
+/// and the editor shows it too. Searches and moves that find nothing are no refusal
+/// (`edit_mode::NAVIGATION`), so they leave `Session::refusal` empty and say nothing.
 pub(crate) fn note_refusal(app: &mut WordApp) {
-    let refusal = app.session.refusal;
-    if let Some(edit) = app.host.as_mut().and_then(|host| host.edit.as_mut())
-        && refusal.is_some()
-    {
-        edit.notice = refusal;
-    }
+    let Some(refusal) = app.session.refusal else { return };
+    let at = app.session.sel.clone();
+    let Some(host) = app.host.as_mut() else { return };
+    let Some(edit) = host.edit.as_mut() else { return };
+    edit.notice = Some((refusal, at));
+    host.bridge.emit(HostEvent::EditRefused { code: refusal.code().to_string() });
 }
 
-/// What the strip says for a refusal: the person's words for each code.
+/// What the notice says for a refusal: the person's words for each code.
 fn notice_text(refusal: Refusal) -> &'static str {
     match refusal {
         Refusal::ParagraphBreakNotSupported => "New paragraphs cannot be added while editing yet. Shift+Enter adds a line break.",
@@ -152,24 +176,23 @@ fn notice_text(refusal: Refusal) -> &'static str {
 }
 
 /// Before the frame's events: a change to the document (typing moves the caret and may scroll)
-/// drops the page a jump made current, so `pageChanged` follows the caret; and the refusal shown
-/// since is over.
+/// drops the page a jump made current, so `pageChanged` follows the caret. A change or a caret move
+/// ends the refusal shown.
 pub(crate) fn follow_typing(app: &WordApp, host: &mut HostState) {
     let rev = app.session.rev();
-    if let Some(edit) = host.edit.as_mut()
-        && edit.rev != rev
-    {
+    let Some(edit) = host.edit.as_mut() else { return };
+    if edit.rev != rev {
         edit.rev = rev;
         edit.notice = None;
         host.page_target = None;
     }
+    if edit.notice.as_ref().is_some_and(|(_, at)| *at != app.session.sel) {
+        edit.notice = None;
+    }
 }
 
-/// After the frame: a save or a comment asked for, and the dirty state.
+/// After the frame: a comment asked for, and the dirty state.
 pub(crate) fn after_frame(app: &mut WordApp, host: &mut HostState, ctx: &egui::Context) {
-    if std::mem::take(&mut host.save_asked) {
-        save(app, host);
-    }
     // A selection whose page is not drawn yet answers next frame; anything else ends the request.
     if host.comment_asked {
         if host.edit.is_none() {
@@ -185,10 +208,9 @@ pub(crate) fn after_frame(app: &mut WordApp, host: &mut HostState, ctx: &egui::C
             }
         }
     }
-    // Undo back to the start of the first session leaves nothing to save; a later session's start
-    // may not be the opened document (`HostState::edited`).
+    // Undo back to the opened document makes it clean again.
     if host.edit.is_some() {
-        let dirty = host.edited || app.session.can_undo();
+        let dirty = is_dirty(app, host);
         if host.dirty != dirty {
             host.dirty = dirty;
             host.bridge.emit(HostEvent::DirtyChanged { dirty });
@@ -196,7 +218,15 @@ pub(crate) fn after_frame(app: &mut WordApp, host: &mut HostState, ctx: &egui::C
     }
 }
 
-fn save(app: &mut WordApp, host: &mut HostState) {
+/// Answer a save with the document as it is at the request: a later command of the same frame (an
+/// open, a mode change) must not change what this save holds. Two requests in one frame for the
+/// same document answer once.
+pub(crate) fn save(app: &mut WordApp, host: &mut HostState) {
+    let request = (host.frame, app.session.rev());
+    if host.last_save == Some(request) {
+        return;
+    }
+    host.last_save = Some(request);
     if host.edit.is_none() {
         host.bridge.emit(HostEvent::SaveFailed { message: "Nothing to save: the document is open for viewing only.".into() });
         return;
@@ -221,45 +251,108 @@ fn command_button(app: &mut WordApp, ui: &mut Ui, label: &str, command: &str, en
     }
 }
 
+/// The strip's buttons: (label, command), in order, with a separator before each group.
+fn strip_groups(may_decide: bool) -> Vec<Vec<(&'static str, &'static str)>> {
+    let mut groups = vec![
+        vec![("Undo", "edit.undo"), ("Redo", "edit.redo")],
+        vec![("Previous change", "review.previousChange"), ("Next change", "review.nextChange")],
+    ];
+    if may_decide {
+        groups.push(vec![
+            ("Accept", "review.accept"),
+            ("Reject", "review.reject"),
+            ("Accept all", "review.acceptAll"),
+            ("Reject all", "review.rejectAll"),
+        ]);
+    }
+    groups
+}
+
+fn strip_permissions(app: &WordApp) -> Option<PermissionsSpec> {
+    app.host.as_ref().and_then(|host| host.edit.as_ref()).map(|edit| edit.permissions)
+}
+
+/// The width the strip takes in `ui`, separators included (0 outside edit mode).
+pub(crate) fn strip_width(app: &WordApp, ui: &Ui) -> f32 {
+    let Some(permissions) = strip_permissions(app) else { return 0.0 };
+    let spacing = ui.spacing();
+    let font = egui::TextStyle::Button.resolve(ui.style());
+    let mut width = 0.0;
+    for group in strip_groups(permissions.accept_reject_changes) {
+        // A separator: its own spacing and the item spacing on both sides.
+        width += 6.0 + spacing.item_spacing.x * 2.0;
+        for (label, _) in group {
+            let text = ui.painter().layout_no_wrap(label.to_string(), font.clone(), egui::Color32::PLACEHOLDER).size().x;
+            width += text + spacing.button_padding.x * 2.0 + spacing.item_spacing.x;
+        }
+    }
+    width
+}
+
 /// In the view bar while editing: undo, redo, moving through changes, and deciding them when allowed.
-pub(crate) fn strip(app: &mut WordApp, ui: &mut Ui) {
-    let Some(permissions) = app.host.as_ref().and_then(|host| host.edit.as_ref()).map(|edit| edit.permissions) else { return };
-    ui.separator();
+/// `leading` puts a separator before the first group (the strip follows the zoom controls).
+pub(crate) fn strip(app: &mut WordApp, ui: &mut Ui, leading: bool) {
+    let Some(permissions) = strip_permissions(app) else { return };
     let (can_undo, can_redo) = (app.session.can_undo(), app.session.can_redo());
-    command_button(app, ui, "Undo", "edit.undo", can_undo);
-    command_button(app, ui, "Redo", "edit.redo", can_redo);
-    ui.separator();
-    command_button(app, ui, "Previous change", "review.previousChange", true);
-    command_button(app, ui, "Next change", "review.nextChange", true);
-    if permissions.accept_reject_changes {
-        ui.separator();
-        command_button(app, ui, "Accept", "review.accept", true);
-        command_button(app, ui, "Reject", "review.reject", true);
-        command_button(app, ui, "Accept all", "review.acceptAll", true);
-        command_button(app, ui, "Reject all", "review.rejectAll", true);
+    for (index, group) in strip_groups(permissions.accept_reject_changes).into_iter().enumerate() {
+        if leading || index > 0 {
+            ui.separator();
+        }
+        for (label, command) in group {
+            let enabled = match command {
+                "edit.undo" => can_undo,
+                "edit.redo" => can_redo,
+                _ => true,
+            };
+            command_button(app, ui, label, command, enabled);
+        }
     }
 }
 
-/// Over the top of the document while editing: why the last thing asked of the editor was refused
-/// (Enter, a formatting shortcut), until the document next changes. Nothing is refused silently. An
-/// overlay, so showing it moves nothing and the document keeps the keyboard.
-pub(crate) fn notice(app: &WordApp, ctx: &egui::Context) {
-    let Some(refusal) = app.host.as_ref().and_then(|host| host.edit.as_ref()).and_then(|edit| edit.notice) else { return };
+/// Points between the notice and the document view's edge.
+const NOTICE_MARGIN: f32 = 8.0;
+/// The notice's height before it was first laid out.
+const NOTICE_HEIGHT: f32 = 32.0;
+/// Where the scroll bar runs along the view's bottom edge.
+const SCROLL_BAR: f32 = 20.0;
+
+/// The caret line's top and bottom on screen, if it is on a drawn page.
+fn caret_band(app: &mut WordApp) -> Option<(f32, f32)> {
+    let layout = app.session.layout();
+    let caret = layout.caret_on(&app.session.sel.focus, app.session.page_hint)?;
+    let top = crate::canvas::page_to_screen(app, caret.page, caret.x, caret.top)?.y;
+    let bottom = crate::canvas::page_to_screen(app, caret.page, caret.x, caret.top + caret.height)?.y;
+    Some((top, bottom))
+}
+
+/// Over the document while editing: why the last thing asked of the editor was refused (Enter, a
+/// formatting shortcut), until the document changes or the caret moves. An overlay, so showing it
+/// moves nothing and the document keeps the keyboard; at the view's top, or at its bottom when the
+/// caret's line is under the top.
+pub(crate) fn notice(app: &mut WordApp, ctx: &egui::Context) {
+    let Some(refusal) = app.host.as_ref().and_then(|host| host.edit.as_ref()).and_then(|edit| edit.notice.as_ref()).map(|(refusal, _)| *refusal)
+    else {
+        return;
+    };
     let Some(view) = app.canvas.canvas_rect else { return };
+    let id = egui::Id::new("embed_edit_notice");
+    let height = ctx.memory(|memory| memory.area_rect(id)).map_or(NOTICE_HEIGHT, |rect| rect.height());
+    let top_band = (view.top(), view.top() + NOTICE_MARGIN * 2.0 + height);
+    let covered = caret_band(app).is_some_and(|(top, bottom)| bottom >= top_band.0 && top <= top_band.1);
+    let (pivot, at) = if covered {
+        (egui::Align2::CENTER_BOTTOM, view.center_bottom() - egui::vec2(0.0, NOTICE_MARGIN + SCROLL_BAR))
+    } else {
+        (egui::Align2::CENTER_TOP, view.center_top() + egui::vec2(0.0, NOTICE_MARGIN))
+    };
     let t = Tokens::get(ctx);
-    egui::Area::new(egui::Id::new("embed_edit_notice"))
-        .order(egui::Order::Foreground)
-        .interactable(false)
-        .pivot(egui::Align2::CENTER_TOP)
-        .fixed_pos(view.center_top() + egui::vec2(0.0, 8.0))
-        .show(ctx, |ui| {
-            egui::Frame::NONE
-                .fill(t.ribbon)
-                .stroke(egui::Stroke::new(1.0, t.border_strong))
-                .corner_radius(4.0)
-                .inner_margin(egui::Margin::symmetric(10, 6))
-                .show(ui, |ui| {
-                    ui.label(egui::RichText::new(notice_text(refusal)).font(regular(12.0)).color(t.text));
-                });
-        });
+    egui::Area::new(id).order(egui::Order::Foreground).interactable(false).pivot(pivot).fixed_pos(at).show(ctx, |ui| {
+        egui::Frame::NONE
+            .fill(t.ribbon)
+            .stroke(egui::Stroke::new(1.0, t.border_strong))
+            .corner_radius(4.0)
+            .inner_margin(egui::Margin::symmetric(10, 6))
+            .show(ui, |ui| {
+                ui.label(egui::RichText::new(notice_text(refusal)).font(regular(12.0)).color(t.text));
+            });
+    });
 }
