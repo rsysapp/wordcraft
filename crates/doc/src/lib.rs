@@ -25,7 +25,8 @@ use std::sync::Arc;
 use serde::{Deserialize, Serialize};
 
 pub use numbering::{ListKind, Numbering};
-pub use para::{InlineObject, Paragraph, Run};
+// embed: Origin, for a writer that keeps the source package.
+pub use para::{InlineObject, Origin, Paragraph, Run};
 pub use props::{Align, CharProps, ParaProps, Rgb, TextColor};
 pub use section::SectionProps;
 pub use styles::{Style, StyleKind, StyleSheet};

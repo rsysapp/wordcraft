@@ -35,6 +35,16 @@ pub fn next_rev() -> u64 {
     REV.fetch_add(1, Ordering::Relaxed)
 }
 
+/// embed: where a paragraph was read from: the package part (its position among the package's part
+/// names, sorted) and the paragraph's position among that part's `w:p` elements in document order.
+/// A writer that keeps the source package uses it to find what to rewrite. Not part of a
+/// paragraph's equality, never serialised.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Default)]
+pub struct Origin {
+    pub part: u32,
+    pub index: u32,
+}
+
 /// A formatting run: `len` bytes of text sharing `props`.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Run {
@@ -227,6 +237,9 @@ pub struct Paragraph {
     /// Set when this paragraph ends a section (OOXML keeps `w:sectPr` on the last paragraph).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub section: Option<Box<SectionProps>>,
+    /// embed: where it was read from (see [`Origin`]); `None` for a paragraph made here.
+    #[serde(skip)]
+    pub origin: Option<Origin>,
     /// Change counter for caches (not part of equality).
     #[serde(skip, default = "next_rev")]
     pub rev: u64,
@@ -258,6 +271,7 @@ impl Paragraph {
             mark: CharProps::default(),
             objects: Vec::new(),
             section: None,
+            origin: None,
             rev: next_rev(),
         }
     }
@@ -563,6 +577,8 @@ impl Paragraph {
             mark: if self.text.is_empty() && off == 0 { self.mark.clone() } else { carry },
             objects: tail_objs,
             section: self.section.take(),
+            // embed: both halves stay on the source paragraph; its own mark ends the later one.
+            origin: self.origin,
             rev: next_rev(),
         };
         if tail.text.is_empty() {
@@ -783,6 +799,26 @@ mod tests {
         let t = p.split_off(p.len()).unwrap();
         assert!(t.is_empty());
         assert_eq!(t.mark.bold, Some(true));
+    }
+
+    // embed: a writer that keeps the source finds a paragraph by where it was read from; Enter keeps
+    // both halves on the source paragraph, whose own mark ends the later one.
+    #[test]
+    fn split_keeps_the_origin_on_both_halves() {
+        let mut p = Paragraph::with_text("Rent is due monthly.", CharProps::default());
+        p.origin = Some(Origin { part: 3, index: 7 });
+        let tail = p.split_off(8).unwrap();
+        assert_eq!((p.origin, tail.origin), (Some(Origin { part: 3, index: 7 }), Some(Origin { part: 3, index: 7 })));
+    }
+
+    #[test]
+    fn origin_is_not_part_of_equality_or_of_the_serialised_paragraph() {
+        let plain = Paragraph::with_text("Rent.", CharProps::default());
+        let mut read = plain.clone();
+        read.origin = Some(Origin { part: 1, index: 2 });
+        assert_eq!(read, plain);
+        assert!(!serde_json::to_string(&read).unwrap().contains("origin"));
+        assert_eq!(Paragraph::new().origin, None);
     }
 
     #[test]
