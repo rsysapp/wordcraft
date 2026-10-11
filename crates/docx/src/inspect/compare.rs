@@ -118,6 +118,11 @@ impl<'a> Projector<'a> {
             Some(mut format) => {
                 for slot in &mut format.slots {
                     if let Some(rev) = slot.rev.take() {
+                        // Word lists no revision for a table's, row's or cell's property change,
+                        // so what the save changed there stands, untracked.
+                        if self.is_new(rev.author, rev.date) && UNSHOWN_CHANGES.contains(&slot.name) {
+                            continue;
+                        }
                         if self.is_new(rev.author, rev.date) {
                             slot.value = rev.old;
                             if matches!(slot.name, "rPr" | "pPr.rPr") {
@@ -165,6 +170,11 @@ impl<'a> Projector<'a> {
         tables.charge(budget)
     }
 }
+
+/// Property slots whose tracked changes Word does not show as revisions (`w:tblPrChange`,
+/// `w:tblGridChange`, `w:tblPrExChange`, `w:trPrChange`, `w:tcPrChange`): the save's changes there
+/// are not undone as tracked.
+const UNSHOWN_CHANGES: &[&str] = &["tblPr", "tblGrid", "tblPrEx", "trPr", "tcPr"];
 
 // ---- Context --------------------------------------------------------------------------------
 

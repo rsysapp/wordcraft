@@ -517,8 +517,18 @@ pub(super) fn walk(
     budget.hold(room.saturating_mul(ITEM_BYTES))?;
     let items = Vec::with_capacity(usize::try_from(room).unwrap_or(0));
     budget.release(room.saturating_mul(ITEM_BYTES).saturating_sub(items_held(&items)));
-    let mut walker =
-        Walker { canon, tables, revisions, items, stack: vec![EMPTY], items_left, budget, hiding, paragraph_style: ParagraphStyle::default() };
+    let mut walker = Walker {
+        canon,
+        tables,
+        revisions,
+        items,
+        stack: vec![EMPTY],
+        items_left,
+        budget,
+        hiding,
+        paragraph_style: ParagraphStyle::default(),
+        hiding_tables: 0,
+    };
     let result = walker.root(root);
     let held = items_held(&walker.items);
     match result {
@@ -555,6 +565,8 @@ struct Walker<'a, 'c> {
     budget: &'a mut Budget,
     hiding: &'a StyleHiding,
     paragraph_style: ParagraphStyle,
+    /// How many of the tables around the current position have a style that may hide.
+    hiding_tables: u32,
 }
 
 /// The first child of this name, by identity, so a second one is never mistaken for it.
@@ -587,66 +599,156 @@ fn hides(properties: Option<&XEl>) -> bool {
     vanish(properties).unwrap_or(false)
 }
 
-/// Which styles hide what they format, read from the styles part, and whether the document's
-/// defaults do. Hidden text through a style is hidden text as surely as direct `w:vanish`.
+/// Which styles may hide what they format, read from the styles part, and whether the document's
+/// defaults and default styles do. Hidden text through a style is hidden text as surely as direct
+/// `w:vanish`, and what cannot be settled counts as hidden: Word's `vanish` is a toggle, so the
+/// levels can cancel, but any `vanish` a run can reach through its styles makes it hidden here. A
+/// reader may show text this reports hidden, never the reverse.
 #[derive(Default)]
 pub(super) struct StyleHiding {
-    /// Style id → whether its own run properties hide (if they say), and the style it is based on.
-    styles: HashMap<String, (Option<bool>, Option<String>)>,
-    default: bool,
+    /// Style id → what its definitions say.
+    styles: HashMap<String, StyleEntry>,
+    /// The document defaults' run properties hide.
+    defaults: bool,
+    /// The default paragraph, character and table styles hide (each `w:default` style of its type,
+    /// whichever a reader takes).
+    default_paragraph: bool,
+    default_character: bool,
+    default_table: bool,
 }
 
-/// Memory charged for each style kept, besides its id and base's: its entry in its table.
-const STYLE_BYTES: u64 = table_slot::<(String, (Option<bool>, Option<String>))>();
+#[derive(Default)]
+struct StyleEntry {
+    /// Its own run properties, or any of its conditional table formats' (`w:tblStylePr`), hide.
+    own: bool,
+    based: Option<String>,
+    /// Defined twice, based on different styles: which a reader takes is not settled.
+    conflicting: bool,
+    /// Which kinds of default style it is.
+    default_of: u8,
+    /// Anything reachable from it hides: worked out once all styles are read.
+    hides: bool,
+}
+
+const DEFAULT_PARAGRAPH: u8 = 1;
+const DEFAULT_CHARACTER: u8 = 2;
+const DEFAULT_TABLE: u8 = 4;
+
 /// The longest style chain followed; a longer one (or a loop) reads as hiding, since what lies
 /// past it is unknown.
 const MAX_STYLE_CHAIN: usize = 32;
 
+/// Whether run properties hide what they format, by themselves (any of `w:vanish`, `w:webHidden`,
+/// `w:specVanish` on).
+fn may_hide(properties: Option<&XEl>) -> bool {
+    properties.is_some_and(|properties| {
+        properties.els().any(|child| {
+            matches!(&*child.name, "w:vanish" | "w:webHidden" | "w:specVanish") && !matches!(child.attr("w:val"), Some("0" | "false" | "off"))
+        })
+    })
+}
+
 impl StyleHiding {
     pub(super) fn read(root: &XEl, budget: &mut Budget) -> Result<StyleHiding, String> {
-        let mut hiding = StyleHiding::default();
+        // Sized from the styles there are, so the table never grows.
+        let count = root.els().filter(|child| &*child.name == "w:style").count();
+        budget.work(units(count))?;
+        budget.hold(
+            units(count).saturating_add(1).saturating_mul(table_slot::<(String, StyleEntry)>()).saturating_add(table_room::<(String, StyleEntry)>()),
+        )?;
+        let mut hiding = StyleHiding { styles: HashMap::with_capacity(count), ..StyleHiding::default() };
         for child in root.els() {
             budget.work(8)?;
             match &*child.name {
                 "w:docDefaults" => {
                     let defaults = child.child("w:rPrDefault").and_then(|default| default.child("w:rPr"));
-                    hiding.default = hides(defaults);
+                    hiding.defaults |= may_hide(defaults);
                 }
                 "w:style" => {
                     let Some(id) = child.attr("w:styleId") else { continue };
-                    let based = child.child("w:basedOn").and_then(|based| based.attr("w:val")).map(str::to_string);
-                    let room = if hiding.styles.is_empty() { table_room::<(String, (Option<bool>, Option<String>))>() } else { 0 };
-                    budget.hold(
-                        STYLE_BYTES.saturating_add(room).saturating_add(units(id.len().saturating_add(based.as_ref().map_or(0, String::len)))),
-                    )?;
-                    hiding.styles.insert(id.to_string(), (vanish(child.child("w:rPr")), based));
+                    let based = child.child("w:basedOn").and_then(|based| based.attr("w:val"));
+                    let own = may_hide(child.child("w:rPr"))
+                        || child.els().any(|format| &*format.name == "w:tblStylePr" && may_hide(format.child("w:rPr")));
+                    let default_of = match (child.attr("w:default"), child.attr("w:type")) {
+                        (Some("1" | "true" | "on"), Some("paragraph") | None) => DEFAULT_PARAGRAPH,
+                        (Some("1" | "true" | "on"), Some("character")) => DEFAULT_CHARACTER,
+                        (Some("1" | "true" | "on"), Some("table")) => DEFAULT_TABLE,
+                        _ => 0,
+                    };
+                    match hiding.styles.get_mut(id) {
+                        Some(entry) => {
+                            entry.own |= own;
+                            entry.conflicting |= entry.based.as_deref() != based;
+                            entry.default_of |= default_of;
+                        }
+                        None => {
+                            budget.hold(units(id.len().saturating_add(based.map_or(0, str::len))))?;
+                            let entry = StyleEntry { own, based: based.map(str::to_string), default_of, ..StyleEntry::default() };
+                            hiding.styles.insert(id.to_string(), entry);
+                        }
+                    }
                 }
                 _ => {}
             }
         }
+        // What each style reaches, worked out once: a run asks a single lookup per style.
+        budget.work(units(hiding.styles.len()).saturating_mul(units(MAX_STYLE_CHAIN)))?;
+        budget.hold(units(hiding.styles.len()))?;
+        let reached: Vec<bool> = hiding.styles.keys().map(|id| hiding.reaches(id)).collect();
+        for (entry, hides) in hiding.styles.values_mut().zip(reached) {
+            entry.hides = hides;
+            hiding.default_paragraph |= hides && entry.default_of & DEFAULT_PARAGRAPH != 0;
+            hiding.default_character |= hides && entry.default_of & DEFAULT_CHARACTER != 0;
+            hiding.default_table |= hides && entry.default_of & DEFAULT_TABLE != 0;
+        }
+        budget.release(units(hiding.styles.len()));
         Ok(hiding)
     }
 
-    /// Whether a style (through the styles it is based on) says hidden or shown.
-    fn style(&self, id: Option<&str>) -> Option<bool> {
-        let mut at = id?;
+    /// Whether any style reachable from `id` (itself, then the styles it is based on) hides; a loop
+    /// or a chain past `MAX_STYLE_CHAIN` does.
+    fn reaches(&self, id: &str) -> bool {
+        let mut at = id;
         for _ in 0..MAX_STYLE_CHAIN {
-            let (own, based) = self.styles.get(at)?;
-            if own.is_some() {
-                return *own;
+            let Some(entry) = self.styles.get(at) else { return false };
+            if entry.own || entry.conflicting {
+                return true;
             }
-            at = based.as_deref()?;
+            match entry.based.as_deref() {
+                Some(based) => at = based,
+                None => return false,
+            }
         }
-        Some(true)
+        true
     }
 
-    /// Whether a run with these direct properties, in a paragraph of this style, is hidden. Direct
-    /// formatting decides when it says; otherwise any level that hides counts. `vanish` is a toggle
-    /// (two style levels that both set it cancel in Word), so this can report text hidden that a
-    /// reader shows, never the reverse.
-    pub(super) fn effective(&self, properties: Option<&XEl>, paragraph_style: Option<&str>) -> bool {
+    /// Whether a style, or the default style of its kind when none is named or the named one is
+    /// missing, may hide.
+    fn style(&self, id: Option<&str>, default: bool) -> bool {
+        match id.and_then(|id| self.styles.get(id)) {
+            Some(entry) => entry.hides,
+            None => default,
+        }
+    }
+
+    /// Whether a table of this style (the default table style when it names none) may hide its
+    /// cells' text.
+    pub(super) fn table(&self, style: Option<&str>) -> bool {
+        self.style(style, self.default_table)
+    }
+
+    /// Whether a run with these direct properties, in a paragraph of this style, inside a table
+    /// whose style may hide (`in_hiding_table`), is hidden. Direct formatting decides when it says;
+    /// otherwise any level that may hide counts: the character style, the paragraph style, the
+    /// table style, the document defaults.
+    pub(super) fn effective(&self, properties: Option<&XEl>, paragraph_style: Option<&str>, in_hiding_table: bool) -> bool {
         let character_style = properties.and_then(|properties| properties.child("w:rStyle")).and_then(|style| style.attr("w:val"));
-        vanish(properties).unwrap_or_else(|| self.style(character_style) == Some(true) || self.style(paragraph_style) == Some(true) || self.default)
+        vanish(properties).unwrap_or_else(|| {
+            self.style(character_style, self.default_character)
+                || self.style(paragraph_style, self.default_paragraph)
+                || in_hiding_table
+                || self.defaults
+        })
     }
 }
 
@@ -812,7 +914,7 @@ impl Walker<'_, '_> {
                 let digest = self.canon.digest(change, &|child| !is(child, old_properties), self.budget)?;
                 let extra = self.tables.content(digest);
                 let (author, date, _) = self.note(change, RevisionKind::Format)?;
-                let old_hidden = self.hiding.effective(old_properties, self.paragraph_style.now.as_deref());
+                let old_hidden = self.hiding.effective(old_properties, self.paragraph_style.now.as_deref(), self.hiding_tables > 0);
                 Some(FormatRev { author, date, extra, old, old_hidden })
             }
             None => None,
@@ -829,14 +931,15 @@ impl Walker<'_, '_> {
     /// run's own (`rev`) or its paragraph's, if its recorded old properties would show the run.
     fn hiding(&self, properties: Option<&XEl>, rev: Option<&FormatRev>) -> (bool, Option<(u32, u32)>) {
         let style = self.paragraph_style.now.as_deref();
-        let hidden = self.hiding.effective(properties, style);
+        let tables = self.hiding_tables > 0;
+        let hidden = self.hiding.effective(properties, style, tables);
         if !hidden {
             return (false, None);
         }
         if let Some(rev) = rev.filter(|rev| !rev.old_hidden) {
             return (true, Some((rev.author, rev.date)));
         }
-        let by_paragraph = self.paragraph_style.change.as_ref().filter(|(_, _, old)| !self.hiding.effective(properties, old.as_deref()));
+        let by_paragraph = self.paragraph_style.change.as_ref().filter(|(_, _, old)| !self.hiding.effective(properties, old.as_deref(), tables));
         (true, by_paragraph.map(|(author, date, _)| (*author, *date)))
     }
 
@@ -1143,6 +1246,9 @@ impl Walker<'_, '_> {
             }
         }
         let shared: Vec<Wrap> = shared.filter(|first_row| all_alike && !first_row.is_empty()).unwrap_or_default();
+        // Text in the table's cells is hidden when its style (or the default table style) may hide.
+        let style = properties.and_then(|properties| properties.child("w:tblStyle")).and_then(|style| style.attr("w:val"));
+        let hides = self.hiding.table(style);
         let depth = self.stack.len();
         for wrap in &shared {
             self.enter(*wrap);
@@ -1152,14 +1258,24 @@ impl Walker<'_, '_> {
         slots.extend(self.slot("tblGrid", grid, "w:tblGridChange", "w:tblGrid", &|_| false)?);
         let format = self.format(slots, false, false);
         self.start(table, &[], MarkKind::Plain, format)?;
-        for node in &table.kids {
-            match node {
-                XNode::El(child) if is(child, properties) || is(child, grid) => {}
-                XNode::El(child) if &*child.name == "w:tr" => self.row(child, !shared.is_empty())?,
-                XNode::El(child) => self.block(child)?,
-                XNode::Text(text) => self.stray(text)?,
-            }
+        if hides {
+            self.hiding_tables = self.hiding_tables.saturating_add(1);
         }
+        let rows = (|| {
+            for node in &table.kids {
+                match node {
+                    XNode::El(child) if is(child, properties) || is(child, grid) => {}
+                    XNode::El(child) if &*child.name == "w:tr" => self.row(child, !shared.is_empty())?,
+                    XNode::El(child) => self.block(child)?,
+                    XNode::Text(text) => self.stray(text)?,
+                }
+            }
+            Ok::<(), String>(())
+        })();
+        if hides {
+            self.hiding_tables = self.hiding_tables.saturating_sub(1);
+        }
+        rows?;
         self.end(table, MarkKind::Plain)?;
         self.leave_to(depth);
         Ok(())

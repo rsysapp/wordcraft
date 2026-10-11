@@ -1652,6 +1652,98 @@ fn counts_text_hidden_when_its_styles_are_uncertain() {
     assert_eq!(inspect(&hidden_paragraph(""), &direct).unwrap().new_revisions[0].hidden_text, 0);
 }
 
+fn table(properties: &str, cell: &str) -> String {
+    format!(
+        r#"<w:tbl><w:tblPr>{properties}</w:tblPr><w:tblGrid><w:gridCol w:w="2000"/></w:tblGrid><w:tr><w:tc><w:p>{cell}</w:p></w:tc></w:tr></w:tbl>"#
+    )
+}
+
+const TABLE_STYLES: &str = r#"<w:style w:type="table" w:styleId="Plain"/><w:style w:type="table" w:styleId="HideTable"><w:rPr><w:vanish/></w:rPr></w:style><w:style w:type="table" w:styleId="Banded"><w:tblStylePr w:type="wholeTable"><w:rPr><w:vanish/></w:rPr></w:tblStylePr></w:style>"#;
+
+/// The default paragraph style hides a paragraph that names no style: an insertion there is hidden.
+#[test]
+fn counts_text_hidden_through_the_default_paragraph_style() {
+    let default_paragraph = r#"<w:style w:type="paragraph" w:default="1" w:styleId="Normal"><w:rPr><w:vanish/></w:rPr></w:style>"#;
+    let base = styled(default_paragraph, &para(&text("Rent.")));
+    let edited = styled(default_paragraph, &para(&format!("{}{}", text("Rent."), ins(SARI, "more"))));
+    assert_eq!(inspect(&base, &edited).unwrap().new_revisions[0].hidden_text, 4);
+}
+
+/// A table style's run properties hide every cell's text.
+#[test]
+fn counts_text_hidden_through_a_table_style() {
+    let base = styled(TABLE_STYLES, &table(r#"<w:tblStyle w:val="HideTable"/>"#, &text("Rent.")));
+    let edited = styled(TABLE_STYLES, &table(r#"<w:tblStyle w:val="HideTable"/>"#, &format!("{}{}", text("Rent."), ins(SARI, "more"))));
+    assert_eq!(inspect(&base, &edited).unwrap().new_revisions[0].hidden_text, 4);
+}
+
+/// A table that names no style takes the default table style, which can hide.
+#[test]
+fn counts_text_hidden_through_the_default_table_style() {
+    let default_table = r#"<w:style w:type="table" w:default="1" w:styleId="TableNormal"><w:rPr><w:vanish/></w:rPr></w:style>"#;
+    let base = styled(default_table, &table("", &text("Rent.")));
+    let edited = styled(default_table, &table("", &format!("{}{}", text("Rent."), ins(SARI, "more"))));
+    assert_eq!(inspect(&base, &edited).unwrap().new_revisions[0].hidden_text, 4);
+}
+
+/// A tracked table property change switching a table to a style that hides its base text: Word
+/// lists no revision for it, so it is an untracked change.
+#[test]
+fn reports_a_table_switched_to_a_hiding_style_by_a_tracked_change() {
+    let base = styled(TABLE_STYLES, &table(r#"<w:tblStyle w:val="Plain"/>"#, &text("Rent.")));
+    let switched = format!(
+        r#"<w:tblStyle w:val="HideTable"/><w:tblPrChange w:id="1" w:author="{}" w:date="{}"><w:tblPr><w:tblStyle w:val="Plain"/></w:tblPr></w:tblPrChange>"#,
+        SARI.0, SARI.1
+    );
+    let edited = styled(TABLE_STYLES, &table(&switched, &text("Rent.")));
+    let inspection = inspect(&base, &edited).unwrap();
+    assert!(inspection.untracked_changes > 0, "{inspection:#?}");
+}
+
+/// Any `vanish` a run can reach counts, whatever Word's toggles would make of it: a conditional
+/// table format, the default character style.
+#[test]
+fn counts_text_any_reachable_vanish_hides() {
+    let base = styled(TABLE_STYLES, &table(r#"<w:tblStyle w:val="Banded"/>"#, &text("Rent.")));
+    let edited = styled(TABLE_STYLES, &table(r#"<w:tblStyle w:val="Banded"/>"#, &format!("{}{}", text("Rent."), ins(SARI, "more"))));
+    assert_eq!(inspect(&base, &edited).unwrap().new_revisions[0].hidden_text, 4);
+    let default_character = r#"<w:style w:type="character" w:default="1" w:styleId="DefaultFont"><w:rPr><w:vanish/></w:rPr></w:style>"#;
+    let base = styled(default_character, &para(&text("Rent.")));
+    let edited = styled(default_character, &para(&format!("{}{}", text("Rent."), ins(SARI, "more"))));
+    assert_eq!(inspect(&base, &edited).unwrap().new_revisions[0].hidden_text, 4);
+    // A style showing (`vanish` off) over one that hides still counts: the hiding one is reachable.
+    let chain = r#"<w:style w:type="character" w:styleId="C1"><w:rPr><w:vanish/></w:rPr></w:style><w:style w:type="character" w:styleId="C2"><w:basedOn w:val="C1"/><w:rPr><w:vanish w:val="0"/></w:rPr></w:style>"#;
+    let base = styled(chain, &para(&text("Rent.")));
+    let edited =
+        styled(chain, &para(&format!("{}{}", text("Rent."), inserted(SARI, r#"<w:r><w:rPr><w:rStyle w:val="C2"/></w:rPr><w:t>more</w:t></w:r>"#))));
+    assert_eq!(inspect(&base, &edited).unwrap().new_revisions[0].hidden_text, 4);
+}
+
+/// Word lists no revision for a tracked change of a table's, row's or cell's properties, so the
+/// save's own such changes are untracked changes.
+#[test]
+fn reports_tracked_table_property_changes_as_untracked() {
+    let change = |name: &str, old: &str| format!(r#"<w:{name} w:id="1" w:author="{}" w:date="{}">{old}</w:{name}>"#, SARI.0, SARI.1);
+    let row = |properties: &str, cell: &str| {
+        format!(
+            r#"<w:tbl><w:tblPr/><w:tblGrid><w:gridCol w:w="2000"/></w:tblGrid><w:tr>{properties}<w:tc>{cell}<w:p>{}</w:p></w:tc></w:tr></w:tbl>"#,
+            text("Rent.")
+        )
+    };
+    let base = package(&row("", ""), &[]);
+    let row_change = package(&row(&format!(r#"<w:trPr><w:cantSplit/>{}</w:trPr>"#, change("trPrChange", "<w:trPr/>")), ""), &[]);
+    let inspection = inspect(&base, &row_change).unwrap();
+    assert!(inspection.untracked_changes > 0, "{inspection:#?}");
+    let cell_change =
+        package(&row("", &format!(r#"<w:tcPr><w:shd w:val="clear" w:fill="000000"/>{}</w:tcPr>"#, change("tcPrChange", "<w:tcPr/>"))), &[]);
+    let inspection = inspect(&base, &cell_change).unwrap();
+    assert!(inspection.untracked_changes > 0, "{inspection:#?}");
+    // A paragraph's tracked property change still explains itself.
+    let paragraph = package(&format!(r#"<w:p><w:pPr><w:jc w:val="center"/>{}</w:pPr>{}</w:p>"#, change("pPrChange", "<w:pPr/>"), text("Rent.")), &[]);
+    let inspection = inspect(&package(&para(&text("Rent.")), &[]), &paragraph).unwrap();
+    assert_eq!(inspection.untracked_changes, 0, "{inspection:#?}");
+}
+
 /// Prefix lists (`mc:Ignorable` and the like) are kept as namespace numbers, charged as they are
 /// expanded: thousands of them under a long namespace stay small. Lists past 1,024 names, or past
 /// 64 KiB in one element, are refused.
