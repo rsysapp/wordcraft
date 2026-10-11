@@ -489,14 +489,25 @@ impl Session {
                     other => other,
                 };
             }
-            // A header or footer the document has is entered as a story to edit; making a new one is
-            // not a tracked change, so is refused.
+            // The header or footer a page shows is entered as a story to edit, an inherited one too
+            // (editing it edits every section showing it, as Word's "link to previous" does); making
+            // a new one is not a tracked change, so is refused. `page` (0-based) is the page clicked,
+            // else the caret's.
             if let Some(header) = crate::edit_mode::entering_header(id) {
-                let Some(part) = crate::edit_mode::existing_header_footer(&self.doc, &self.sel.focus, header) else {
+                let layout = self.layout();
+                let page = params
+                    .get("page")
+                    .and_then(Value::as_u64)
+                    .and_then(|page| usize::try_from(page).ok())
+                    .or_else(|| if self.sel.focus.story == StoryRef::Body { layout.page_of(&self.sel.focus) } else { None })
+                    .unwrap_or(self.page_hint);
+                let Some(part) = crate::edit_mode::shown_header_footer(&self.doc, &layout, page, header) else {
                     return Err(self.refused(id, Refusal::CommandNotAllowed, None));
                 };
                 self.close_typing();
                 self.sel = Selection::caret(self.doc.end_of(StoryRef::Part(part)));
+                // Headers repeat: the caret is drawn on the page entered.
+                self.page_hint = page;
                 self.redraw();
                 return Ok(serde_json::json!({ "story": part }));
             }
@@ -573,8 +584,21 @@ impl Session {
         match &result {
             Ok(_) => {
                 if spec.mutates {
-                    self.touch();
                     self.doc.ensure_nonempty();
+                    // embed: in an edit session a command that changed nothing (Accept with nothing to
+                    // accept, an empty paste) leaves no revision record, no undo step and the content
+                    // version as it was, so the host is not told the document differs.
+                    let unchanged = self.edit_rules.is_some()
+                        && before_doc.as_ref().is_some_and(|(before, ..)| crate::edit_mode::only_records_added(before, &self.doc));
+                    match before_doc {
+                        Some((before, _, h, t, v)) if unchanged => {
+                            self.doc.revisions.truncate(before.revisions.len());
+                            self.history.truncate(h);
+                            self.typing_open = t;
+                            self.version = v;
+                        }
+                        _ => self.touch(),
+                    }
                 }
                 self.clamp_selection();
             }

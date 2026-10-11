@@ -51,16 +51,40 @@ pub fn entering_header(id: &str) -> Option<bool> {
     }
 }
 
-/// The header (or footer) the document already has for the section the caret is in, if any.
-pub fn existing_header_footer(doc: &Document, at: &wordcraft_doc::Pos, header: bool) -> Option<u32> {
-    let block = match at.story {
-        StoryRef::Body => at.path.0.first().copied().unwrap_or(0) as usize,
-        StoryRef::Part(_) => 0,
+/// Whether `after` is `before` with, at most, revision records appended: the document's text,
+/// parts and settings are as they were. Records nothing refers to (all else is unchanged) are what
+/// a command that changed nothing leaves behind.
+pub fn only_records_added(before: &Document, after: &Document) -> bool {
+    // Blocks a command did not touch are shared with the copy taken before it; a block it rewrote
+    // without changing is compared by value.
+    let same_blocks = |a: &wordcraft_doc::Blocks, b: &wordcraft_doc::Blocks| {
+        a.len() == b.len() && a.iter().zip(b).all(|(x, y)| std::sync::Arc::ptr_eq(x, y) || x == y)
     };
-    let sections = doc.sections();
-    let (_, section) = sections.iter().find(|(end, _)| block <= *end).or_else(|| sections.last())?;
-    let part = if header { section.headers.default } else { section.footers.default };
-    part.filter(|id| doc.parts.get(id).is_some_and(|part| matches!(part.kind, PartKind::Header | PartKind::Footer)))
+    let rest = |doc: &Document| Document { body: Vec::new(), parts: Default::default(), revisions: Vec::new(), ..doc.clone() };
+    after.revisions.get(..before.revisions.len()) == Some(before.revisions.as_slice())
+        && same_blocks(&before.body, &after.body)
+        && before.parts.len() == after.parts.len()
+        && before.parts.iter().zip(&after.parts).all(|((a_id, a), (b_id, b))| a_id == b_id && a.kind == b.kind && same_blocks(&a.blocks, &b.blocks))
+        && rest(before) == rest(after)
+}
+
+/// The header (or footer) page `page` shows, as the layout resolves it the way Word renders it: a
+/// section's first-page part on its title page, the even part on even pages when the document has
+/// different odd and even headers, and parts inherited from earlier sections ("link to previous").
+/// `None` when the page shows none: an edit session never makes one.
+pub fn shown_header_footer(doc: &Document, layout: &wordcraft_layout::DocLayout, page: usize, header: bool) -> Option<u32> {
+    let shown = layout.pages.get(page).and_then(|page| if header { page.header_story } else { page.footer_story })?;
+    doc.parts.get(&shown).is_some_and(|part| matches!(part.kind, PartKind::Header | PartKind::Footer)).then_some(shown)
+}
+
+/// The sections (0-based, in order) whose pages show header or footer `part`: more than one when
+/// later sections inherit it, so editing it edits them all.
+pub fn sections_showing(layout: &wordcraft_layout::DocLayout, part: u32) -> Vec<usize> {
+    let mut sections: Vec<usize> =
+        layout.pages.iter().filter(|page| page.header_story == Some(part) || page.footer_story == Some(part)).map(|page| page.section).collect();
+    sections.sort_unstable();
+    sections.dedup();
+    sections
 }
 
 /// Deciding tracked changes.

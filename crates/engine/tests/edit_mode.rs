@@ -768,3 +768,136 @@ mod probes {
         assert_eq!(inspection.comments, Default::default(), "{inspection:#?}");
     }
 }
+
+// embed: W3 fix round 3. Headers and footers as the page shows them (Ruling W3-6), and commands that
+// change nothing (Ruling W3-7).
+mod pages {
+    use serde_json::json;
+    use wordcraft_engine::doc::{CharProps, Document, Paragraph, PartKind, StoryRef, para_block};
+    use wordcraft_engine::edit_mode::{self, EditRules, Refusal};
+    use wordcraft_engine::{CmdError, Session};
+
+    use super::start_editing;
+
+    fn header(doc: &mut Document, text: &str) -> u32 {
+        doc.add_part(PartKind::Header, vec![para_block(Paragraph::with_text(text, CharProps::default()).styled("Header"))])
+    }
+
+    /// Plain clauses, enough for several pages.
+    fn long() -> Document {
+        let text: Vec<String> = (1..=150).map(|i| format!("Clause {i}. The Supplier shall deliver the goods within thirty days.")).collect();
+        let mut doc = Document::from_text(&text.join("\n"));
+        doc.ensure_nonempty();
+        doc
+    }
+
+    fn enter_on(s: &mut Session, page: usize) -> Result<u32, CmdError> {
+        s.run("insert.editHeader", &json!({ "page": page }))?;
+        match s.sel.focus.story {
+            StoryRef::Part(id) => Ok(id),
+            StoryRef::Body => panic!("the caret stayed in the text"),
+        }
+    }
+
+    #[test]
+    fn a_title_page_enters_its_first_page_header_and_the_next_page_the_default() {
+        let mut doc = long();
+        let default = header(&mut doc, "Default");
+        let first = header(&mut doc, "First");
+        doc.last_section.headers.default = Some(default);
+        doc.last_section.headers.first = Some(first);
+        doc.last_section.title_page = true;
+        let mut s = Session::new(doc);
+        start_editing(&mut s, false);
+        assert!(s.layout().pages.len() >= 3);
+        assert_eq!(enter_on(&mut s, 0).unwrap(), first);
+        assert_eq!(enter_on(&mut s, 1).unwrap(), default);
+        assert_eq!(s.page_hint, 1, "the caret is drawn on the page entered");
+    }
+
+    #[test]
+    fn a_first_page_only_header_is_entered_on_page_one_and_refused_after() {
+        let mut doc = long();
+        let first = header(&mut doc, "First");
+        doc.last_section.headers.first = Some(first);
+        doc.last_section.title_page = true;
+        let parts = doc.parts.len();
+        let mut s = Session::new(doc);
+        start_editing(&mut s, false);
+        assert_eq!(enter_on(&mut s, 0).unwrap(), first);
+        s.run("insert.closeHeader", &json!({})).unwrap();
+        let refused = s.run("insert.editHeader", &json!({ "page": 1 }));
+        assert_eq!(refused.as_ref().map_err(CmdError::edit_refusal), Err(Some(Refusal::CommandNotAllowed)));
+        assert_eq!(s.doc.parts.len(), parts, "no header was made");
+    }
+
+    #[test]
+    fn even_pages_enter_the_even_header() {
+        let mut doc = long();
+        let odd = header(&mut doc, "Odd");
+        let even = header(&mut doc, "Even");
+        doc.last_section.headers.default = Some(odd);
+        doc.last_section.headers.even = Some(even);
+        doc.settings.even_odd_headers = true;
+        let mut s = Session::new(doc);
+        start_editing(&mut s, false);
+        assert_eq!(enter_on(&mut s, 0).unwrap(), odd);
+        assert_eq!(enter_on(&mut s, 1).unwrap(), even);
+        assert_eq!(enter_on(&mut s, 2).unwrap(), odd);
+    }
+
+    /// Two sections, a header defined in the first only: the second shows it too.
+    pub fn inherited() -> Session {
+        let mut s = Session::new(long());
+        s.run("select.text", &json!({ "text": "Clause 60." })).unwrap();
+        s.run("select.collapse", &json!({})).unwrap();
+        s.run("layout.break", &json!({ "kind": "nextPage" })).unwrap();
+        s.run("caret.docStart", &json!({})).unwrap();
+        s.run("insert.header", &json!({ "text": "Lease of the warehouse" })).unwrap();
+        s.run("insert.closeHeader", &json!({})).unwrap();
+        s
+    }
+
+    #[test]
+    fn a_later_section_enters_the_header_it_inherits() {
+        let mut s = inherited();
+        let layout = s.layout();
+        let last = layout.pages.len() - 1;
+        let shown = layout.pages[0].header_story.unwrap();
+        assert_eq!(layout.pages[last].header_story, Some(shown), "the second section shows the first's header");
+        assert_eq!(layout.pages[last].section, 1);
+        assert_eq!(edit_mode::sections_showing(&layout, shown), vec![0, 1]);
+        start_editing(&mut s, false);
+        assert_eq!(enter_on(&mut s, last).unwrap(), shown);
+        // From the caret's page when no page is given.
+        s.run("insert.closeHeader", &json!({})).unwrap();
+        s.run("caret.docEnd", &json!({})).unwrap();
+        s.run("insert.editHeader", &json!({})).unwrap();
+        assert_eq!(s.sel.focus.story, StoryRef::Part(shown));
+    }
+
+    // W3-7: nothing to accept, nothing pasted: no new version, no record, no undo step.
+    #[test]
+    fn a_command_that_changes_nothing_leaves_no_trace() {
+        let mut s = Session::new(Document::from_text("Rent is due monthly."));
+        start_editing(&mut s, true);
+        let version = s.content_version();
+        for (id, params) in [
+            ("review.accept", json!({})),
+            ("review.acceptAll", json!({})),
+            ("review.rejectAll", json!({})),
+            ("edit.pasteText", json!({ "text": "" })),
+            ("text.insert", json!({ "text": "" })),
+        ] {
+            s.run(id, &params).unwrap();
+            assert_eq!(s.content_version(), version, "{id}");
+            assert!(s.doc.revisions.is_empty(), "{id}: {:?}", s.doc.revisions);
+            assert!(!s.can_undo(), "{id}");
+        }
+        // A real change still is one.
+        s.run("text.insert", &json!({ "text": "x" })).unwrap();
+        assert_ne!(s.content_version(), version);
+        assert_eq!(s.doc.revisions.len(), 1);
+        let _ = EditRules { may_decide: true };
+    }
+}

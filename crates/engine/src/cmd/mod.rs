@@ -145,6 +145,10 @@ pub fn type_text_as(s: &mut Session, text: &str, what: &str) -> Result<(), CmdEr
     {
         return Err(CmdError::Editing(crate::edit_mode::EditRefusal::new(refusal, what)));
     }
+    // embed: nothing typed or pasted changes nothing in an edit session (no deletion, no record).
+    if s.edit_rules.is_some() && text.is_empty() {
+        return Ok(());
+    }
     let mut props = s.typing_props();
     delete_selection(s)?;
     if s.doc.settings.track_changes {
