@@ -258,6 +258,10 @@ pub(super) struct Parsed {
 /// and the tree's memory against `budget`, charged as the tree grows.
 pub(super) fn parse(bytes: &[u8], names: &mut Names, limits: &mut Limits, budget: &mut Budget) -> Result<Parsed, String> {
     budget.hold(PARSE_BYTES)?;
+    // Every byte is looked at by the reader, and text and tags again as they are checked, decoded
+    // and resolved, whatever is kept: comments, processing instructions, white space and markup the
+    // reader skips cost their scan too. Charged before the reader starts.
+    budget.work(1 + units(bytes.len()) / BYTES_PER_UNIT_SCANNED)?;
     let mut held: u64 = 0;
     let mut most_items: u64 = 4;
     let mut room = ReaderRoom::default();
@@ -287,6 +291,15 @@ fn charge(budget: &mut Budget, held: &mut u64, bytes: u64) -> Result<(), String>
     *held = held.saturating_add(bytes);
     Ok(())
 }
+
+/// Bytes the reader and the checks after it pass over for one unit of work: the reader's scan, the
+/// tag's attribute walks (three: declarations, the resolver, the element), text's line ends and
+/// characters checked.
+const BYTES_PER_UNIT_SCANNED: u64 = 8;
+
+/// Work charged for each event the reader gives, before it reads it: an event's own cost (a
+/// reference, an empty CDATA section, a comment) whatever its length.
+const EVENT_UNITS: u64 = 2;
 
 /// Memory charged for each record the reader keeps while elements are open: an open element's
 /// start in its name buffer, a namespace binding.
@@ -399,6 +412,7 @@ fn parse_into(
     let mut in_scope: u64 = 0;
     let mut root: Option<XEl> = None;
     loop {
+        budget.work(EVENT_UNITS)?;
         let at = usize::try_from(reader.buffer_position()).unwrap_or(usize::MAX);
         let name_length = start_name_length(bytes, at);
         if let Some(length) = name_length {
@@ -557,17 +571,21 @@ fn element(
         let (namespace, local) = resolver.resolve_attribute(attribute.key);
         let key = resolved(namespace, local.as_ref(), names, budget)?;
         let value = if holds_prefixes(&name, &key) {
-            // The raw value while it is expanded; the expansion is what is kept.
+            // The raw value while it is expanded; the expansion is what is kept. Decoding it and
+            // splitting it into tokens twice pass over its bytes.
             let raw_bytes = units(attribute.value.len());
             budget.hold(raw_bytes)?;
+            budget.work(1 + raw_bytes / 4)?;
             let raw = attribute_value(&attribute.value);
             let lists = Lists { resolver, in_scope, attribute: &key };
             let expanded = raw.and_then(|raw| qualified_list(&lists, &raw, names, budget, held, &mut list_bytes));
             budget.release(raw_bytes);
             expanded?
         } else {
-            // Read into a string with room for the raw value, no more.
+            // Read into a string with room for the raw value, no more; decoding it (references, line
+            // ends) passes over it once more.
             charge(budget, held, units(attribute.value.len()))?;
+            budget.work(units(attribute.value.len()) / 4)?;
             attribute_value(&attribute.value)?
         };
         let key = names.get(&key, budget)?;
@@ -588,6 +606,10 @@ const MAX_LIST_BYTES: usize = 64 * 1024;
 /// takes the default namespace), written as element names are (`w:local`, `{n}local`), so a
 /// long namespace costs its number, not its length. Each token's expansion is charged, as memory
 /// and as work, before it is made; `spent` counts the element's expanded bytes so far.
+/// Work charged for each token of a prefix list resolved: two strings made and the lookups
+/// (about 0.2 µs, measured with one-letter prefixes).
+const TOKEN_UNITS: u64 = 20;
+
 /// What a prefix list is read against: the declarations in scope (and how many), and the
 /// attribute it is the value of.
 struct Lists<'r, 'k> {
@@ -634,8 +656,9 @@ fn qualified_token(lists: &Lists<'_, '_>, token: &str, names: &mut Names, budget
         None if lists.attribute == "xsi:type" => ("", token),
         None => (token, ""),
     };
+    // Its probe name and expansion are made for each token, twice (once measured, once written).
+    budget.work(TOKEN_UNITS + units(token.len()) / 4)?;
     let probe = if prefix.is_empty() { "x".to_string() } else { format!("{prefix}:x") };
-    budget.work(8 + units(token.len()) / 4)?;
     walk(lists.in_scope, budget)?;
     let (namespace, _) = lists.resolver.resolve(QName(probe.as_bytes()), true);
     match namespace {

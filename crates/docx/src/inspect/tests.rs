@@ -2127,3 +2127,21 @@ fn tells_the_same_text_box_apart_by_what_hides_it() {
     let inspection = inspect(&base, &edited).unwrap();
     assert!(inspection.new_revisions[0].hidden_text >= 1, "{inspection:#?}");
 }
+
+/// Every loop of the XML reader is charged for what it passes over, whether or not anything is
+/// kept: comments, processing instructions, white space around the root, empty CDATA sections,
+/// references, and attribute values decoded.
+#[test]
+fn charges_what_the_reader_passes_over() {
+    let floor = |xml: &str, units: u64| {
+        let work = parse_work(xml).unwrap();
+        assert!(work >= units, "{} bytes: work {work}, at least {units}", xml.len());
+    };
+    let megabyte = 1 << 20;
+    floor(&format!("<r>{}</r>", "<!---->".repeat(megabyte / 7)), (megabyte / 8) as u64);
+    floor(&format!("<r>{}</r>", "<?p?>".repeat(megabyte / 5)), (megabyte / 8) as u64 + (megabyte / 5) as u64);
+    floor(&format!("<r/>{}", " ".repeat(megabyte)), (megabyte / 8) as u64);
+    floor(&format!("<r>{}</r>", "<![CDATA[]]>".repeat(megabyte / 12)), (megabyte / 12) as u64 * 2);
+    floor(&format!("<r>{}</r>", "x&lt;".repeat(megabyte / 5)), (megabyte / 5) as u64 * 4);
+    floor(&format!(r#"<r a="{}"/>"#, "&lt;".repeat(megabyte / 4)), (megabyte / 4) as u64);
+}

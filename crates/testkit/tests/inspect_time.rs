@@ -74,6 +74,68 @@ fn xml(text: &[u8]) -> Vec<u8> {
     out
 }
 
+/// An XML part of about `PART` bytes: `head`, then `unit` repeated, then `tail`.
+fn fill(head: &str, unit: &str, tail: &str) -> Vec<u8> {
+    let room = PART.saturating_sub(head.len() + tail.len());
+    let mut out = head.as_bytes().to_vec();
+    out.extend_from_slice(&unit.as_bytes().repeat(room / unit.len().max(1)));
+    out.extend_from_slice(tail.as_bytes());
+    out
+}
+
+/// The same XML in three custom XML parts a side.
+fn same_xml(content: &[u8]) -> (Vec<u8>, Vec<u8>) {
+    (side("customXml", "xml", content, *content.last().unwrap_or(&b'>')), side("customXml", "xml", content, *content.last().unwrap_or(&b'>')))
+}
+
+/// Shapes that each make one loop of the XML reader do the most it can for the bytes it is given.
+fn xml_loops() -> Vec<(&'static str, Vec<u8>, Vec<u8>)> {
+    let mut shapes = Vec::new();
+    let mut add = |name: &'static str, content: Vec<u8>| {
+        let (base, edited) = same_xml(&content);
+        shapes.push((name, base, edited));
+    };
+    add("XML: short comments", fill("<data>", "<!---->", "</data>"));
+    add("XML: one long comment", fill("<data><!--", "x", "--></data>"));
+    add("XML: processing instructions", fill("<data>", "<?p?>", "</data>"));
+    add("XML: white space after the root", fill("<data/>", " ", ""));
+    add("XML: line ends in text", fill("<data>", "\r\n", "</data>"));
+    add("XML: empty CDATA pieces", fill("<data>", "<![CDATA[]]>", "</data>"));
+    add("XML: CDATA pieces", fill("<data>", "<![CDATA[x]]>", "</data>"));
+    add("XML: entity references", fill("<data>", "&lt;", "</data>"));
+    add("XML: references in pieces", fill("<data>", "x&lt;", "</data>"));
+    add("XML: long numeric reference", fill("<data>&#x", "0", "41;</data>"));
+    add("XML: document type", fill("<!DOCTYPE data [", " ", "]><data/>"));
+    add("XML: long declaration", fill("<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"", "y", "\"?><data/>"));
+    let attributes: String = (0..500).map(|n| format!(" a{n}=\"\"")).collect();
+    add("XML: many short attributes", fill("<data>", &format!("<e{attributes}/>"), "</data>"));
+    let keys: String = (0..500).map(|n| format!(" {}{n:03}=\"\"", "k".repeat(253))).collect();
+    add("XML: long attribute names", fill("<data>", &format!("<e{keys}/>"), "</data>"));
+    add("XML: references in an attribute value", fill("<data><e a=\"", "&lt;", "\"/></data>"));
+    add("XML: line ends in an attribute value", fill("<data><e a=\"", "\r\n", "\"/></data>"));
+    let mc = r#"xmlns:mc="http://schemas.openxmlformats.org/markup-compatibility/2006""#;
+    add("XML: white space in a prefix list", fill(&format!("<data {mc}><e mc:Ignorable=\""), " ", "\"/></data>"));
+    add(
+        "XML: prefix list tokens",
+        fill(&format!("<data {mc} xmlns:p=\"urn:p\">"), r#"<e mc:Ignorable="p p p p p p p p p p p p p p p p"/>"#, "</data>"),
+    );
+    let declarations = |from: usize, to: usize| -> String { (from..to).map(|n| format!(r#" xmlns:p{n}="urn:{n}""#)).collect() };
+    add(
+        "XML: names walking 1,024 declarations",
+        fill(&format!("<data{}><s{}><t{}>", declarations(0, 500), declarations(500, 1_000), declarations(1_000, 1_024)), "<e/>", "</t></s></data>"),
+    );
+    add(
+        "XML: attributes walking 1,024 declarations",
+        fill(
+            &format!("<data{}><s{}><t{}>", declarations(0, 500), declarations(500, 1_000), declarations(1_000, 1_024)),
+            r#"<e p0:a="" p0:b="" p0:c=""/>"#,
+            "</t></s></data>",
+        ),
+    );
+    add("XML: nested start and end tags", fill("<data>", "<e><e><e><e></e></e></e></e>", "</data>"));
+    shapes
+}
+
 fn shapes() -> Vec<(&'static str, Vec<u8>, Vec<u8>)> {
     let mut random = Random(0x9E37_79B9_7F4A_7C15);
     let mut shapes = Vec::new();
@@ -106,7 +168,9 @@ fn shapes() -> Vec<(&'static str, Vec<u8>, Vec<u8>)> {
 fn the_work_limit_bounds_the_time() {
     let mut worst = (0.0f64, "");
     let mut longest = (0.0f64, "");
-    for (name, base, edited) in shapes() {
+    let only = std::env::var("INSPECT_TIME_ONLY").ok();
+    for (name, base, edited) in shapes().into_iter().chain(xml_loops()).filter(|(name, _, _)| only.as_deref().is_none_or(|only| name.contains(only)))
+    {
         let started = Instant::now();
         let (result, _, work) = inspect_measured(&base, &edited);
         let seconds = started.elapsed().as_secs_f64();
