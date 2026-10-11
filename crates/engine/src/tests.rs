@@ -287,3 +287,22 @@ fn caret_navigation() {
     run(&mut s, "caret.left", json!({}));
     assert_eq!(s.sel.focus.off, 10);
 }
+
+// embed: a redo that would replay a decision is refused while the edit session may not decide,
+// even if history ever survived a change of rules (`Session::begin_edit` clears it).
+#[test]
+fn an_edit_session_redoes_a_decision_only_while_it_may_decide() {
+    use crate::edit_mode::{EditRules, Refusal};
+    let mut s = Session::new(wordcraft_doc::Document::from_text("Rent is due."));
+    s.begin_edit("Sari Wulan", "2026-10-10T08:00:00Z", EditRules { may_decide: true }).unwrap_or_else(|e| panic!("{e}"));
+    run(&mut s, "text.insert", json!({"text": "Monthly: "}));
+    run(&mut s, "review.rejectAll", json!({}));
+    run(&mut s, "edit.undo", json!({}));
+    s.edit_rules = Some(EditRules { may_decide: false });
+    let refused = s.run("edit.redo", &json!({})).err().and_then(|e| e.edit_refusal());
+    assert_eq!(refused, Some(Refusal::DecisionNotAllowed));
+    assert!(text(&s).starts_with("Monthly: "), "the decision was not replayed");
+    s.edit_rules = Some(EditRules { may_decide: true });
+    run(&mut s, "edit.redo", json!({}));
+    assert_eq!(text(&s), "Rent is due.");
+}

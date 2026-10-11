@@ -243,26 +243,28 @@ fn nav_comment(s: &mut Session, dir: i32) -> CmdResult {
 }
 
 /// Accept or reject a revision range in one paragraph.
-fn resolve_para(s: &mut Session, story: StoryRef, path: &wordcraft_doc::Path, from: usize, to: usize, accept: bool) -> Result<(), CmdError> {
-    // embed: accepting in an edit session decides the changes on record only. This session's own
-    // stay tracked: accepted, they would be plain text the host cannot tell from an untracked edit.
-    // Rejecting them is undoing them, which leaves nothing to tell.
-    let own: Vec<u32> = match (&s.revision_date, s.edit_rules) {
-        (Some(date), Some(_)) if accept => s
-            .doc
-            .revisions
-            .iter()
-            .enumerate()
-            .filter(|(_, revision)| revision.author == s.author && &revision.date == date)
-            .filter_map(|(index, _)| u32::try_from(index).ok())
-            .collect(),
-        _ => Vec::new(),
-    };
+/// embed: accepting in an edit session decides the changes on record only. This session's own stay
+/// tracked: accepted, they would be plain text the host cannot tell from an untracked edit.
+/// Rejecting them is undoing them, which leaves nothing to tell. Its own are the revision records
+/// it made (at or past `Session::edit_floor`); `None` when nothing is kept.
+fn own_from(s: &Session, accept: bool) -> Option<usize> {
+    s.edit_rules.filter(|_| accept).map(|_| s.edit_floor)
+}
+
+fn resolve_para(
+    s: &mut Session,
+    story: StoryRef,
+    path: &wordcraft_doc::Path,
+    from: usize,
+    to: usize,
+    accept: bool,
+    own: Option<usize>,
+) -> Result<(), CmdError> {
     let para = s.doc.para_mut(story, path)?;
     let ranges: Vec<(usize, usize, bool, bool)> = para
         .run_ranges()
         .filter(|(r, _)| r.end > from && r.start < to)
-        .filter(|(_, c)| ![c.ins, c.del].into_iter().flatten().any(|revision| own.contains(&revision)))
+        .filter(|(_, c)| !own.is_some_and(|floor| [c.ins, c.del].into_iter().flatten().any(|revision| revision as usize >= floor)))
         .map(|(r, c)| (r.start.max(from), r.end.min(to), c.ins.is_some(), c.del.is_some()))
         .collect();
     for (a, b, ins, del) in ranges.into_iter().rev() {
@@ -283,10 +285,15 @@ fn resolve_para(s: &mut Session, story: StoryRef, path: &wordcraft_doc::Path, fr
 
 fn resolve_all(s: &mut Session, accept: bool) -> CmdResult {
     let stories: Vec<StoryRef> = std::iter::once(StoryRef::Body).chain(s.doc.parts.keys().map(|k| StoryRef::Part(*k))).collect();
+    let own = own_from(s, accept);
     for st in stories {
+        // embed: an edit session leaves comments and text boxes as the file has them.
+        if s.edit_rules.is_some() && !crate::edit_mode::editable_story(&s.doc, st) {
+            continue;
+        }
         for path in s.doc.para_paths(st).into_iter().rev() {
             let len = s.doc.para(st, &path).map(|p| p.len()).unwrap_or(0);
-            resolve_para(s, st, &path, 0, len, accept)?;
+            resolve_para(s, st, &path, 0, len, accept, own)?;
         }
     }
     // embed: an edit session's own changes can stay tracked (`resolve_para`), so their records stay.
@@ -312,11 +319,12 @@ fn resolve_sel(s: &mut Session, accept: bool) -> CmdResult {
     } else {
         (a, b)
     };
+    let own = own_from(s, accept);
     for path in s.doc.paths_between(&a, &b).into_iter().rev() {
         let len = s.doc.para(a.story, &path).map(|p| p.len()).unwrap_or(0);
         let from = if path == a.path { a.off } else { 0 };
         let to = if path == b.path { b.off } else { len };
-        resolve_para(s, a.story, &path, from, to, accept)?;
+        resolve_para(s, a.story, &path, from, to, accept, own)?;
     }
     s.sel = Selection::caret(a);
     s.clamp_selection();

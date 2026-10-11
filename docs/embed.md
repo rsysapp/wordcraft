@@ -285,6 +285,41 @@ downloads, whatever the keyboard or pointer does. Ctrl/⌘+C copies the selectio
 event's `copyText` reports it (no tracked deletions or hidden text). Links inside the document are
 not followed.
 
+## Edit mode (engine)
+
+The engine's side of API 0.2's edit mode is in place; the host bridge (`setMode`, the edit strip,
+saving) is not yet. `Session::begin_edit(author, revisionDate, rules)` is the only way into an
+edit session. It refuses a blank author or a date that is not UTC whole seconds
+(`2026-10-10T08:00:00Z`), forces tracking on and clears undo and redo, so neither reaches past the
+session's start. Starting again with other rules or another date starts a new session, so one save
+carries one date. In a session, `Session::run` runs only `wordcraft_engine::edit_mode`'s
+allow-list: typing, deleting, line breaks, nonbreaking spaces and hyphens, Tab as a tracked tab
+character, cut, paste as plain text, undo, redo and moving between changes; accepting and rejecting
+only with the permission to decide. Every change is a tracked change by the session's author,
+dated with its date. A change counts as the session's own only when the session made its revision
+record, whatever a file revision's author or date. Deleting the session's own insertion removes
+it, deleting anything else marks it deleted, and accepting leaves the session's own changes
+tracked. Only the main text, headers, footers, footnotes and endnotes are edited; comments and
+text boxes stay as the file has them.
+
+A refusal is `CmdError::Editing`, with a stable code in `edit_mode::Refusal::code`, also left in
+`Session::refusal` and `Session::status`, for the host to map to its own message:
+
+| Code | Refused |
+|---|---|
+| `command_not_allowed` | a command off the allow-list |
+| `decision_not_allowed` | accepting, rejecting, or redoing a decision, without the permission |
+| `paragraph_break_not_supported` | Enter, and typed or pasted text with a paragraph break |
+| `character_not_allowed` | typed or pasted page or column breaks, other control characters, and directional formatting characters |
+| `outside_editable_story` | an edit with the selection in a comment or a text box |
+| `invalid_edit_session` | `begin_edit` without an author or a valid date |
+
+**Known limitation: new paragraphs.** API 0.2 lists new paragraphs among edit mode's edits, but
+Enter is not available in edit mode yet, and pasted text with paragraph breaks is refused. The
+Word writer does not yet record an inserted paragraph mark as a tracked change, so a new paragraph
+would be saved untracked. Enter returns once it does; until then the host shows the
+`paragraph_break_not_supported` refusal. Line breaks (Shift+Enter) work.
+
 ## Branding
 
 The embed build is a modified version of WordCraft: it carries none of the ArtCraft logo images

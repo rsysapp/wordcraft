@@ -99,6 +99,9 @@ struct Undo {
     label: String,
     doc: Document,
     sel: Selection,
+    /// embed: the step accepts or rejects tracked changes; an edit session redoes it only while it
+    /// may decide them.
+    decision: bool,
 }
 
 /// An editing session.
@@ -154,10 +157,16 @@ pub struct Session {
     pub ui_requests: Vec<Value>,
     /// embed: a view-only session runs only `crate::view_only::COMMANDS`.
     pub view_only: bool,
-    /// embed: an edit session runs only `crate::edit_mode` commands.
-    pub edit_rules: Option<crate::edit_mode::EditRules>,
+    /// embed: an edit session runs only `crate::edit_mode` commands. Set only by `begin_edit`.
+    pub(crate) edit_rules: Option<crate::edit_mode::EditRules>,
     /// embed: the date the host gives this edit session's tracked changes, instead of the clock.
-    pub revision_date: Option<String>,
+    pub(crate) revision_date: Option<String>,
+    /// embed: the number of revision records the document had when the edit session began. A
+    /// record at or past it was made by this session: that, never an author name or a date, is
+    /// what makes a change the session's own.
+    pub(crate) edit_floor: usize,
+    /// embed: why the last command was refused by an edit session (`None` when it was not).
+    pub refusal: Option<crate::edit_mode::Refusal>,
 }
 
 /// Maximum undo depth.
@@ -203,6 +212,8 @@ impl Session {
             view_only: false,
             edit_rules: None,
             revision_date: None,
+            edit_floor: 0,
+            refusal: None,
         }
     }
 
@@ -249,7 +260,7 @@ impl Session {
             return;
         }
         self.typing_open = label == "Typing";
-        self.history.push(Undo { label: label.to_string(), doc: self.doc.clone(), sel: self.sel.clone() });
+        self.history.push(Undo { label: label.to_string(), doc: self.doc.clone(), sel: self.sel.clone(), decision: false });
         if self.history.len() > MAX_UNDO {
             self.history.remove(0);
         }
@@ -281,7 +292,12 @@ impl Session {
         }
         self.typing_open = false;
         let Some(u) = self.history.pop() else { return false };
-        let cur = Undo { label: u.label.clone(), doc: std::mem::replace(&mut self.doc, u.doc), sel: std::mem::replace(&mut self.sel, u.sel) };
+        let cur = Undo {
+            label: u.label.clone(),
+            doc: std::mem::replace(&mut self.doc, u.doc),
+            sel: std::mem::replace(&mut self.sel, u.sel),
+            decision: u.decision,
+        };
         self.redo.push(cur);
         self.touch();
         true
@@ -293,7 +309,12 @@ impl Session {
         }
         self.typing_open = false;
         let Some(u) = self.redo.pop() else { return false };
-        let cur = Undo { label: u.label.clone(), doc: std::mem::replace(&mut self.doc, u.doc), sel: std::mem::replace(&mut self.sel, u.sel) };
+        let cur = Undo {
+            label: u.label.clone(),
+            doc: std::mem::replace(&mut self.doc, u.doc),
+            sel: std::mem::replace(&mut self.sel, u.sel),
+            decision: u.decision,
+        };
         self.history.push(cur);
         self.touch();
         true
@@ -305,8 +326,61 @@ impl Session {
         self.typing_open = false;
     }
 
+    /// embed: start an edit session, the only way into one: every change is tracked under `author`
+    /// and dated `revision_date` (UTC whole seconds), and runs only `crate::edit_mode` commands.
+    /// Undo and redo start afresh, so neither reaches past the session's start, and the changes this
+    /// session makes are told apart by their records, made from here on. Starting again with other
+    /// rules or another date ends the session before and starts a new one: one date per save.
+    /// Refused without an author or a valid date, leaving everything as it was.
+    pub fn begin_edit(&mut self, author: &str, revision_date: &str, rules: crate::edit_mode::EditRules) -> Result<(), CmdError> {
+        let blank = author.trim().is_empty() || author.chars().count() > 255;
+        if blank || !crate::edit_mode::is_revision_date(revision_date) {
+            return Err(self.refused("begin_edit", crate::edit_mode::Refusal::InvalidEditSession));
+        }
+        self.view_only = false;
+        self.author = author.to_string();
+        self.edit_rules = Some(rules);
+        self.revision_date = Some(revision_date.to_string());
+        self.edit_floor = self.doc.revisions.len();
+        self.doc.settings.track_changes = true;
+        self.pending = None;
+        self.refusal = None;
+        self.reset_history();
+        Ok(())
+    }
+
+    /// embed: end the edit session. Its history goes with it; the document keeps its edits.
+    pub fn end_edit(&mut self) {
+        if self.edit_rules.is_some() {
+            self.reset_history();
+        }
+        self.edit_rules = None;
+        self.revision_date = None;
+        self.edit_floor = 0;
+    }
+
+    /// embed: the edit session's rules, while one runs.
+    pub fn edit_rules(&self) -> Option<crate::edit_mode::EditRules> {
+        self.edit_rules
+    }
+
+    /// embed: the date this edit session's tracked changes carry, while one runs.
+    pub fn revision_date(&self) -> Option<&str> {
+        self.revision_date.as_deref()
+    }
+
+    /// embed: an edit session's refusal of `id`, recorded where the host reads it.
+    fn refused(&mut self, id: &str, refusal: crate::edit_mode::Refusal) -> CmdError {
+        let error = CmdError::Editing(crate::edit_mode::EditRefusal { refusal, command: id.to_string() });
+        self.status = error.to_string();
+        self.refusal = Some(refusal);
+        error
+    }
+
     /// Replace the document (open/new).
     pub fn set_document(&mut self, doc: Document) {
+        // embed: another document ends an edit session: its revision records are not this session's.
+        self.end_edit();
         self.doc = doc;
         self.doc.ensure_nonempty();
         self.sel = Selection::caret(self.doc.start_of(StoryRef::Body));
@@ -328,6 +402,7 @@ impl Session {
     /// it was; a panic inside a command becomes an error.
     pub fn run(&mut self, id: &str, params: &Value) -> Result<Value, CmdError> {
         let reg = self.registry.clone();
+        self.refusal = None;
         let Some(spec) = reg.get(id) else { return Err(CmdError::Unknown(id.to_string())) };
         // embed: a view-only session refuses every edit path, not just the ones marked as mutating.
         if self.view_only && !crate::view_only::allows(id) {
@@ -337,14 +412,29 @@ impl Session {
         // a tab character there, never the cell, row, list-level or indent moves `text.tab` makes in
         // the full application (embed API "Keyboard in edit mode").
         if let Some(rules) = self.edit_rules {
+            use crate::edit_mode::{DECIDE, Refusal, TAB, allows, editable_story, tab_params};
             // Tracking is on for the whole session, whatever the document's own setting, so no
             // allowed command can make an untracked change (embed API 0.2, "WordCraft tracks every change").
             self.doc.settings.track_changes = true;
-            if id == crate::edit_mode::TAB {
-                return self.run("text.insert", &crate::edit_mode::tab_params());
+            if id == TAB {
+                return self.run("text.insert", &tab_params());
             }
-            if !crate::edit_mode::allows(id, rules) {
-                return Err(CmdError::Disabled(crate::edit_mode::refusal(id)));
+            if !allows(id, rules) {
+                let refusal = match id {
+                    _ if DECIDE.contains(&id) => Refusal::DecisionNotAllowed,
+                    // Enter: off until the writer records an inserted paragraph mark (Ruling 6C-10).
+                    "text.newParagraph" => Refusal::ParagraphBreakNotSupported,
+                    _ => Refusal::CommandNotAllowed,
+                };
+                return Err(self.refused(id, refusal));
+            }
+            // Redo replays a whole document state: one a decision made needs the permission now.
+            if id == "edit.redo" && !rules.may_decide && self.redo.last().is_some_and(|step| step.decision) {
+                return Err(self.refused(id, Refusal::DecisionNotAllowed));
+            }
+            // Comments and text boxes stay as the file has them (Ruling W2-2).
+            if spec.mutates && !(editable_story(&self.doc, self.sel.anchor.story) && editable_story(&self.doc, self.sel.focus.story)) {
+                return Err(self.refused(id, Refusal::OutsideEditableStory));
             }
         }
         if let Some(why) = (spec.enabled)(self) {
@@ -379,6 +469,12 @@ impl Session {
         if spec.mutates {
             let label = if spec.id == "text.insert" { "Typing" } else { spec.label };
             self.checkpoint(label);
+            // embed: remember which steps decided tracked changes (see `Undo::decision`).
+            if crate::edit_mode::DECIDE.contains(&id)
+                && let Some(step) = self.history.last_mut()
+            {
+                step.decision = true;
+            }
         } else if !spec.id.starts_with("caret.") && !spec.id.starts_with("view.") {
             // Non-mutating commands other than caret movement keep the typing group.
         } else if spec.id.starts_with("caret.") {
@@ -409,6 +505,7 @@ impl Session {
                     self.typing_open = t;
                 }
                 self.status = e.to_string();
+                self.refusal = e.edit_refusal();
             }
         }
         result

@@ -81,7 +81,11 @@ pub fn delete_selection(s: &mut Session) -> Result<Pos, CmdError> {
 pub fn new_revision(s: &mut Session, kind: RevisionKind) -> u32 {
     // embed: an edit session's changes carry the host's date; the web build has no clock.
     let date = s.revision_date.clone().unwrap_or_else(now_iso);
-    if let Some((i, _)) = s.doc.revisions.iter().enumerate().rev().find(|(_, r)| r.kind == kind && r.author == s.author && r.date == date) {
+    // embed: an edit session reuses only records it made itself, never one read from the file,
+    // however alike (see `Session::edit_floor`).
+    let floor = if s.edit_rules.is_some() { s.edit_floor } else { 0 };
+    if let Some((i, _)) = s.doc.revisions.iter().enumerate().skip(floor).rev().find(|(_, r)| r.kind == kind && r.author == s.author && r.date == date)
+    {
         return i as u32;
     }
     s.doc.revisions.push(Revision { kind, author: s.author.clone(), date });
@@ -92,8 +96,9 @@ pub fn new_revision(s: &mut Session, kind: RevisionKind) -> u32 {
 fn track_delete(s: &mut Session, a: &Pos, b: &Pos) -> Result<Pos, CmdError> {
     let rid = new_revision(s, RevisionKind::Delete);
     let author = s.author.clone();
-    // embed: in an edit session only this session's insertions are the author's own; earlier ones are on record.
-    let session_date = s.revision_date.clone();
+    // embed: in an edit session only this session's insertions are the author's own, known by their
+    // records (made at or past `edit_floor`); earlier ones, the same person's included, are on record.
+    let floor = s.edit_rules.map(|_| s.edit_floor);
     // Remove text this author inserted (it never existed for the reader); mark the rest.
     let paths = s.doc.paths_between(a, b);
     for path in paths.iter().rev() {
@@ -102,14 +107,15 @@ fn track_delete(s: &mut Session, a: &Pos, b: &Pos) -> Result<Pos, CmdError> {
         let to = if *path == b.path { b.off } else { p.len() };
         let ranges: Vec<(usize, usize, bool)> = p
             .run_ranges()
-            // embed: text already deleted keeps its deletion, its author and date (as in Word); marking
-            // it again would re-attribute someone else's change.
+            // embed: in every session, the full application's too: text already deleted keeps its
+            // deletion, its author and date (as in Word); marking it again would re-attribute
+            // someone else's change.
             .filter(|(r, c)| r.end > from && r.start < to && c.del.is_none())
             .map(|(r, c)| {
-                let own = c
-                    .ins
-                    .and_then(|i| s.doc.revisions.get(i as usize))
-                    .is_some_and(|rv| rv.author == author && session_date.as_ref().is_none_or(|date| &rv.date == date));
+                let own = match floor {
+                    Some(floor) => c.ins.is_some_and(|i| i as usize >= floor),
+                    None => c.ins.and_then(|i| s.doc.revisions.get(i as usize)).is_some_and(|rv| rv.author == author),
+                };
                 (r.start.max(from), r.end.min(to), own)
             })
             .collect();
@@ -127,9 +133,12 @@ fn track_delete(s: &mut Session, a: &Pos, b: &Pos) -> Result<Pos, CmdError> {
 
 /// Insert typed text at the caret (replacing the selection), with pending formatting and track changes.
 pub fn type_text(s: &mut Session, text: &str) -> Result<(), CmdError> {
-    // embed: an edit session cannot save a new paragraph as a tracked change yet (`edit_mode::COMMANDS`).
-    if s.edit_rules.is_some() && text.contains(['\r', '\u{2029}']) {
-        return Err(CmdError::Disabled(crate::edit_mode::NEW_PARAGRAPH.into()));
+    // embed: an edit session cannot save a new paragraph as a tracked change yet (`edit_mode::COMMANDS`),
+    // and types no break or control character the reader would not see as typed text.
+    if s.edit_rules.is_some()
+        && let Err(refusal) = crate::edit_mode::check_text(text)
+    {
+        return Err(CmdError::Editing(crate::edit_mode::EditRefusal { refusal, command: "typing".into() }));
     }
     let mut props = s.typing_props();
     delete_selection(s)?;

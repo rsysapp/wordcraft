@@ -36,6 +36,19 @@ pub enum CmdError {
     Disabled(String),
     #[error("{0}")]
     Failed(String),
+    /// embed: refused by an edit session, with a stable code (`edit_mode::Refusal`).
+    #[error("{0}")]
+    Editing(edit_mode::EditRefusal),
+}
+
+impl CmdError {
+    /// embed: the edit session's refusal, when this is one.
+    pub fn edit_refusal(&self) -> Option<edit_mode::Refusal> {
+        match self {
+            CmdError::Editing(refused) => Some(refused.refusal),
+            _ => None,
+        }
+    }
 }
 
 impl From<wordcraft_doc::DocError> for CmdError {
