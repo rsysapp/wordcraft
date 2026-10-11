@@ -1018,3 +1018,82 @@ fn reads_roles_from_exact_relationship_types() {
     assert_eq!(inspection.added_parts.len(), 1);
     assert_eq!(inspection.changed_relationships.len(), 1);
 }
+
+// ---- Never crash, stay bounded -----------------------------------------------------------------
+
+/// A small deterministic generator, so a failing case can be replayed.
+struct Lcg(u64);
+
+impl Lcg {
+    fn next(&mut self) -> u64 {
+        self.0 = self.0.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1_442_695_040_888_963_407);
+        self.0 >> 33
+    }
+    fn below(&mut self, bound: usize) -> usize {
+        (self.next() % bound.max(1) as u64) as usize
+    }
+}
+
+fn rich_body() -> String {
+    format!(
+        r#"{}<w:tbl><w:tblPr><w:tblW w:w="0" w:type="auto"/></w:tblPr><w:tblGrid><w:gridCol w:w="2000"/></w:tblGrid><w:tr><w:tc><w:p>{}</w:p></w:tc></w:tr></w:tbl>{}<w:sectPr><w:pgSz w:w="11906" w:h="16838"/></w:sectPr>"#,
+        para(&format!(
+            r#"<w:bookmarkStart w:id="0" w:name="Price"/>{}{}<w:bookmarkEnd w:id="0"/>{}"#,
+            text("Rent "),
+            ins(ANA, "is due "),
+            del(ANA, "monthly")
+        )),
+        text("Cell"),
+        para(&anchored("1", "Deposit")),
+    )
+}
+
+/// Bytes flipped anywhere in a package, and characters changed anywhere in its XML: every case
+/// answers, as facts or as an error, and never panics.
+#[test]
+fn never_panics_on_mangled_packages_or_xml() {
+    let base = with_comments(&rich_body(), &[("1", "Ana Setia", "Check.", "00000001")], &[("00000001", None, false)]);
+    let document_xml = document(&rich_body());
+    assert_eq!(inspect(&base, &base).unwrap(), Inspection::default());
+    let mut random = Lcg(0x5EED);
+    for _ in 0..600 {
+        let mut bytes = base.clone();
+        for _ in 0..1 + random.below(4) {
+            let at = random.below(bytes.len());
+            bytes[at] = random.next() as u8;
+        }
+        let _ = inspect(&base, &bytes);
+        let _ = inspect(&bytes, &base);
+    }
+    let alphabet: Vec<char> = "<>/=\"' &;:#xwpr0129abtXYZ\u{0}\u{FFFD}é".chars().collect();
+    for _ in 0..600 {
+        let mut chars: Vec<char> = document_xml.chars().collect();
+        for _ in 0..1 + random.below(3) {
+            let at = random.below(chars.len());
+            match random.below(3) {
+                0 => chars[at] = alphabet[random.below(alphabet.len())],
+                1 => {
+                    chars.remove(at);
+                }
+                _ => chars.insert(at, alphabet[random.below(alphabet.len())]),
+            }
+        }
+        let mangled: String = chars.into_iter().collect();
+        let edited = zip_entries(&[
+            ("[Content_Types].xml".to_string(), CONTENT_TYPES.as_bytes().to_vec()),
+            ("_rels/.rels".to_string(), ROOT_RELS.as_bytes().to_vec()),
+            ("word/document.xml".to_string(), mangled.into_bytes()),
+        ])
+        .unwrap();
+        let _ = inspect(&base, &edited);
+        let _ = inspect(&edited, &base);
+    }
+}
+
+/// A story longer than an inspection reads is unreadable, naming which file.
+#[test]
+fn refuses_more_text_than_it_reads() {
+    let base = package(&para(&text("Rent.")), &[]);
+    let long = package(&para(&text(&"a".repeat(MAX_STORY_ITEMS + 1))), &[]);
+    assert!(matches!(inspect(&base, &long), Err(InspectError::Edited(message)) if message.contains("more text")));
+}
