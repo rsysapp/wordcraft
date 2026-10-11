@@ -32,6 +32,7 @@ aho-corasick = { workspace = true } # embed: host marks
 [dev-dependencies]
 egui_kittest = { workspace = true, features = ["wgpu", "snapshot"] }
 image = { workspace = true }
+wordcraft-docx = { workspace = true } # embed: the save inspector over edit mode's saves
 
 [build-dependencies]
 serde_json = { workspace = true }

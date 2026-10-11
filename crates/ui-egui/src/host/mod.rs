@@ -3,6 +3,8 @@
 //! lives here so upstream merges stay easy.
 
 pub mod bridge;
+// embed: edit mode (embed API 0.2).
+pub(crate) mod edit;
 pub(crate) mod marks;
 pub mod open;
 // Public only for the embed crate and the tests; not part of the desktop or web app's API.
@@ -15,7 +17,7 @@ pub mod text_match;
 pub mod view;
 pub mod wire;
 
-pub use bridge::{HostBridge, HostCommand, HostEvent};
+pub use bridge::{EditorMode, HostBridge, HostCommand, HostEvent};
 #[doc(hidden)]
 pub use profile::EmbedProfile;
 #[doc(hidden)]

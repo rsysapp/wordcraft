@@ -158,6 +158,10 @@ fn usable(rect: &wordcraft_geom::Rect) -> bool {
 /// frame's click on the canvas landed in one, tell the host: the topmost wins. A drag is never a
 /// click, so selecting text across a mark activates nothing.
 pub(crate) fn paint(app: &mut WordApp, painter: &egui::Painter, pages: &[Rect], layout: &Arc<DocLayout>, scale: f32, canvas: &egui::Response) {
+    // No marks, and no clicks on them, while the document is edited (embed API 0.2).
+    if app.host.as_ref().is_some_and(|host| host.edit.is_some()) {
+        return;
+    }
     let Some(host) = app.host.as_mut() else { return };
     if host.resolve_marks(&app.session.doc, app.session.rev(), layout) {
         painter.ctx().request_repaint();

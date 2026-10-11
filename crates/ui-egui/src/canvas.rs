@@ -354,8 +354,9 @@ pub fn show(app: &mut WordApp, ui: &mut Ui) {
             }
             // IME candidate window placement.
             let cr = Rect::from_min_max(pos2(x, y0), pos2(x + 1.0, y1));
-            // embed: view mode takes no text input, so it never claims the IME (and the on-screen keyboard).
-            if focused && !app.profile.is_view() {
+            // embed: view mode takes no text input, so it never claims the IME (and the on-screen keyboard);
+            // edit mode does, or eframe never focuses its text agent and composed or on-screen typing is lost.
+            if focused && (!app.profile.is_view() || app.session.edit_rules().is_some()) {
                 ui.ctx().output_mut(|o| {
                     o.ime =
                         Some(egui::output::IMEOutput { rect: cr, cursor_rect: cr, purpose: Default::default(), should_interrupt_composition: false });

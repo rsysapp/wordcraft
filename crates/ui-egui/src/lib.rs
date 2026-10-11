@@ -179,6 +179,8 @@ impl WordApp {
         self.after_command(id);
         if let Err(e) = &r {
             self.status(e.clone());
+            // embed: an edit session's refusal is shown in the edit strip, never dropped silently.
+            host::edit::note_refusal(self);
         }
         r
     }

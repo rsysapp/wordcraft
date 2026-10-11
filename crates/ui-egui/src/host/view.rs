@@ -15,6 +15,7 @@ pub fn show(app: &mut WordApp, ui: &mut Ui) {
     egui::CentralPanel::default().frame(egui::Frame::NONE.fill(t.canvas)).show(ui, |ui| {
         crate::canvas::show(app, ui);
     });
+    super::edit::notice(app, ui.ctx());
 }
 
 fn bar(app: &mut WordApp, ui: &mut Ui) {
@@ -28,6 +29,7 @@ fn bar(app: &mut WordApp, ui: &mut Ui) {
                 page_controls(app, ui);
                 ui.separator();
                 zoom_controls(app, ui);
+                super::edit::strip(app, ui);
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| find_controls(app, ui));
             });
         });

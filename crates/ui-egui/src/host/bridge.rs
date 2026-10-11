@@ -6,7 +6,7 @@ use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 use serde::Serialize;
 
-use super::wire::{JumpTarget, MarkSpec, ThemeSpec};
+use super::wire::{JumpTarget, MarkSpec, ModeRequest, ThemeSpec};
 
 /// What a host page asks of the editor.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -22,19 +22,69 @@ pub enum HostCommand {
     SetMarks(Vec<MarkSpec>),
     /// Dark or light chrome and the host's accent; pages stay white.
     SetTheme(ThemeSpec),
+    /// Switch the open document to view or edit mode; answered by `ModeChanged`.
+    SetMode(ModeRequest),
+    /// Serialise the document; answered by `SaveRequested` or `SaveFailed`.
+    RequestSave,
 }
 
 /// What the editor tells the host page; serialises to the embed API's `EditorEvent`.
 #[derive(Clone, Debug, PartialEq, Serialize)]
 #[serde(tag = "type", rename_all = "camelCase", rename_all_fields = "camelCase")]
 pub enum HostEvent {
-    Opened { pages: u32 },
-    OpenFailed { message: String },
-    PageChanged { page: u32 },
-    Selection { text: String, copy_text: String, page: Option<u32>, x: f32, y: f32 },
+    Opened {
+        pages: u32,
+    },
+    OpenFailed {
+        message: String,
+    },
+    PageChanged {
+        page: u32,
+    },
+    Selection {
+        text: String,
+        copy_text: String,
+        page: Option<u32>,
+        x: f32,
+        y: f32,
+    },
     SelectionCleared,
-    MarkActivated { id: String },
-    JumpNotFound { target: JumpTarget },
+    MarkActivated {
+        id: String,
+    },
+    JumpNotFound {
+        target: JumpTarget,
+    },
+    ModeChanged {
+        mode: EditorMode,
+    },
+    DirtyChanged {
+        dirty: bool,
+    },
+    /// `bytes` is set on the JavaScript object by the embed crate, outside JSON.
+    SaveRequested {
+        file_name: String,
+        #[serde(skip)]
+        bytes: Vec<u8>,
+    },
+    SaveFailed {
+        message: String,
+    },
+    CommentRequested {
+        text: String,
+        copy_text: String,
+        page: Option<u32>,
+        x: f32,
+        y: f32,
+    },
+}
+
+/// The mode in force, as `modeChanged` names it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum EditorMode {
+    View,
+    Edit,
 }
 
 #[derive(Default)]
@@ -172,6 +222,16 @@ mod tests {
             (
                 HostEvent::JumpNotFound { target: JumpTarget::Page { page: u32::MAX } },
                 json!({"type": "jumpNotFound", "target": {"kind": "page", "page": 4294967295u32}}),
+            ),
+            (HostEvent::ModeChanged { mode: EditorMode::Edit }, json!({"type": "modeChanged", "mode": "edit"})),
+            (HostEvent::ModeChanged { mode: EditorMode::View }, json!({"type": "modeChanged", "mode": "view"})),
+            (HostEvent::DirtyChanged { dirty: true }, json!({"type": "dirtyChanged", "dirty": true})),
+            // The bytes travel outside JSON (the embed crate sets them on the event object).
+            (HostEvent::SaveRequested { file_name: "a.docx".into(), bytes: vec![1, 2] }, json!({"type": "saveRequested", "fileName": "a.docx"})),
+            (HostEvent::SaveFailed { message: "m".into() }, json!({"type": "saveFailed", "message": "m"})),
+            (
+                HostEvent::CommentRequested { text: "a b".into(), copy_text: "a\nb".into(), page: Some(1), x: 1.0, y: 2.0 },
+                json!({"type": "commentRequested", "text": "a b", "copyText": "a\nb", "page": 1, "x": 1.0, "y": 2.0}),
             ),
         ];
         for (event, expected) in cases {

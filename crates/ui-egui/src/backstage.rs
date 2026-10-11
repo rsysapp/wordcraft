@@ -262,7 +262,9 @@ fn options_page(app: &mut WordApp, ui: &mut Ui) {
     ui.horizontal(|ui| {
         ui.label("User name:");
         let mut n = app.session.author.clone();
-        if ui.text_edit_singleline(&mut n).changed() {
+        // embed: an edit session's author is the host's (`Session::begin_edit`); nothing here renames it.
+        let editing = app.session.edit_rules().is_some();
+        if ui.add_enabled(!editing, egui::TextEdit::singleline(&mut n)).changed() && !editing {
             app.session.author = n;
         }
     });

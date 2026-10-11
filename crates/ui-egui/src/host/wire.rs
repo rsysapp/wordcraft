@@ -158,6 +158,71 @@ pub fn parse_marks(json: &str) -> Result<Vec<MarkSpec>, String> {
     Ok(marks)
 }
 
+/// `setMode`'s request (embed API 0.2).
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize)]
+#[serde(tag = "mode", rename_all = "lowercase")]
+pub enum ModeRequest {
+    View,
+    Edit {
+        author: AuthorSpec,
+        #[serde(rename = "revisionDate")]
+        revision_date: String,
+        permissions: PermissionsSpec,
+    },
+}
+
+/// The person editing: their display name authors every tracked change of the session.
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AuthorSpec {
+    pub id: String,
+    pub name: String,
+}
+
+/// Which tools edit mode offers; this editor reads `accept_reject_changes` only.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct PermissionsSpec {
+    pub accept_reject_changes: bool,
+    pub organize_pages: bool,
+    pub fill_forms: bool,
+    pub redact: bool,
+    pub stamps: bool,
+    pub drawing: bool,
+}
+
+/// Tracked changes and annotations name their author; Word refuses longer names.
+const MAX_AUTHOR_CHARS: usize = 255;
+
+/// Most fraction digits a revision date may carry (nanoseconds); Word keeps whole seconds anyway.
+const MAX_FRACTION_DIGITS: usize = 9;
+
+/// A host's revision date, `YYYY-MM-DDTHH:MM:SS` on a calendar day with an optional fraction and
+/// `Z`, as Word stores it: to the second (`2026-10-10T08:00:00.123Z` is `2026-10-10T08:00:00Z`).
+/// `None` when it is not one.
+pub fn revision_date_seconds(date: &str) -> Option<String> {
+    let whole = format!("{}Z", date.get(..19)?);
+    let tail_ok = match date.get(19..)?.as_bytes() {
+        [b'Z'] => true,
+        [b'.', fraction @ .., b'Z'] => (1..=MAX_FRACTION_DIGITS).contains(&fraction.len()) && fraction.iter().all(u8::is_ascii_digit),
+        _ => false,
+    };
+    (tail_ok && wordcraft_engine::edit_mode::is_revision_date(&whole)).then_some(whole)
+}
+
+pub fn parse_mode_request(json: &str) -> Result<ModeRequest, String> {
+    let request: ModeRequest = serde_json::from_str(json).map_err(|error| format!("setMode: {error}"))?;
+    if let ModeRequest::Edit { author, revision_date, .. } = &request {
+        if author.name.trim().is_empty() || author.name.chars().count() > MAX_AUTHOR_CHARS {
+            return Err(format!("setMode: author.name must be 1 to {MAX_AUTHOR_CHARS} characters"));
+        }
+        if revision_date_seconds(revision_date).is_none() {
+            return Err("setMode: revisionDate must be an ISO 8601 UTC timestamp on a calendar day".into());
+        }
+    }
+    Ok(request)
+}
+
 #[cfg(test)]
 mod tests {
     use egui::Color32;
@@ -315,5 +380,34 @@ mod tests {
             (0..MAX_MARKS).map(|index| format!(r##"{{"id":"m{index}","text":"x","page":null,"color":"#000000"}}"##)).collect();
         entries.push(r#"{"id":"late","text":"x","page":null,"color":"red"}"#.into());
         assert_eq!(parse_marks(&format!("[{}]", entries.join(","))).unwrap().len(), MAX_MARKS);
+    }
+
+    // W3: a revision date is a real calendar day in UTC; Word keeps it to the second.
+    #[test]
+    fn revision_dates_are_utc_calendar_days_kept_to_the_second() {
+        for (date, seconds) in [
+            ("2026-10-10T08:00:00Z", "2026-10-10T08:00:00Z"),
+            ("2026-10-10T08:00:00.123Z", "2026-10-10T08:00:00Z"),
+            ("2028-02-29T23:59:59.5Z", "2028-02-29T23:59:59Z"),
+        ] {
+            assert_eq!(revision_date_seconds(date).as_deref(), Some(seconds), "{date}");
+        }
+        for bad in [
+            "2026-02-31T08:00:00Z",
+            "2026-02-29T08:00:00Z",
+            "2026-04-31T08:00:00.000Z",
+            "2026-13-01T08:00:00Z",
+            "2026-10-10T24:00:00Z",
+            "2026-10-10T08:00:00",
+            "2026-10-10T08:00:00.Z",
+            "2026-10-10T08:00:00.1234567890Z",
+            "2026-10-10T08:00:00+07:00",
+            "2026-10-10",
+            "yesterday",
+            "",
+            "２０２６-10-10T08:00:00Z",
+        ] {
+            assert_eq!(revision_date_seconds(bad), None, "{bad}");
+        }
     }
 }

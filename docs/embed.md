@@ -287,8 +287,8 @@ not followed.
 
 ## Edit mode (engine)
 
-The engine's side of API 0.2's edit mode is in place; the host bridge (`setMode`, the edit strip,
-saving) is not yet. `Session::begin_edit(author, revisionDate, rules)` is the only way into an
+The engine's and the host bridge's sides of API 0.2's edit mode are in place (the JavaScript methods
+come with the 0.2 release). `Session::begin_edit(author, revisionDate, rules)` is the only way into an
 edit session. It refuses a blank author or a date that is not UTC whole seconds on a calendar day
 (`2026-10-10T08:00:00Z`; `2026-02-31T08:00:00Z` is refused), forces tracking on and clears undo and
 redo, so neither reaches past the session's start. Starting again with another author, other rules
@@ -321,6 +321,14 @@ session every error `Session::run` answers is one, so the host never parses an e
 | `not_available` | a command that does not apply where the selection is (Cut with nothing selected) |
 | `document_protected` | a change the document's own Restrict Editing setting refuses |
 | `command_failed` | a command that failed; the document is as it was |
+
+The host bridge (`crates/ui-egui/src/host/edit.rs`) begins the engine's session once per entry into
+edit mode: `setMode` with the author, date (to the second) and rules already running keeps the
+session. A malformed request is refused before it is queued; a request queued with a date the
+calendar lacks, or with no document open (none yet, or the last open failed), answers `modeChanged`
+with `view`. Every open, a refused one included, ends edit mode first. A refusal while editing (Enter,
+a formatting shortcut) is shown over the top of the document, in words mapped from its code, until
+the document next changes; the contract has no event for it, so the host page is not told.
 
 **Known limitation: new paragraphs.** API 0.2 lists new paragraphs among edit mode's edits, but
 Enter is not available in edit mode yet, and pasted text with paragraph breaks is refused. The

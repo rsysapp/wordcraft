@@ -166,10 +166,16 @@ fn cmd_embed() -> Result<(), String> {
         "embed_host",
         "--test",
         "embed_view",
+        // embed: edit mode (embed API 0.2).
+        "--test",
+        "embed_edit",
         "--test",
         "app_harness",
     ]);
-    run(test, "cargo test --locked -p wordcraft-ui-egui --no-default-features --test embed_host --test embed_view --test app_harness")?;
+    run(
+        test,
+        "cargo test --locked -p wordcraft-ui-egui --no-default-features --test embed_host --test embed_view --test embed_edit --test app_harness",
+    )?;
     let mut clippy = cargo();
     clippy.args(["clippy", "--locked", "--target", "wasm32-unknown-unknown", "-p", "wordcraft-embed", "--", "-D", "warnings"]);
     run(clippy, "cargo clippy --locked --target wasm32-unknown-unknown -p wordcraft-embed -- -D warnings")

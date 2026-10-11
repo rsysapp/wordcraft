@@ -84,6 +84,20 @@ pub struct HostState {
     reported: bool,
     /// The editor replaced the selection this frame, so a reported one is cleared when it ends.
     clear_reported: bool,
+    /// embed: the edit session while the host page has the document in edit mode (embed API 0.2).
+    pub(crate) edit: Option<super::edit::EditSession>,
+    /// The opened file's name, which a save keeps; and whether a document is open: the last open
+    /// succeeded (a refused open leaves nothing to edit).
+    pub(crate) file_name: String,
+    pub(crate) file_open: bool,
+    /// A save or a comment asked for during the frame, answered after it (`edit::after_frame`).
+    pub(crate) save_asked: bool,
+    pub(crate) comment_asked: bool,
+    /// An edit session that ended (or was begun again, which clears undo) had changed the opened
+    /// document: undoing what the next one did does not make it clean.
+    pub(crate) edited: bool,
+    /// The dirty state the host was last told (`dirtyChanged`); a new document starts clean.
+    pub(crate) dirty: bool,
 }
 
 impl HostState {
@@ -122,6 +136,10 @@ impl HostState {
     /// Screen rectangles of the marks painted last frame, with their ids, the topmost last (tests).
     #[doc(hidden)]
     pub fn mark_rects(&self) -> Vec<(egui::Rect, String)> {
+        // Host marks describe the stored version; they are hidden while it is edited.
+        if self.edit.is_some() {
+            return Vec::new();
+        }
         self.marks.painted()
     }
 
@@ -163,7 +181,30 @@ impl HostState {
             settled: Selection::default(),
             reported: false,
             clear_reported: false,
+            edit: None,
+            file_name: String::new(),
+            file_open: false,
+            save_asked: false,
+            comment_asked: false,
+            edited: false,
+            dirty: false,
         }
+    }
+
+    /// Entering edit mode: a selection the host was told of is cleared, before `modeChanged` (embed
+    /// API 0.2, "Entering edit mode").
+    pub(crate) fn clear_reported_selection(&mut self) {
+        if std::mem::take(&mut self.reported) {
+            self.bridge.emit(HostEvent::SelectionCleared);
+        }
+        self.clear_reported = false;
+    }
+
+    /// Leaving edit mode: the selection made while editing counts as settled, so it is reported only
+    /// once the person changes it.
+    pub(crate) fn settle_quietly(&mut self, sel: &Selection) {
+        self.settled = sel.clone();
+        self.clear_reported = false;
     }
 }
 
@@ -176,13 +217,22 @@ pub(crate) fn before_frame(app: &mut WordApp, ctx: &egui::Context) {
     }
     for command in host.bridge.take_commands() {
         match command {
-            HostCommand::Open { name, bytes } => open(app, &mut host, &name, &bytes),
-            // Refused like any open that fails: the open document stays.
-            HostCommand::OpenTooLarge { .. } => host.bridge.emit(HostEvent::OpenFailed { message: super::open::TOO_LARGE.to_string() }),
+            HostCommand::Open { name, bytes } => {
+                super::edit::before_open(app, &mut host);
+                open(app, &mut host, &name, &bytes);
+            }
+            // Refused like any open that fails: the open document stays, edit mode ends (embed API 0.2).
+            HostCommand::OpenTooLarge { .. } => {
+                super::edit::before_open(app, &mut host);
+                refuse_open(&mut host, super::open::TOO_LARGE.to_string());
+            }
             HostCommand::JumpTo(target) => jump(app, &mut host, target, ctx.cumulative_frame_nr()),
             // Looked for when next painted, against the layout painted then.
             HostCommand::SetMarks(marks) => host.marks.set(marks),
             HostCommand::SetTheme(theme) => set_theme(app, &mut host, ctx, &theme),
+            HostCommand::SetMode(request) => super::edit::set_mode(app, &mut host, request),
+            // Answered after the frame, once: two requests in one frame answer once.
+            HostCommand::RequestSave => host.save_asked = true,
         }
     }
     app.host = Some(host);
@@ -211,6 +261,8 @@ pub(crate) fn after_frame(app: &mut WordApp, ctx: &egui::Context) {
     if std::mem::take(&mut app.canvas.scroll_to_doc_taken) || app.canvas.scroll_to_doc.is_none() {
         host.pending_jump = None;
     }
+    // Typing in edit mode drops a jump's page target before the page is reported.
+    super::edit::follow_typing(app, &mut host);
     follow_the_view(app, &mut host, ctx);
     // The target page is in view too (the jump put its top there, or as near as the end allows), and
     // the host's page indicator should say what the bar says.
@@ -221,7 +273,11 @@ pub(crate) fn after_frame(app: &mut WordApp, ctx: &egui::Context) {
         host.last_page = Some(page);
         host.bridge.emit(HostEvent::PageChanged { page: page_number(page) });
     }
-    settle_selection(app, &mut host, ctx);
+    // Selecting is part of editing: no selection events in edit mode (embed API 0.2).
+    if host.edit.is_none() {
+        settle_selection(app, &mut host, ctx);
+    }
+    super::edit::after_frame(app, &mut host, ctx);
     app.host = Some(host);
 }
 
@@ -265,7 +321,7 @@ fn settle_selection(app: &mut WordApp, host: &mut HostState, ctx: &egui::Context
 }
 
 /// A settled selection as the host would hear of it.
-enum Reading {
+pub(super) enum Reading {
     Text(HostEvent),
     /// Nothing but whitespace (or object placeholders) is selected.
     Blank,
@@ -276,7 +332,7 @@ enum Reading {
 /// The selection as the host hears it, placed at the end of its last line: egui points times the
 /// zoom factor are CSS pixels from the canvas's top-left (eframe's web backend draws one point per
 /// CSS pixel at zoom 1). The PDF editor's embed build places its selections alike.
-fn read_selection(app: &mut WordApp, zoom: f32) -> Reading {
+pub(super) fn read_selection(app: &mut WordApp, zoom: f32) -> Reading {
     let (start, end) = app.session.sel.ordered();
     // What the reader sees, as jumps and marks match it: no tracked deletions or hidden text.
     let visible = visible_fragment_text(&app.session.doc.copy_range(&start, &end));
@@ -468,6 +524,11 @@ fn open(app: &mut WordApp, host: &mut HostState, name: &str, bytes: &[u8]) {
             if let Some(waiting) = host.pending_jump.take() {
                 host.bridge.emit(HostEvent::JumpNotFound { target: waiting.target });
             }
+            host.file_open = true;
+            host.file_name = name.to_string();
+            // A new document starts clean; `dirtyChanged` reports its edits from here.
+            host.edited = false;
+            host.dirty = false;
             app.session.set_document(doc);
             app.session.page_hint = 0;
             app.session.find = Default::default();
@@ -486,8 +547,15 @@ fn open(app: &mut WordApp, host: &mut HostState, name: &str, bytes: &[u8]) {
             host.opened = true;
             host.bridge.emit(HostEvent::Opened { pages: u32::try_from(pages).unwrap_or(u32::MAX) });
         }
-        Err(message) => host.bridge.emit(HostEvent::OpenFailed { message }),
+        Err(message) => refuse_open(host, message),
     }
+}
+
+/// An open that failed or was refused: the document that was showing stays on the canvas, but the
+/// host shows its failure panel, so there is no document for edit mode until the next open succeeds.
+fn refuse_open(host: &mut HostState, message: String) {
+    host.file_open = false;
+    host.bridge.emit(HostEvent::OpenFailed { message });
 }
 
 /// 1-based page number for the host.

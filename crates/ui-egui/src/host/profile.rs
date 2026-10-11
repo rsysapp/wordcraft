@@ -64,5 +64,9 @@ pub(crate) fn view_gate(app: &mut WordApp, id: &str, params: &Value) -> Option<R
         }
         return Some(Ok(json!({})));
     }
+    // While the host page has the document in edit mode, edit mode's gate decides.
+    if let Some(rules) = app.session.edit_rules() {
+        return super::edit::gate(app, id, params, rules);
+    }
     if wordcraft_engine::view_only::allows(id) { None } else { Some(Err(refusal(id))) }
 }
