@@ -973,3 +973,170 @@ fn a_command_that_changes_nothing_tells_the_host_nothing() {
     assert!(harness.state().session.doc.revisions.is_empty());
     assert!(!harness.state().session.can_undo());
 }
+
+// ---- Task W4: save, dirty state and comments in edit mode ----
+
+/// An embedded app whose page offers the browser's download, as the web shell does, so a save that
+/// slipped past edit mode's gate would show up as a download.
+fn with_download_service(downloads: std::rc::Rc<std::cell::Cell<usize>>) -> (Harness<'static, WordApp>, HostBridge) {
+    use wordcraft_ui_egui::Services;
+    use wordcraft_ui_egui::host::EmbedProfile;
+    let bridge = HostBridge::new();
+    let services = Services { download: Some(Box::new(move |_, _| downloads.set(downloads.get() + 1))), ..Services::default() };
+    let app = WordApp::new(wordcraft_engine::Session::new(Document::new()), services).with_host(bridge.clone(), EmbedProfile::View);
+    let mut harness = common::harness(app, 1.0);
+    bridge.set_context(harness.ctx.clone());
+    wordcraft_ui_egui::host::prepare_context(&harness.ctx);
+    harness.run_steps(2);
+    bridge.send(HostCommand::Open { name: "lease.docx".into(), bytes: docx("Rent is due monthly.") });
+    harness.run_steps(3);
+    bridge.take_events();
+    (harness, bridge)
+}
+
+fn saves(events: &[HostEvent]) -> usize {
+    events.iter().filter(|event| matches!(event, HostEvent::SaveRequested { .. })).count()
+}
+
+#[test]
+fn answers_a_save_with_the_document_s_bytes_under_its_name_and_the_session_author() {
+    let (mut harness, bridge) = editing(false);
+    harness.state_mut().run("text.insert", json!({ "text": "Monthly: " })).unwrap();
+    harness.run_steps(2);
+    bridge.take_events();
+    bridge.send(HostCommand::RequestSave);
+    harness.run_steps(2);
+    let events = bridge.take_events();
+    let Some(HostEvent::SaveRequested { file_name, bytes }) = events.iter().find(|event| matches!(event, HostEvent::SaveRequested { .. })) else {
+        panic!("a save answer: {events:?}");
+    };
+    assert_eq!(file_name, "lease.docx");
+    let reopened = wordcraft_engine::io::open_bytes("lease.docx", bytes).unwrap();
+    assert!(reopened.plain_text(StoryRef::Body).contains("Monthly: Rent is due monthly."));
+    let revision = reopened.revisions.last().expect("the typing is a tracked change");
+    assert_eq!((revision.author.as_str(), revision.kind == RevisionKind::Insert), (AUTHOR, true));
+    // The save is the only event: it neither ends edit mode nor clears dirty.
+    assert_eq!(events.len(), 1, "{events:?}");
+    assert!(harness.state().session.edit_rules().is_some());
+}
+
+#[test]
+fn saves_a_document_that_was_not_changed_too() {
+    let (mut harness, bridge) = editing(false);
+    bridge.send(HostCommand::RequestSave);
+    harness.run_steps(2);
+    let events = bridge.take_events();
+    let Some(HostEvent::SaveRequested { bytes, .. }) = events.first() else { panic!("a save answer: {events:?}") };
+    let reopened = wordcraft_engine::io::open_bytes("lease.docx", bytes).unwrap();
+    assert_eq!(reopened.plain_text(StoryRef::Body), "Rent is due monthly.");
+    assert!(reopened.revisions.is_empty(), "no change was made, so none is written");
+}
+
+#[test]
+fn never_downloads_whatever_asks_for_a_save() {
+    let downloads = std::rc::Rc::new(std::cell::Cell::new(0));
+    let (mut harness, bridge) = with_download_service(downloads.clone());
+    bridge.send(edit(false));
+    harness.run_steps(2);
+    bridge.take_events();
+    focus_canvas(&mut harness);
+    // The shortcut, the command (the strip and Backstage run it) and the host's request.
+    harness.key_press_modifiers(egui::Modifiers::COMMAND, egui::Key::S);
+    harness.run_steps(2);
+    harness.state_mut().run("file.save", json!({})).unwrap();
+    bridge.send(HostCommand::RequestSave);
+    harness.run_steps(2);
+    assert_eq!(saves(&bridge.take_events()), 3);
+    assert_eq!(downloads.get(), 0, "a save is the host's to keep");
+}
+
+#[test]
+fn takes_no_save_and_no_download_in_view_mode() {
+    let downloads = std::rc::Rc::new(std::cell::Cell::new(0));
+    let (mut harness, bridge) = with_download_service(downloads.clone());
+    focus_canvas(&mut harness);
+    harness.key_press_modifiers(egui::Modifiers::COMMAND, egui::Key::S);
+    harness.run_steps(2);
+    assert!(harness.state_mut().run("file.save", json!({})).is_err());
+    harness.run_steps(2);
+    assert_eq!(saves(&bridge.take_events()), 0);
+    assert_eq!(downloads.get(), 0);
+}
+
+// The contract: saving never clears dirty; only `opened` does, and it starts clean without a
+// `dirtyChanged` (the host resets its own state on `opened`).
+#[test]
+fn keeps_the_document_dirty_after_a_save_until_it_is_opened_again() {
+    let (mut harness, bridge) = editing(false);
+    harness.state_mut().run("text.insert", json!({ "text": "Monthly " })).unwrap();
+    harness.run_steps(2);
+    assert_eq!(bridge.take_events(), vec![HostEvent::DirtyChanged { dirty: true }]);
+    bridge.send(HostCommand::RequestSave);
+    harness.run_steps(3);
+    let events = bridge.take_events();
+    assert_eq!(saves(&events), 1);
+    assert!(!events.iter().any(|event| matches!(event, HostEvent::DirtyChanged { .. })), "{events:?}");
+    // A second change after the save is not a second dirtyChanged: it was never clean again.
+    harness.state_mut().run("text.insert", json!({ "text": "x" })).unwrap();
+    harness.run_steps(2);
+    assert!(bridge.take_events().is_empty());
+
+    // The host keeps the save and opens it again: clean, in view mode, and edit mode starts clean.
+    bridge.send(HostCommand::Open { name: "lease.docx".into(), bytes: docx("Rent is due monthly.") });
+    harness.run_steps(3);
+    bridge.take_events();
+    bridge.send(edit(false));
+    harness.run_steps(2);
+    assert_eq!(bridge.take_events(), vec![HostEvent::ModeChanged { mode: EditorMode::Edit }]);
+    harness.state_mut().run("text.insert", json!({ "text": "y" })).unwrap();
+    harness.run_steps(2);
+    assert_eq!(bridge.take_events(), vec![HostEvent::DirtyChanged { dirty: true }], "dirty began again from clean");
+}
+
+#[test]
+fn reports_dirty_again_each_time_the_document_goes_from_clean_to_changed() {
+    let (mut harness, bridge) = editing(false);
+    for _ in 0..2 {
+        harness.state_mut().run("text.insert", json!({ "text": "x" })).unwrap();
+        harness.run_steps(2);
+        assert_eq!(bridge.take_events(), vec![HostEvent::DirtyChanged { dirty: true }]);
+        harness.state_mut().run("edit.undo", json!({})).unwrap();
+        harness.run_steps(2);
+        assert_eq!(bridge.take_events(), vec![HostEvent::DirtyChanged { dirty: false }]);
+    }
+    // Redo makes the same change again.
+    harness.state_mut().run("edit.redo", json!({})).unwrap();
+    harness.run_steps(2);
+    assert_eq!(bridge.take_events(), vec![HostEvent::DirtyChanged { dirty: true }]);
+}
+
+#[test]
+fn drops_a_comment_request_asked_as_edit_mode_ends() {
+    let (mut harness, bridge) = editing(false);
+    harness.state_mut().run("select.all", json!({})).unwrap();
+    harness.state_mut().run("review.newComment", json!({ "text": "" })).unwrap();
+    bridge.send(HostCommand::SetMode(ModeRequest::View));
+    harness.run_steps(4);
+    let events = bridge.take_events();
+    assert!(!events.iter().any(|event| matches!(event, HostEvent::CommentRequested { .. })), "{events:?}");
+}
+
+#[test]
+fn sends_no_comment_request_for_a_selection_with_nothing_to_quote() {
+    let (mut harness, bridge) = editing(false);
+    // A collapsed caret.
+    harness.state_mut().run("review.newComment", json!({ "text": "" })).unwrap();
+    harness.run_steps(3);
+    // Only text that is tracked as deleted: the reader sees nothing there to quote.
+    harness.state_mut().run("select.all", json!({})).unwrap();
+    harness.state_mut().run("text.delete", json!({})).unwrap();
+    harness.state_mut().run("select.all", json!({})).unwrap();
+    harness.run_steps(2);
+    assert!(harness.state().session.doc.revisions.iter().any(|revision| revision.kind == RevisionKind::Delete));
+    bridge.take_events();
+    harness.state_mut().run("review.newComment", json!({ "text": "" })).unwrap();
+    harness.run_steps(3);
+    let events = bridge.take_events();
+    assert!(!events.iter().any(|event| matches!(event, HostEvent::CommentRequested { .. })), "{events:?}");
+    assert!(harness.state().session.doc.comments.is_empty());
+}

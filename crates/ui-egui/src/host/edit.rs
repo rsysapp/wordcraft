@@ -415,4 +415,84 @@ mod tests {
         assert_eq!(super::section_list(&[0, 2]), "1, 3");
         assert_eq!(super::section_list(&[usize::MAX]), usize::MAX.to_string());
     }
+
+    /// D21: the comment request needs the selection's page to have been drawn (the host places its
+    /// box from the selection's end). Text added after the canvas drew, in the same frame, leaves a
+    /// selection on a page the canvas has not laid out: the request waits for the next frame and
+    /// is then answered once, instead of being lost or sent with no place.
+    #[test]
+    fn a_comment_request_waits_for_the_selection_s_page_to_be_drawn() {
+        use std::cell::Cell;
+        use std::rc::Rc;
+
+        use serde_json::json;
+        use wordcraft_doc::Document;
+        use wordcraft_engine::Session;
+
+        use crate::host::bridge::HostBridge;
+        use crate::host::wire::{AuthorSpec, ModeRequest, PermissionsSpec};
+        use crate::host::{EmbedProfile, HostCommand, HostEvent};
+        use crate::{Services, WordApp};
+
+        let bridge = HostBridge::new();
+        let app = WordApp::new(Session::new(Document::new()), Services::default()).with_host(bridge.clone(), EmbedProfile::View);
+        // On: a frame whose canvas drew first, then the document grew and the comment was asked.
+        let grow = Rc::new(Cell::new(false));
+        let growing = grow.clone();
+        let mut harness = egui_kittest::Harness::builder().with_size(egui::vec2(1100.0, 800.0)).with_max_steps(12).build_ui_state(
+            move |ui, app: &mut WordApp| {
+                let ctx = ui.ctx().clone();
+                app.logic(&ctx);
+                if growing.get() {
+                    crate::canvas::show(app, ui);
+                    app.run("text.insert", json!({ "text": "Rent is due monthly. ".repeat(1500) })).expect("typing");
+                    app.run("select.all", json!({})).expect("select all");
+                    app.run("review.newComment", json!({ "text": "" })).expect("comment");
+                    assert!(app.session.layout().pages.len() > app.canvas.page_rects.len(), "the text made pages the canvas has not drawn");
+                    super::super::state::after_frame(app, &ctx);
+                } else {
+                    app.ui(ui);
+                }
+            },
+            app,
+        );
+        bridge.set_context(harness.ctx.clone());
+        crate::host::prepare_context(&harness.ctx);
+        harness.run_steps(2);
+        let bytes = wordcraft_engine::io::save_bytes("lease.docx", &Document::from_text("Rent is due monthly.")).expect("writes");
+        bridge.send(HostCommand::Open { name: "lease.docx".into(), bytes });
+        harness.run_steps(3);
+        let permissions =
+            PermissionsSpec { accept_reject_changes: false, organize_pages: true, fill_forms: true, redact: true, stamps: true, drawing: true };
+        bridge.send(HostCommand::SetMode(ModeRequest::Edit {
+            author: AuthorSpec { id: "u-sari".into(), name: "Sari Wulan".into() },
+            revision_date: "2026-10-10T08:00:00Z".into(),
+            permissions,
+        }));
+        harness.run_steps(2);
+        bridge.take_events();
+
+        grow.set(true);
+        harness.step();
+        grow.set(false);
+        let early = bridge.take_events();
+        assert!(!early.iter().any(|event| matches!(event, HostEvent::CommentRequested { .. })), "the page was not drawn yet: {early:?}");
+        harness.run_steps(3);
+        let events = bridge.take_events();
+        let requests: Vec<(&String, &Option<u32>, f32, f32)> = events
+            .iter()
+            .filter_map(|event| match event {
+                HostEvent::CommentRequested { text, page, x, y, .. } => Some((text, page, *x, *y)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(requests.len(), 1, "{events:?}");
+        let (text, page, x, y) = requests[0];
+        assert!(text.starts_with("Rent is due monthly. Rent is due monthly."), "{text}");
+        assert!(page.is_some_and(|number| number >= 1) && x.is_finite() && y.is_finite() && x > 0.0 && y > 0.0, "{requests:?}");
+        // Once, not on every later frame; and nothing was written into the file.
+        harness.run_steps(3);
+        assert!(bridge.take_events().iter().all(|event| !matches!(event, HostEvent::CommentRequested { .. })));
+        assert!(harness.state().session.doc.comments.is_empty());
+    }
 }
