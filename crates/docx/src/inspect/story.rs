@@ -578,7 +578,8 @@ pub(super) struct StyleHiding {
 
 /// Memory charged for each style kept, besides its id and base's.
 const STYLE_BYTES: u64 = 160;
-/// The longest style chain followed; a longer one (or a loop) reads as not hiding past it.
+/// The longest style chain followed; a longer one (or a loop) reads as hiding, since what lies
+/// past it is unknown.
 const MAX_STYLE_CHAIN: usize = 32;
 
 impl StyleHiding {
@@ -613,13 +614,16 @@ impl StyleHiding {
             }
             at = based.as_deref()?;
         }
-        None
+        Some(true)
     }
 
-    /// Whether a run with these direct properties, in a paragraph of this style, is hidden.
+    /// Whether a run with these direct properties, in a paragraph of this style, is hidden. Direct
+    /// formatting decides when it says; otherwise any level that hides counts. `vanish` is a toggle
+    /// (two style levels that both set it cancel in Word), so this can report text hidden that a
+    /// reader shows, never the reverse.
     pub(super) fn effective(&self, properties: Option<&XEl>, paragraph_style: Option<&str>) -> bool {
         let character_style = properties.and_then(|properties| properties.child("w:rStyle")).and_then(|style| style.attr("w:val"));
-        vanish(properties).or_else(|| self.style(character_style)).or_else(|| self.style(paragraph_style)).unwrap_or(self.default)
+        vanish(properties).unwrap_or_else(|| self.style(character_style) == Some(true) || self.style(paragraph_style) == Some(true) || self.default)
     }
 }
 

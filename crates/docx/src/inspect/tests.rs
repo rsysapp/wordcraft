@@ -1634,6 +1634,24 @@ fn counts_text_hidden_through_a_style() {
     assert_eq!(inspect(&shown, &inserted_default).unwrap().new_revisions[0].hidden_text, 4);
 }
 
+/// What the inspector cannot settle about styles counts as hidden: a `basedOn` loop, and a style
+/// that shows (`vanish` off) over a paragraph style that hides, which Word's toggle rules can still
+/// hide.
+#[test]
+fn counts_text_hidden_when_its_styles_are_uncertain() {
+    let styles = r#"<w:style w:type="character" w:styleId="A"><w:basedOn w:val="B"/></w:style><w:style w:type="character" w:styleId="B"><w:basedOn w:val="A"/></w:style><w:style w:type="character" w:styleId="Shown"><w:rPr><w:vanish w:val="0"/></w:rPr></w:style><w:style w:type="paragraph" w:styleId="Hide"><w:rPr><w:vanish/></w:rPr></w:style>"#;
+    let base = styled(styles, &para(&text("Rent.")));
+    let looped =
+        styled(styles, &para(&format!("{}{}", text("Rent."), inserted(SARI, r#"<w:r><w:rPr><w:rStyle w:val="A"/></w:rPr><w:t>more</w:t></w:r>"#))));
+    assert_eq!(inspect(&base, &looped).unwrap().new_revisions[0].hidden_text, 4);
+    let hidden_paragraph = |run: &str| styled(styles, &format!(r#"<w:p><w:pPr><w:pStyle w:val="Hide"/></w:pPr>{}{run}</w:p>"#, text("Rent.")));
+    let shown = hidden_paragraph(&inserted(SARI, r#"<w:r><w:rPr><w:rStyle w:val="Shown"/></w:rPr><w:t>more</w:t></w:r>"#));
+    assert_eq!(inspect(&hidden_paragraph(""), &shown).unwrap().new_revisions[0].hidden_text, 4);
+    // Direct formatting decides: shown outright is shown.
+    let direct = hidden_paragraph(&inserted(SARI, r#"<w:r><w:rPr><w:vanish w:val="0"/></w:rPr><w:t>more</w:t></w:r>"#));
+    assert_eq!(inspect(&hidden_paragraph(""), &direct).unwrap().new_revisions[0].hidden_text, 0);
+}
+
 /// Prefix lists (`mc:Ignorable` and the like) are kept as namespace numbers, charged as they are
 /// expanded: thousands of them under a long namespace stay small. Lists past 1,024 names, or past
 /// 64 KiB in one element, are refused.
