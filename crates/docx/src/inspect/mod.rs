@@ -104,7 +104,14 @@ const PART_WORK: u64 = 2_000;
 
 /// Memory charged for each part a side keeps, besides its name twice: its entries in the kinds map
 /// and in the stories or canonical map.
-const PART_BYTES: u64 = 384;
+const PART_BYTES: u64 = budget::tree_slot::<String, Kind>() + budget::tree_slot::<String, Digest>() + budget::tree_slot::<String, Vec<Item>>();
+/// Memory charged for each relationship part a side keeps, besides its source's name.
+const RELS_PART_BYTES: u64 = budget::tree_slot::<String, Rels>();
+/// Memory held for the whole inspection besides what is charged as it is made: the first rooms of
+/// its maps and sets (each a node or a few buckets), and short working copies made one at a time
+/// (a part name lowered for a lookup, a stack's wrappers listed, a run's slots), each bounded by a
+/// name's or the depth's limit.
+const FIXED_BYTES: u64 = 1 << 20;
 
 /// Why a package over its element budget is unreadable.
 const TOO_MANY_ELEMENTS: &str = "more XML elements than an inspection reads";
@@ -317,8 +324,8 @@ pub fn inspect_measured(base: &[u8], edited: &[u8]) -> (Result<Inspection, Inspe
 }
 
 fn inspect_budgeted(base: &[u8], edited: &[u8], limits: &ReadLimits, max_changes: usize, budget: &mut Budget) -> Result<Inspection, InspectError> {
-    // Canonical hashing's working room, held for the whole inspection.
-    budget.hold(opc::HASHING_BYTES).map_err(InspectError::Edited)?;
+    // Canonical hashing's working room, and the fixed room, held for the whole inspection.
+    budget.hold(opc::HASHING_BYTES.saturating_add(FIXED_BYTES)).map_err(InspectError::Edited)?;
     let mut names = Names::default();
     let mut tables = Tables::new();
     let base = Side::read(base, limits, &mut names, &mut tables, budget).map_err(InspectError::Base)?;
@@ -454,7 +461,9 @@ impl<'a> Side<'a> {
                 let parsed = parse_part(&mut package, name, names, &mut limits, budget)?;
                 let part = Rels::parse(&parsed.root, budget).map_err(|error| format!("{name}: {error}"));
                 budget.release(parsed.held);
-                rels.insert(source, part?);
+                let part = part?;
+                budget.hold(RELS_PART_BYTES.saturating_add(budget::units(source.len())))?;
+                rels.insert(source, part);
             }
         }
         let main = single_target(&rels, "", rt::OFFICE_DOC)?.ok_or("no main document part")?;
@@ -507,12 +516,19 @@ impl<'a> Side<'a> {
             let part_rels = rels.get(name.as_str()).unwrap_or(&empty);
             if content_type.is_some_and(opc::is_story_type) {
                 let parsed = parse_part(&mut package, name, names, &mut limits, budget)?;
-                let marks: Bookmarks = opc::bookmarks(&parsed.root);
+                let (marks, marks_held): (Bookmarks, u64) = match opc::bookmarks(&parsed.root, budget) {
+                    Ok(marks) => marks,
+                    Err(error) => {
+                        budget.release(parsed.held);
+                        return Err(format!("{name}: {error}"));
+                    }
+                };
                 let canon = Canon { rels: part_rels, bookmarks: Some(&marks) };
                 let items = story::walk(&parsed.root, &canon, tables, &mut revisions, &mut items_left, parsed.most_items, &hiding, budget)
                     .map_err(|error| format!("{name}: {error}"));
                 drop(parsed.root);
-                budget.release(parsed.held);
+                drop(marks);
+                budget.release(parsed.held.saturating_add(marks_held));
                 kept.keep(name, Part::Story(items?), budget)?;
             } else if opc::is_xml(name, content_type) {
                 let parsed = parse_part(&mut package, name, names, &mut limits, budget)?;
@@ -649,12 +665,16 @@ fn compare(
     Ok(inspection)
 }
 
-/// Memory charged for each entry of a set or map of names built while comparing, besides the name.
-const SET_ENTRY_BYTES: u64 = 64;
+/// Memory charged for each entry of a set or list of names built while comparing, besides the name:
+/// the most a set of ids, or a list of names made to size, takes.
+const SET_ENTRY_BYTES: u64 = compare::ID_BYTES;
+/// Memory charged for each relationship in a set while sets are compared.
+const REL_SET_BYTES: u64 = budget::tree_slot::<&Rel, ()>();
+/// Memory charged for each of the save's own revisions, in a set.
+const PAIR_SET_BYTES: u64 = budget::table_slot::<(u32, u32)>();
 
-/// Memory charged for each set built while comparing, besides its entries: its first node, which
-/// has room for eleven.
-const SET_NODE_BYTES: u64 = 128;
+/// Memory charged for each set built while comparing, besides its entries: its first node.
+const SET_NODE_BYTES: u64 = budget::tree_room::<&Rel, ()>();
 
 /// Memory charged for each story both sides have, besides its name: its entry in a vector that grows
 /// by doubling (old and new room meeting while it moves).
@@ -741,7 +761,7 @@ fn compare_relationships(base: &Side<'_>, edited: &Side<'_>, inspection: &mut In
     for source in union(&base.rels, &edited.rels) {
         // Both sides' sets, held while they are compared: a node each at least, however few.
         let count = |side: &Side<'_>| side.rels.get(source).map_or(0, Rels::len);
-        let sets = budget::units(count(base).saturating_add(count(edited))).saturating_mul(SET_ENTRY_BYTES).saturating_add(2 * SET_NODE_BYTES);
+        let sets = budget::units(count(base).saturating_add(count(edited))).saturating_mul(REL_SET_BYTES).saturating_add(2 * SET_NODE_BYTES);
         charge(budget, sets)?;
         let (before, after) = (base.relationship_set(source), edited.relationship_set(source));
         for (change, rel) in
@@ -796,7 +816,7 @@ fn compare_comments(base: &Side<'_>, edited: &Side<'_>, tally: &mut Tally, budge
     }
     for id in base_ids.intersection(&edited_ids) {
         if base.comments.get(id) != edited.comments.get(id) && tally.comments_altered.insert(id.clone()) {
-            tally.pending = tally.pending.saturating_add(compare::CACHE_BYTES).saturating_add(budget::units(id.len()));
+            tally.pending = tally.pending.saturating_add(compare::ID_BYTES).saturating_add(budget::units(id.len()));
         }
     }
     budget.hold(std::mem::take(&mut tally.pending)).map_err(InspectError::Edited)?;
@@ -813,8 +833,11 @@ fn new_revisions(
 ) -> Result<(Pairs, BTreeMap<u32, AuthorRevisions>), InspectError> {
     let charge = |budget: &mut Budget, bytes: u64| budget.hold(bytes).map_err(InspectError::Edited);
     let fresh = |pair: &&(u32, u32)| !base.revisions.by_pair.contains_key(*pair);
-    charge(budget, budget::units(edited.revisions.by_pair.keys().filter(fresh).count()).saturating_mul(SET_ENTRY_BYTES))?;
-    let new_pairs: Pairs = edited.revisions.by_pair.keys().filter(fresh).copied().collect();
+    let fresh_count = edited.revisions.by_pair.keys().filter(fresh).count();
+    charge(budget, budget::units(fresh_count).saturating_mul(PAIR_SET_BYTES).saturating_add(budget::table_room::<(u32, u32)>()))?;
+    // Sized from the count, so the set never grows.
+    let mut new_pairs = Pairs::with_capacity(fresh_count);
+    new_pairs.extend(edited.revisions.by_pair.keys().filter(fresh).copied());
     let mut by_author: BTreeMap<u32, AuthorRevisions> = BTreeMap::new();
     for ((author, date), counts) in edited.revisions.by_pair.iter().filter(|(pair, _)| new_pairs.contains(*pair)) {
         if !by_author.contains_key(author) {

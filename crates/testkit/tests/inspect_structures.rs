@@ -198,6 +198,118 @@ fn shapes() -> Vec<(&'static str, Probe)> {
     shapes
 }
 
+/// A hash table's growth point: one entry past the 7/8 of 2^k buckets it holds before it doubles.
+const fn resize_point(k: u32) -> usize {
+    7 * (1 << k) / 8 + 1
+}
+
+/// A vector's or string's growth point: one past 2^k.
+const fn doubling_point(k: u32) -> usize {
+    (1 << k) + 1
+}
+
+/// Shapes that end just past a collection's growth point, where it holds the most for what it
+/// holds: a hash table holding its old and new buckets, a vector or string its old and new room.
+fn growth_points() -> Vec<(&'static str, Probe)> {
+    let mut shapes: Vec<(&'static str, Probe)> = Vec::new();
+    let tree = |xml: String| -> Probe { Box::new(move |mark| probe::tree(xml.as_bytes(), mark)) };
+    // A text node between elements: its slot in its parent's children, at the children's doubling.
+    shapes.push(("tree: text-node slots", tree(format!("<r>{}<a/></r>", "<a/> ".repeat(1 << 16)))));
+    shapes.push(("tree: empty CDATA nodes", tree(format!("<r>{}<a/></r>", "<a/><![CDATA[]]>".repeat(1 << 16)))));
+    // Text built in pieces (between references), at its string's doubling point.
+    shapes.push(("tree: text in pieces", tree(format!("<r><t>{}x</t></r>", "x&amp;".repeat(1 << 20)))));
+    shapes.push(("tree: children", tree(format!("<r>{}</r>", "<a/>".repeat(doubling_point(17))))));
+    let attributes: String = (0..257).map(|n| format!(r#" a{n}="1""#)).collect();
+    shapes.push(("tree: attributes at a doubling point", tree(format!("<r>{}</r>", format!("<e{attributes}/>").repeat(400)))));
+    // Distinct names: the root's, then `resize_point - 1` more.
+    let names: String = (1..resize_point(15)).map(|n| format!("<e{n}/>")).collect();
+    shapes.push(("tree: names at a resize point", tree(format!("<r>{names}</r>"))));
+    let namespaces: String = (0..resize_point(15)).map(|n| format!(r#"<a:e xmlns:a="urn:{n}"/>"#)).collect();
+    shapes.push(("tree: namespaces at a resize point", tree(format!("<r>{namespaces}</r>"))));
+    // Long prefixes in the reader's buffer of open names, nested.
+    let prefix = "p".repeat(4_000);
+    let nested =
+        format!(r#"<{prefix}:e xmlns:{prefix}="urn:x">{}{}</{prefix}:e>"#, format!("<{prefix}:e>").repeat(60), format!("</{prefix}:e>").repeat(60));
+    shapes.push(("tree: open names", tree(format!("<r>{}</r>", nested.repeat(20)))));
+
+    for (name, entries, count) in [
+        ("table: contents at a resize point", Entries::Contents(8), resize_point(16)),
+        ("table: texts at a resize point", Entries::Texts(8), resize_point(16) - 1),
+        ("table: texts at a doubling point", Entries::Texts(8), doubling_point(16) - 1),
+        ("table: stacks at a resize point", Entries::Stacks, resize_point(16)),
+        ("table: stacks at a doubling point", Entries::Stacks, doubling_point(16)),
+        ("table: formats at a resize point", Entries::Formats(1), resize_point(16) - 1),
+        ("table: formats at a doubling point", Entries::Formats(1), doubling_point(16) - 1),
+        ("table: marks at a resize point", Entries::Marks(4), resize_point(16)),
+        ("table: marks at a doubling point", Entries::Marks(4), doubling_point(16)),
+        ("table: contexts at a resize point", Entries::Contexts, resize_point(16) - 1),
+        ("table: contexts at a doubling point", Entries::Contexts, doubling_point(16) - 1),
+    ] {
+        let count = u32::try_from(count).unwrap();
+        shapes.push((name, Box::new(move |mark| probe::table_entries(entries.clone(), count, mark))));
+    }
+
+    let styles: String = (0..resize_point(15))
+        .map(|n| format!(r#"<w:style w:type="character" w:styleId="S{n}"><w:basedOn w:val="S{}"/><w:rPr><w:vanish/></w:rPr></w:style>"#, n + 1))
+        .collect();
+    let styles = format!(r#"<w:styles {W}>{styles}</w:styles>"#);
+    shapes.push(("styles at a resize point", Box::new(move |mark| probe::styles(styles.as_bytes(), mark))));
+    let rels: String = (0..resize_point(15)).map(|n| format!(r#"<Relationship Id="r{n}" Type="t" Target="x" TargetMode="External"/>"#)).collect();
+    let rels = format!(r#"<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">{rels}</Relationships>"#);
+    shapes.push(("relationships at a resize point", Box::new(move |mark| probe::relationships(rels.as_bytes(), mark))));
+    let marks: String = (0..resize_point(15)).map(|n| format!(r#"<w:bookmarkStart w:id="{n}" w:name="b"/>"#)).collect();
+    let marks = story(&format!("<w:p>{marks}</w:p>"));
+    shapes.push(("bookmarks at a resize point", Box::new(move |mark| probe::bookmarks(&marks, mark))));
+    let long_marks: String = (0..2_000).map(|n| format!(r#"<w:bookmarkStart w:id="{n}" w:name="{}"/>"#, "b".repeat(4_000))).collect();
+    let long_marks = story(&format!("<w:p>{long_marks}</w:p>"));
+    shapes.push(("bookmarks: long names", Box::new(move |mark| probe::bookmarks(&long_marks, mark))));
+    let comments: String = (0..resize_point(15))
+        .map(|n| format!(r#"<w:comment w:id="{n}" w:author="A"><w:p w14:paraId="{n:08X}" xmlns:w14="http://schemas.microsoft.com/office/word/2010/wordml"/></w:comment>"#))
+        .collect();
+    let comments = format!(r#"<w:comments {W}>{comments}</w:comments>"#);
+    shapes.push(("comments at a resize point", Box::new(move |mark| probe::comments(comments.as_bytes(), mark))));
+
+    let changes: String = (0..resize_point(15)).map(|n| inserted(n, &run("x"), "ins")).collect();
+    let changes = story(&format!("<w:p>{changes}</w:p>"));
+    for (name, phase) in [("projection caches at a resize point", 0), ("facts: stacks at a resize point", 1), ("fields: stacks at a resize point", 2)]
+    {
+        let changes = changes.clone();
+        shapes.push((
+            name,
+            Box::new(move |mark| match phase {
+                0 => probe::projection(&changes, false, mark),
+                1 => probe::facts_of(&changes, mark),
+                _ => probe::fields_of(&changes, mark),
+            }),
+        ));
+    }
+    // Each insertion by an author of its own: the facts kept per author.
+    let authors: String =
+        (0..20_000).map(|n| format!(r#"<w:ins w:id="1" w:author="A{n}" w:date="2026-01-01T00:00:00Z">{}</w:ins>"#, run("x"))).collect();
+    let authors = story(&format!("<w:p>{authors}</w:p>"));
+    shapes.push((
+        "facts: authors",
+        Box::new({
+            let authors = authors.clone();
+            move |mark| probe::facts_of(&authors, mark)
+        }),
+    ));
+    let fields: String =
+        (0..20_000).map(|n| format!(r#"<w:ins w:id="1" w:author="A{n}" w:date="2026-01-01T00:00:00Z">{}</w:ins>"#, run("x"))).collect();
+    let field =
+        r#"<w:r><w:fldChar w:fldCharType="begin"/></w:r><w:r><w:instrText>PAGE</w:instrText></w:r><w:r><w:fldChar w:fldCharType="separate"/></w:r>"#;
+    let fields = story(&format!(r#"<w:p>{field}{fields}<w:r><w:fldChar w:fldCharType="end"/></w:r></w:p>"#));
+    shapes.push(("fields: authors", Box::new(move |mark| probe::fields_of(&fields, mark))));
+    shapes.push(("comparison: tokens at a doubling point", Box::new(|mark| probe::tokens(doubling_point(18), mark))));
+    let entries: Vec<(String, Vec<u8>)> = (0..doubling_point(14)).map(|n| (format!("p/{n}.bin"), vec![b'x'; 1])).collect();
+    let doubled = zip(&entries, zip::CompressionMethod::Stored);
+    shapes.push(("package directory at a doubling point", Box::new(move |mark| probe::package(&doubled, mark))));
+    let entries: Vec<(String, Vec<u8>)> = (0..1_000).map(|n| (format!("p/{}{n}.bin", "n".repeat(30_000)), vec![b'x'; 1])).collect();
+    let long = zip(&entries, zip::CompressionMethod::Stored);
+    shapes.push(("package directory: long names", Box::new(move |mark| probe::package(&long, mark))));
+    shapes
+}
+
 const MAIN: &str = "application/vnd.openxmlformats-officedocument.wordprocessingml.document.main+xml";
 const RELS: &str = r#"xmlns="http://schemas.openxmlformats.org/package/2006/relationships""#;
 
@@ -339,6 +451,7 @@ fn parts_inspection() -> Probe {
 fn each_structure_holds_no_more_than_its_charge() {
     let mut shapes = shapes();
     shapes.extend(compared());
+    shapes.extend(growth_points());
     shapes.push(("inspection: many parts", parts_inspection()));
     let mut over = Vec::new();
     let mut worst = (0.0f64, "");
@@ -347,7 +460,7 @@ fn each_structure_holds_no_more_than_its_charge() {
         let measured = probe(&mut || baseline = reset_peak()).unwrap_or_else(|error| panic!("{name}: {error}"));
         let held = peak().saturating_sub(baseline) as u64;
         let ratio = held as f64 / measured.charged.max(1) as f64;
-        eprintln!("{name:<36} held {:>9.3} MB  charged {:>9.3} MB  ratio {ratio:.3}", held as f64 / 1e6, measured.charged as f64 / 1e6);
+        eprintln!("{name:<36} held {:>9.3} MB  charged {:>9.3} MB  ratio {ratio:.4}", held as f64 / 1e6, measured.charged as f64 / 1e6);
         if ratio > worst.0 {
             worst = (ratio, name);
         }
@@ -356,6 +469,6 @@ fn each_structure_holds_no_more_than_its_charge() {
         }
         drop(measured);
     }
-    eprintln!("largest held/charged ratio: {:.3} ({})", worst.0, worst.1);
+    eprintln!("largest held/charged ratio: {:.4} ({})", worst.0, worst.1);
     assert!(over.is_empty(), "held more than charged: {over:?}");
 }

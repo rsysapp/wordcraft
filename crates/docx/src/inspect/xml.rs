@@ -8,14 +8,15 @@
 //! prefixes as [`crate::xml`]), `{uri}local` for any other namespace, and the bare local name for
 //! none, so a producer's own prefixes never matter.
 
+use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
 
 use quick_xml::events::{BytesStart, Event};
-use quick_xml::name::{QName, ResolveResult};
-use quick_xml::reader::NsReader;
+use quick_xml::name::{NamespaceResolver, QName, ResolveResult};
+use quick_xml::reader::Reader;
 
-use super::budget::{Budget, units};
+use super::budget::{Budget, shared_string, table_room, table_slot, units, vector_slot};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(super) enum XNode {
@@ -52,15 +53,17 @@ impl XEl {
         self.els().next().is_some()
     }
 
-    /// The direct text, joined.
-    pub(super) fn text(&self) -> String {
-        let mut out = String::new();
-        for node in &self.kids {
-            if let XNode::Text(text) = node {
-                out.push_str(text);
-            }
-        }
-        out
+    /// The direct text, in pieces, without copying it.
+    pub(super) fn texts(&self) -> impl DoubleEndedIterator<Item = &str> {
+        self.kids.iter().filter_map(|node| match node {
+            XNode::Text(text) => Some(text.as_str()),
+            XNode::El(_) => None,
+        })
+    }
+
+    /// Whether the direct text is white space only (or none).
+    pub(super) fn text_is_space(&self) -> bool {
+        self.texts().all(is_space)
     }
 }
 
@@ -76,9 +79,6 @@ pub(super) struct Names {
 /// The most distinct names one inspection keeps; no WordprocessingML package has a fraction of
 /// them.
 const MAX_NAMES: usize = 100_000;
-/// Memory charged for each name or namespace kept, besides its bytes: the shared string and its
-/// table entry.
-const NAME_BYTES: u64 = 96;
 
 impl Names {
     fn get(&mut self, name: &str, budget: &mut Budget) -> Result<Rc<str>, String> {
@@ -90,7 +90,9 @@ impl Names {
         if self.names.len() >= MAX_NAMES {
             return Err("more distinct XML names than an inspection keeps".into());
         }
-        budget.hold(NAME_BYTES.saturating_add(units(name.len())))?;
+        // The shared string and its entry, and the table's first room with the first name.
+        let room = if self.names.is_empty() { table_room::<Rc<str>>() } else { 0 };
+        budget.hold(table_slot::<Rc<str>>().saturating_add(shared_string(name.len())).saturating_add(room))?;
         let shared: Rc<str> = Rc::from(name);
         self.names.insert(shared.clone());
         Ok(shared)
@@ -105,7 +107,8 @@ impl Names {
         if self.namespaces.len() >= MAX_NAMES {
             return Err("more distinct XML namespaces than an inspection keeps".into());
         }
-        budget.hold(NAME_BYTES.saturating_add(units(uri.len())))?;
+        let room = if self.namespaces.is_empty() { table_room::<(Box<[u8]>, usize)>() } else { 0 };
+        budget.hold(table_slot::<(Box<[u8]>, usize)>().saturating_add(units(uri.len())).saturating_add(room))?;
         let number = self.namespaces.len();
         self.namespaces.insert(uri.into(), number);
         Ok(number)
@@ -118,13 +121,16 @@ pub(super) struct Limits {
     pub max_depth: usize,
 }
 
-/// Memory charged for each element of a parsed tree: its node in its parent's children, three times
-/// (a growing vector holds up to twice its length, and its old room too while it moves; vectors are
-/// shrunk to fit as elements close), and the allocator's share.
-const ELEMENT_BYTES: u64 = 3 * std::mem::size_of::<XNode>() as u64 + 16;
-/// Memory charged for each attribute, besides its value: its entry (three times, as for elements),
-/// the reader's record of its key, and the duplicate check's.
-const ATTRIBUTE_BYTES: u64 = 3 * std::mem::size_of::<(Rc<str>, String)>() as u64 + 64;
+/// Memory charged for each node of a parsed tree (an element, or a text between elements): its slot
+/// in its parent's children, a vector growing by doubling (vectors are shrunk to fit as elements
+/// close), and the allocator's share.
+const NODE_BYTES: u64 = vector_slot::<XNode>() + 16;
+/// Memory charged for each attribute, besides its value: its entry in a vector growing by doubling.
+const ATTRIBUTE_BYTES: u64 = vector_slot::<(Rc<str>, String)>();
+/// Memory held while a part is parsed, whatever it holds: one element's working records (its
+/// attributes' duplicate check, the reader's record of their keys, the open elements' first
+/// rooms, a name being written), each bounded by `MAX_ATTRIBUTES`, `MAX_NAME` and the depth.
+const PARSE_BYTES: u64 = 256 * 1024;
 /// The longest element, attribute or namespace name read; a longer one is no WordprocessingML.
 const MAX_NAME: usize = 4_096;
 
@@ -250,9 +256,13 @@ pub(super) struct Parsed {
 /// Parse a part. Elements count against `limits` (one element budget across the package); work
 /// and the tree's memory against `budget`, charged as the tree grows.
 pub(super) fn parse(bytes: &[u8], names: &mut Names, limits: &mut Limits, budget: &mut Budget) -> Result<Parsed, String> {
+    budget.hold(PARSE_BYTES)?;
     let mut held: u64 = 0;
     let mut most_items: u64 = 4;
-    let result = parse_into(bytes, names, limits, budget, &mut held, &mut most_items);
+    let mut room = ReaderRoom::default();
+    let result = parse_into(bytes, names, limits, budget, &mut held, &mut most_items, &mut room);
+    // The reader and its bindings are gone with the parse.
+    budget.release(room.charged.saturating_add(PARSE_BYTES));
     match result {
         Ok(root) => Ok(Parsed { root, held, most_items }),
         Err(error) => {
@@ -277,6 +287,64 @@ fn charge(budget: &mut Budget, held: &mut u64, bytes: u64) -> Result<(), String>
     Ok(())
 }
 
+/// Memory charged for each record the reader keeps while elements are open: an open element's
+/// start in its name buffer, a namespace binding.
+const BINDING_BYTES: u64 = 48;
+
+/// What the reader holds for the open elements, and the namespace resolver for the declarations in
+/// scope: each open element's raw name, each declaration's prefix and namespace, and a record of
+/// each. Their buffers grow by doubling and are never shrunk while the part is read, so the most
+/// they ever held is charged (three times, for the doubling) until the part is read, before they
+/// grow.
+#[derive(Default)]
+struct ReaderRoom {
+    bytes: u64,
+    records: u64,
+    charged: u64,
+}
+
+impl ReaderRoom {
+    /// Room for `bytes` and `records` more than are open now.
+    fn reserve(&mut self, bytes: u64, records: u64, budget: &mut Budget) -> Result<(), String> {
+        let bytes = self.bytes.saturating_add(bytes);
+        let records = self.records.saturating_add(records);
+        let wanted = bytes.saturating_add(records.saturating_mul(BINDING_BYTES)).saturating_mul(3);
+        if wanted > self.charged {
+            budget.hold(wanted - self.charged)?;
+            self.charged = wanted;
+        }
+        Ok(())
+    }
+}
+
+/// The length of the raw name of the start tag at `at`, if a start tag begins there: the reader
+/// copies it into its buffer of open names before the tag is seen here.
+fn start_name_length(bytes: &[u8], at: usize) -> Option<usize> {
+    let rest = bytes.get(at..)?.strip_prefix(b"<")?;
+    if matches!(rest.first(), None | Some(b'/' | b'!' | b'?')) {
+        return None;
+    }
+    Some(rest.iter().position(|byte| matches!(byte, b' ' | b'\t' | b'\r' | b'\n' | b'/' | b'>')).unwrap_or(rest.len()))
+}
+
+/// The namespace declarations of a start tag: their bytes (prefix and namespace) and how many.
+fn declarations(start: &BytesStart<'_>) -> (u64, u64) {
+    let mut bytes = 0u64;
+    let mut count = 0u64;
+    for attribute in start.attributes().with_checks(false).flatten() {
+        let key = attribute.key.as_ref();
+        if key == b"xmlns" || key.starts_with(b"xmlns:") {
+            bytes = bytes.saturating_add(units(key.len().saturating_add(attribute.value.len())));
+            count = count.saturating_add(1);
+        }
+    }
+    (bytes, count)
+}
+
+/// The most bytes of an element's raw name: a prefix and a local name each no longer than
+/// `MAX_NAME`.
+const MAX_RAW_NAME: usize = 2 * MAX_NAME + 1;
+
 fn parse_into(
     bytes: &[u8],
     names: &mut Names,
@@ -284,9 +352,10 @@ fn parse_into(
     budget: &mut Budget,
     held: &mut u64,
     most_items: &mut u64,
+    room: &mut ReaderRoom,
 ) -> Result<XEl, String> {
     let bytes = bytes.strip_prefix(&[0xEF, 0xBB, 0xBF][..]).unwrap_or(bytes);
-    let mut reader = NsReader::from_reader(bytes);
+    let mut reader = Reader::from_reader(bytes);
     {
         let config = reader.config_mut();
         config.trim_text_start = false;
@@ -297,62 +366,96 @@ fn parse_into(
         config.allow_unmatched_ends = false;
         config.allow_dangling_amp = false;
     }
+    // The namespaces in scope, kept here (not by the reader) so each declaration is charged before
+    // it is kept.
+    let mut resolver = NamespaceResolver::default();
+    room.reserve(256, 2, budget)?;
     let mut stack: Vec<XEl> = Vec::new();
-    // What each open element's namespace declarations hold in the reader.
-    let mut open_declarations: Vec<u64> = Vec::new();
+    // What each open element holds in the reader's room: its name and declarations, and records.
+    let mut open: Vec<(u64, u64)> = Vec::new();
     let mut root: Option<XEl> = None;
     loop {
+        let at = usize::try_from(reader.buffer_position()).unwrap_or(usize::MAX);
+        let name_length = start_name_length(bytes, at);
+        if let Some(length) = name_length {
+            if length > MAX_RAW_NAME {
+                return Err("a name longer than any WordprocessingML name".into());
+            }
+            room.reserve(units(length), 1, budget)?;
+        }
         // Events borrow from the part's bytes: nothing is copied but the text kept.
-        let (result, event) = reader.read_resolved_event().map_err(|error| format!("malformed XML: {error}"))?;
+        let event = reader.read_event().map_err(|error| format!("malformed XML: {error}"))?;
         match event {
             Event::Start(ref start) | Event::Empty(ref start) => {
                 if root.is_some() {
                     return Err("content after the root element".into());
                 }
                 limits.elements_left = limits.elements_left.checked_sub(1).ok_or(super::TOO_MANY_ELEMENTS)?;
-                let name = resolved(result, start.local_name().as_ref(), names, budget)?;
-                charge(budget, held, ELEMENT_BYTES)?;
-                let mut declarations = 0u64;
-                let element = element(&reader, name, start, names, budget, held, &mut declarations)?;
-                budget.hold(declarations)?;
+                let raw_name = units(start.name().as_ref().len());
+                if name_length.is_none() || start.name().as_ref().len() > MAX_RAW_NAME {
+                    return Err("a start tag the reader saw otherwise".into());
+                }
+                let (declared, bindings) = declarations(start);
+                let own = (raw_name.saturating_add(declared), bindings.saturating_add(1));
+                room.reserve(own.0, own.1, budget)?;
+                resolver.push(start).map_err(|error| format!("malformed XML: {error}"))?;
+                let (result, local) = resolver.resolve_element(start.name());
+                let name = resolved(result, local.as_ref(), names, budget)?;
+                charge(budget, held, NODE_BYTES)?;
+                let element = element(&resolver, name, start, names, budget, held)?;
                 *most_items = most_items.saturating_add(2);
                 if matches!(event, Event::Start(_)) {
                     if stack.len() >= limits.max_depth {
-                        budget.release(declarations);
                         return Err(super::TOO_DEEP.into());
                     }
                     stack.push(element);
-                    open_declarations.push(declarations);
+                    room.bytes = room.bytes.saturating_add(own.0);
+                    room.records = room.records.saturating_add(own.1);
+                    open.push(own);
                 } else {
-                    budget.release(declarations);
+                    resolver.pop();
                     close(&mut stack, &mut root, element);
                 }
             }
             Event::End(_) => {
                 let element = stack.pop().ok_or("an end tag without a start")?;
-                budget.release(open_declarations.pop().unwrap_or(0));
+                resolver.pop();
+                let (bytes, records) = open.pop().unwrap_or((0, 0));
+                room.bytes = room.bytes.saturating_sub(bytes);
+                room.records = room.records.saturating_sub(records);
                 close(&mut stack, &mut root, element);
             }
             Event::Text(text) => {
-                let text = text.xml10_content().map_err(|_| "text that is not UTF-8".to_string())?;
-                checked(&text)?;
-                charge(budget, held, TEXT_FACTOR.saturating_mul(units(text.len())))?;
-                *most_items = most_items.saturating_add(item_bound(&stack, text.len()));
-                push_text(&mut stack, &text)?;
+                // Text with line ends to normalise is decoded into a copy as long as the raw text:
+                // held while it is read.
+                let raw = units(text.len());
+                budget.hold(raw)?;
+                let pushed = (|| {
+                    let text = text.xml10_content().map_err(|_| "text that is not UTF-8".to_string())?;
+                    checked(&text)?;
+                    *most_items = most_items.saturating_add(item_bound(&stack, text.len()));
+                    push_text(&mut stack, text, budget, held)
+                })();
+                budget.release(raw);
+                pushed?;
             }
             Event::CData(data) => {
-                let text = data.xml10_content().map_err(|_| "text that is not UTF-8".to_string())?;
-                checked(&text)?;
-                charge(budget, held, TEXT_FACTOR.saturating_mul(units(text.len())))?;
-                *most_items = most_items.saturating_add(item_bound(&stack, text.len()));
-                push_text(&mut stack, &text)?;
+                let raw = units(data.len());
+                budget.hold(raw)?;
+                let pushed = (|| {
+                    let text = data.xml10_content().map_err(|_| "text that is not UTF-8".to_string())?;
+                    checked(&text)?;
+                    *most_items = most_items.saturating_add(item_bound(&stack, text.len()));
+                    push_text(&mut stack, text, budget, held)
+                })();
+                budget.release(raw);
+                pushed?;
             }
             Event::GeneralRef(reference) => {
                 let name = reference.decode().map_err(|_| "a reference that is not UTF-8".to_string())?;
                 let character = entity(&name)?;
-                charge(budget, held, TEXT_FACTOR.saturating_mul(units(character.len_utf8())))?;
                 *most_items = most_items.saturating_add(1);
-                push_text(&mut stack, character.encode_utf8(&mut [0; 4]))?;
+                push_text(&mut stack, Cow::Borrowed(character.encode_utf8(&mut [0; 4])), budget, held)?;
             }
             Event::Decl(declaration) => {
                 if let Some(encoding) = declaration.encoding() {
@@ -373,25 +476,16 @@ fn parse_into(
     root.ok_or_else(|| "no root element".to_string())
 }
 
-/// Memory charged per byte of text kept: twice, as a text node built from pieces (text between
-/// references) grows by doubling.
-const TEXT_FACTOR: u64 = 2;
-
-/// Memory charged for each namespace declaration while its element is open, besides its bytes: the
-/// reader's binding record.
-const DECLARATION_BYTES: u64 = 64;
-
 /// The most attributes one element may carry; real ones carry a few dozen.
 pub(super) const MAX_ATTRIBUTES: usize = 512;
 
 fn element(
-    reader: &NsReader<&[u8]>,
+    resolver: &NamespaceResolver,
     name: String,
     start: &BytesStart<'_>,
     names: &mut Names,
     budget: &mut Budget,
     held: &mut u64,
-    declarations: &mut u64,
 ) -> Result<XEl, String> {
     let mut attrs: Vec<(Rc<str>, String)> = Vec::new();
     // Names are interned, so one name is one pointer.
@@ -405,29 +499,26 @@ fn element(
         }
         let key = attribute.key.as_ref();
         if key == b"xmlns" || key.starts_with(b"xmlns:") {
-            // The reader keeps each declaration while its element is open (held by the caller
-            // until the element closes); the tree keeps none.
+            // The resolver keeps each declaration while its element is open, charged to the
+            // reader's room; the tree keeps none.
             declared = declared.saturating_add(1);
-            // The reader's binding buffer grows by doubling: twice the bytes.
-            *declarations = declarations
-                .saturating_add(DECLARATION_BYTES)
-                .saturating_add(units(key.len().saturating_add(attribute.value.len())).saturating_mul(2));
             budget.work(4 + units(attribute.value.len()) / 4)?;
             continue;
         }
-        // Held as it is read: its entry and the records the checks keep.
+        // Held as it is read: its entry.
         charge(budget, held, ATTRIBUTE_BYTES)?;
-        let (namespace, local) = reader.resolve_attribute(attribute.key);
+        let (namespace, local) = resolver.resolve_attribute(attribute.key);
         let key = resolved(namespace, local.as_ref(), names, budget)?;
         let value = if holds_prefixes(&name, &key) {
             // The raw value while it is expanded; the expansion is what is kept.
             let raw_bytes = units(attribute.value.len());
             budget.hold(raw_bytes)?;
             let raw = attribute_value(&attribute.value);
-            let expanded = raw.and_then(|raw| qualified_list(reader, &key, &raw, names, budget, held, &mut list_bytes));
+            let expanded = raw.and_then(|raw| qualified_list(resolver, &key, &raw, names, budget, held, &mut list_bytes));
             budget.release(raw_bytes);
             expanded?
         } else {
+            // Read into a string with room for the raw value, no more.
             charge(budget, held, units(attribute.value.len()))?;
             attribute_value(&attribute.value)?
         };
@@ -450,7 +541,7 @@ const MAX_LIST_BYTES: usize = 64 * 1024;
 /// long namespace costs its number, not its length. Each token's expansion is charged, as memory
 /// and as work, before it is made; `spent` counts the element's expanded bytes so far.
 fn qualified_list(
-    reader: &NsReader<&[u8]>,
+    resolver: &NamespaceResolver,
     attribute: &str,
     value: &str,
     names: &mut Names,
@@ -464,7 +555,7 @@ fn qualified_list(
         if count >= MAX_LIST_NAMES {
             return Err(format!("a {attribute} list longer than any real one"));
         }
-        length = length.saturating_add(qualified_token(reader, attribute, token, names, budget)?.len()).saturating_add(1);
+        length = length.saturating_add(qualified_token(resolver, attribute, token, names, budget)?.len()).saturating_add(1);
         if spent.saturating_add(length) > MAX_LIST_BYTES {
             return Err(format!("a {attribute} list longer than any real one"));
         }
@@ -474,14 +565,14 @@ fn qualified_list(
     charge(budget, held, units(length))?;
     let mut out = String::with_capacity(length);
     for token in value.split_whitespace() {
-        out.push_str(&qualified_token(reader, attribute, token, names, budget)?);
+        out.push_str(&qualified_token(resolver, attribute, token, names, budget)?);
         out.push(' ');
     }
     Ok(out)
 }
 
 /// One token of a prefix list, its prefix resolved in scope; charged as work.
-fn qualified_token(reader: &NsReader<&[u8]>, attribute: &str, token: &str, names: &mut Names, budget: &mut Budget) -> Result<String, String> {
+fn qualified_token(resolver: &NamespaceResolver, attribute: &str, token: &str, names: &mut Names, budget: &mut Budget) -> Result<String, String> {
     let (prefix, local) = match token.split_once(':') {
         Some(parts) => parts,
         None if attribute == "xsi:type" => ("", token),
@@ -489,7 +580,7 @@ fn qualified_token(reader: &NsReader<&[u8]>, attribute: &str, token: &str, names
     };
     let probe = if prefix.is_empty() { "x".to_string() } else { format!("{prefix}:x") };
     budget.work(8 + units(token.len()) / 4)?;
-    let (namespace, _) = reader.resolve(QName(probe.as_bytes()), false);
+    let (namespace, _) = resolver.resolve(QName(probe.as_bytes()), true);
     match namespace {
         ResolveResult::Bound(namespace) => {
             let namespace = namespace.as_ref().to_vec();
@@ -500,15 +591,34 @@ fn qualified_token(reader: &NsReader<&[u8]>, attribute: &str, token: &str, names
     }
 }
 
-fn push_text(stack: &mut [XEl], text: &str) -> Result<(), String> {
+/// Text kept in the tree, its room charged before it is made: a new text node (its slot in its
+/// parent's children, and its characters, kept at their length), or more characters for the text
+/// node before it (text between references, comments or CDATA), whose room grows by doubling with
+/// the old room held beside the new while it moves.
+fn push_text(stack: &mut [XEl], text: Cow<'_, str>, budget: &mut Budget, held: &mut u64) -> Result<(), String> {
     let Some(top) = stack.last_mut() else {
         // Outside the root only white space may stand.
-        return if text.chars().all(|c| matches!(c, ' ' | '\t' | '\n' | '\r')) { Ok(()) } else { Err("text outside the root element".into()) };
+        return if is_space(&text) { Ok(()) } else { Err("text outside the root element".into()) };
     };
     if let Some(XNode::Text(previous)) = top.kids.last_mut() {
-        previous.push_str(text);
+        let needed = previous.len().saturating_add(text.len());
+        let old = previous.capacity();
+        if needed > old {
+            let grown = needed.max(old.saturating_mul(2));
+            charge(budget, held, units(grown))?;
+            previous.reserve_exact(grown.saturating_sub(previous.len()));
+            budget.release(units(old));
+            *held = held.saturating_sub(units(old));
+        }
+        previous.push_str(&text);
     } else {
-        top.kids.push(XNode::Text(text.to_string()));
+        // A decoded copy is moved into the node as it is; borrowed text is copied at its length.
+        let length = match &text {
+            Cow::Owned(owned) => owned.capacity(),
+            Cow::Borrowed(borrowed) => borrowed.len(),
+        };
+        charge(budget, held, NODE_BYTES.saturating_add(units(length)))?;
+        top.kids.push(XNode::Text(text.into_owned()));
     }
     Ok(())
 }

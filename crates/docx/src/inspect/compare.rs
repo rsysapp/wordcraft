@@ -13,7 +13,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::hash::{BuildHasher, Hasher as _};
 
 use super::LossKind;
-use super::budget::{Budget, units};
+use super::budget::{Budget, table_slot, tree_slot, units, vector_slot};
 use super::diff::{Step, script, script_bytes};
 use super::digest::Hasher;
 use super::opc::finish;
@@ -41,16 +41,34 @@ pub(super) struct Projector<'a> {
     pending: u64,
 }
 
-/// Memory charged for each entry of a cache or map kept while comparing: the entry and its share
-/// of the table's spare room.
-pub(super) const CACHE_BYTES: u64 = 64;
+/// Memory charged for each entry of the projector's caches.
+const STACK_CACHE_BYTES: u64 = table_slot::<(u32, Option<u32>)>();
+const FORMAT_CACHE_BYTES: u64 = table_slot::<(u32, u32)>();
+/// Memory charged for each comment id in a set of ids, besides the id.
+pub(super) const ID_BYTES: u64 = tree_slot::<String, ()>();
+
+const fn larger(one: u64, other: u64) -> u64 {
+    if one > other { one } else { other }
+}
+
+/// A loss as the tally keeps it.
+type LossKey = (String, LossKind, Option<String>);
+
 /// Memory charged for each record an inspection reports or tallies (an added part, a loss, a
 /// changed content type or relationship, an author's counts), besides its strings: the record in
-/// its map or growing vector, and its copy into the answer.
-pub(super) const RECORD_BYTES: u64 = 256;
-/// Memory charged for each change the tally finds resolved: its entry in a set whose nodes may be
-/// half empty.
-const RESOLUTION_BYTES: u64 = 3 * std::mem::size_of::<Resolution>() as u64;
+/// its map or growing vector, and its copy into the answer. The most any of them takes.
+pub(super) const RECORD_BYTES: u64 = larger(
+    larger(
+        tree_slot::<LossKey, u32>() + std::mem::size_of::<super::Loss>() as u64,
+        tree_slot::<u32, super::AuthorRevisions>() + std::mem::size_of::<super::AuthorRevisions>() as u64,
+    ),
+    larger(
+        larger(vector_slot::<super::AddedPart>(), vector_slot::<super::ContentTypeChange>()),
+        larger(vector_slot::<super::RelationshipChange>(), tree_slot::<String, u32>() + std::mem::size_of::<super::AuthorCount>() as u64),
+    ),
+);
+/// Memory charged for each change the tally finds resolved: its entry in a set.
+const RESOLUTION_BYTES: u64 = tree_slot::<Resolution, ()>();
 
 impl<'a> Projector<'a> {
     pub(super) fn new(new_pairs: &'a Pairs, new_comments: &'a BTreeSet<String>) -> Self {
@@ -87,7 +105,7 @@ impl<'a> Projector<'a> {
             }
         };
         self.stacks.insert(id, projected);
-        self.pending = self.pending.saturating_add(CACHE_BYTES);
+        self.pending = self.pending.saturating_add(STACK_CACHE_BYTES);
         projected
     }
 
@@ -118,7 +136,7 @@ impl<'a> Projector<'a> {
             None => id,
         };
         self.formats.insert(id, projected);
-        self.pending = self.pending.saturating_add(CACHE_BYTES);
+        self.pending = self.pending.saturating_add(FORMAT_CACHE_BYTES);
         projected
     }
 
@@ -266,8 +284,21 @@ pub(super) struct Holds {
     pub objects: u32,
 }
 
-/// Memory charged for each move followed: its entry and the two hashers of what left and arrived.
-const MOVE_BYTES: u64 = 2 * 512 + 64;
+/// Memory charged for each move followed: its entry, and the two hashers' short buffers of what
+/// left and arrived (each at most 256 bytes, growing by doubling).
+const MOVE_BYTES: u64 = tree_slot::<(u32, u32), (Hasher, Hasher)>() + 2 * 384;
+/// Memory charged for each stack whose facts are cached.
+const STACK_FACTS_BYTES: u64 = table_slot::<(u32, StackFacts)>();
+/// Memory charged for each author whose insertions' holds are counted.
+const HOLDS_BYTES: u64 = tree_slot::<u32, Holds>();
+
+/// The entry for `author` in `holds`, its memory charged when it is new.
+fn holds_of<'h>(holds: &'h mut BTreeMap<u32, Holds>, author: u32, budget: &mut Budget) -> Result<&'h mut Holds, String> {
+    if !holds.contains_key(&author) {
+        budget.hold(HOLDS_BYTES)?;
+    }
+    Ok(holds.entry(author).or_default())
+}
 
 /// The author of the save's innermost insertion around a stack, and the save's move it is in.
 type StackFacts = (Option<u32>, Option<(bool, u32, u32)>);
@@ -286,7 +317,7 @@ pub(super) fn facts(
     for item in items {
         budget.work(2)?;
         if !stacks.contains_key(&item.wraps) {
-            budget.hold(CACHE_BYTES)?;
+            budget.hold(STACK_FACTS_BYTES)?;
         }
         let (inserter, moved) = *stacks.entry(item.wraps).or_insert_with(|| {
             let wraps: Vec<Wrap> = tables.wraps_of(item.wraps);
@@ -311,11 +342,11 @@ pub(super) fn facts(
         if let Some((author, date)) = tables.format_of(item.format).and_then(|format| format.hidden_by)
             && new_pairs.contains(&(author, date))
         {
-            let entry = holds.entry(author).or_default();
+            let entry = holds_of(holds, author, budget)?;
             entry.hidden = entry.hidden.saturating_add(1);
         }
         let Some(author) = inserter else { continue };
-        let entry = holds.entry(author).or_default();
+        let entry = holds_of(holds, author, budget)?;
         let format = tables.format_of(item.format);
         let mark = tables.mark_info(item.piece).map(|mark| mark.kind);
         if format.is_some_and(|format| format.hidden) {
@@ -352,8 +383,8 @@ pub(super) fn facts(
 struct OpenField {
     /// Its start was there before the save (not inserted by it).
     base: bool,
-    /// Tracked changes of the save inside it, per author.
-    touched: BTreeMap<u32, u32>,
+    /// A tracked change of the save is inside it.
+    touched: bool,
     /// Every item of it, start to end, is in a deletion of the save.
     all_deleted: bool,
 }
@@ -361,6 +392,8 @@ struct OpenField {
 /// How a stack relates to the save: the author of its innermost change by the save, whether a
 /// change of the save inserts it, whether one deletes it.
 type StackRole = (Option<u32>, bool, bool);
+/// Memory charged for each stack whose role is cached.
+const ROLE_BYTES: u64 = table_slot::<(u32, StackRole)>();
 
 /// A base field is its start, code, separator, result and end together. The save may delete it
 /// whole; any other tracked change inside it (code narrowed, a separator deleted, a character
@@ -377,21 +410,15 @@ pub(super) fn field_structure(
     let mut roles: HashMap<u32, StackRole> = HashMap::new();
     let mut open: Vec<OpenField> = Vec::new();
     let mut changed = 0u32;
-    let close = |field: OpenField, holds: &mut BTreeMap<u32, Holds>, changed: &mut u32| {
-        if field.base && !field.touched.is_empty() {
-            if !field.all_deleted {
-                *changed = changed.saturating_add(1);
-            }
-            for (author, count) in field.touched {
-                let entry = holds.entry(author).or_default();
-                entry.field_codes = entry.field_codes.saturating_add(count);
-            }
+    let close = |field: OpenField, changed: &mut u32| {
+        if field.base && field.touched && !field.all_deleted {
+            *changed = changed.saturating_add(1);
         }
     };
     for item in items {
         budget.work(3 + units(open.len()))?;
         if !roles.contains_key(&item.wraps) {
-            budget.hold(CACHE_BYTES)?;
+            budget.hold(ROLE_BYTES)?;
         }
         let (author, inserted, deleted) = *roles.entry(item.wraps).or_insert_with(|| {
             let wraps = tables.wraps_of(item.wraps);
@@ -409,23 +436,31 @@ pub(super) fn field_structure(
             if open.len() >= MAX_FIELD_DEPTH {
                 return Err("fields nested deeper than an inspection reads".into());
             }
-            open.push(OpenField { base: !inserted, touched: BTreeMap::new(), all_deleted: true });
+            open.push(OpenField { base: !inserted, touched: false, all_deleted: true });
         }
+        // Each change touching base fields counts once for each of them, in its author's field
+        // codes.
+        let toucher = author.or(formatted);
+        let mut base_fields = 0u32;
         for field in open.iter_mut().filter(|field| field.base) {
-            if let Some(author) = author.or(formatted) {
-                let count = field.touched.entry(author).or_default();
-                *count = count.saturating_add(1);
-            }
+            field.touched |= toucher.is_some();
             field.all_deleted &= deleted;
+            base_fields = base_fields.saturating_add(1);
+        }
+        if let Some(author) = toucher
+            && base_fields > 0
+        {
+            let entry = holds_of(holds, author, budget)?;
+            entry.field_codes = entry.field_codes.saturating_add(base_fields);
         }
         if matches!(kind, Some(MarkKind::FieldEnd | MarkKind::SimpleFieldEnd))
             && let Some(field) = open.pop()
         {
-            close(field, holds, &mut changed);
+            close(field, &mut changed);
         }
     }
     while let Some(field) = open.pop() {
-        close(field, holds, &mut changed);
+        close(field, &mut changed);
     }
     Ok(changed)
 }
@@ -560,7 +595,7 @@ impl<'a> Story<'a> {
         }
         match comment {
             Some(id) if untracked || altered => {
-                let held = CACHE_BYTES.saturating_add(units(id.len()));
+                let held = ID_BYTES.saturating_add(units(id.len()));
                 if self.tally.comments_altered.insert(id) {
                     self.tally.pending = self.tally.pending.saturating_add(held);
                 }
@@ -582,7 +617,7 @@ impl<'a> Story<'a> {
             // An empty anchor of a removed comment goes with it; any other anchor gone alters its
             // comment.
             if !self.comments.removed.contains(id) && self.tally.comments_altered.insert(id.to_string()) {
-                self.tally.pending = self.tally.pending.saturating_add(CACHE_BYTES).saturating_add(units(id.len()));
+                self.tally.pending = self.tally.pending.saturating_add(ID_BYTES).saturating_add(units(id.len()));
             }
             return;
         }
@@ -619,7 +654,7 @@ impl<'a> Story<'a> {
             && self.comments.base.contains(id)
         {
             if self.tally.comments_altered.insert(id.to_string()) {
-                self.tally.pending = self.tally.pending.saturating_add(CACHE_BYTES).saturating_add(units(id.len()));
+                self.tally.pending = self.tally.pending.saturating_add(ID_BYTES).saturating_add(units(id.len()));
             }
             return;
         }
@@ -635,16 +670,16 @@ impl<'a> Story<'a> {
 /// mark on its own: `items[start..start + len]`. Words are matched whole, everything included; what
 /// lies between matched words is then matched character by character, by the character alone, so
 /// a resolved change or a formatting difference is seen as the same character kept.
-struct Token {
+pub(super) struct Token {
     start: usize,
     len: usize,
     hash: u64,
 }
 
 /// A token's memory, with its vector's slack while it grows.
-const TOKEN_BYTES: u64 = 2 * std::mem::size_of::<Token>() as u64;
+const TOKEN_BYTES: u64 = vector_slot::<Token>();
 
-fn tokens(items: &[Item], hasher: &RandomState, budget: &mut Budget) -> Option<Vec<Token>> {
+pub(super) fn tokens(items: &[Item], hasher: &RandomState, budget: &mut Budget) -> Option<Vec<Token>> {
     let mut out = Vec::new();
     let mut start = 0;
     let close = |out: &mut Vec<Token>, budget: &mut Budget, start: usize, end: usize| -> bool {

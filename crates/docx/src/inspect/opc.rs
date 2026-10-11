@@ -3,11 +3,14 @@
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 
-use super::budget::{Budget, units};
+use super::budget::{Budget, table_room, table_slot, tree_room, tree_slot, units};
 
-/// Memory charged for each relationship or content type kept, besides its strings: the strings'
-/// own headers and the table entry with its share of the table's spare room.
-const REL_BYTES: u64 = 256;
+/// Memory charged for each relationship kept, besides its strings: its entry in its table.
+const REL_BYTES: u64 = table_slot::<(String, Rel)>();
+/// Memory charged for each content type kept, besides its strings: its entry in its map.
+const TYPE_BYTES: u64 = tree_slot::<String, String>();
+/// Memory charged for each bookmark of a story part, besides its id and name.
+const BOOKMARK_BYTES: u64 = table_slot::<(String, Option<String>)>();
 use super::digest::{Digest, Hasher};
 use super::xml::{XEl, XNode, is_space};
 
@@ -34,13 +37,17 @@ impl Rels {
         if root.attrs.iter().any(|(key, _)| !key.contains(':')) {
             return Err("an attribute on Relationships".into());
         }
-        let mut by_id = HashMap::new();
+        // Sized from the relationships there are, so the table never grows.
+        let count = root.els().count();
+        budget.work(units(count))?;
+        budget.hold(units(count).saturating_mul(REL_BYTES).saturating_add(table_room::<(String, Rel)>()))?;
+        let mut by_id = HashMap::with_capacity(count);
         for node in &root.kids {
             match node {
                 XNode::Text(text) if is_space(text) => {}
                 XNode::Text(_) => return Err("text in a relationship part".into()),
                 XNode::El(el) if &*el.name == "rel:Relationship" => {
-                    if el.has_element_kids() || !is_space(&el.text()) {
+                    if el.has_element_kids() || !el.text_is_space() {
                         return Err("content inside a relationship".into());
                     }
                     if let Some((key, _)) = el.attrs.iter().find(|(key, _)| !matches!(&**key, "Id" | "Type" | "Target" | "TargetMode")) {
@@ -54,9 +61,8 @@ impl Rels {
                         Some("External") => true,
                         Some(other) => return Err(format!("a relationship TargetMode {other:?}")),
                     };
-                    // Kept for the whole inspection: the strings, and the entry with its share of the
-                    // table's room.
-                    budget.hold(REL_BYTES.saturating_add(units(id.len().saturating_add(kind.len()).saturating_add(target.len()))))?;
+                    // Kept for the whole inspection: the strings (the entry was held with the table).
+                    budget.hold(units(id.len().saturating_add(kind.len()).saturating_add(target.len())))?;
                     budget.work(40 + units(id.len()) / 4)?;
                     if by_id.insert(id.to_string(), Rel { kind: kind.to_string(), target: target.to_string(), external }).is_some() {
                         return Err(format!("two relationships with Id {id}"));
@@ -118,6 +124,7 @@ impl ContentTypes {
         if &*root.name != "ct:Types" {
             return Err("[Content_Types].xml without Types".into());
         }
+        budget.hold(2 * tree_room::<String, String>())?;
         let mut defaults = BTreeMap::new();
         let mut overrides = BTreeMap::new();
         for node in &root.kids {
@@ -130,18 +137,22 @@ impl ContentTypes {
                         "ct:Override" => ("PartName", &mut overrides),
                         other => return Err(format!("{other} in [Content_Types].xml")),
                     };
-                    if el.has_element_kids() || !is_space(&el.text()) || el.attrs.iter().any(|(key, _)| &**key != key_name && &**key != "ContentType")
-                    {
+                    if el.has_element_kids() || !el.text_is_space() || el.attrs.iter().any(|(key, _)| &**key != key_name && &**key != "ContentType") {
                         return Err("an unexpected content type entry".into());
                     }
                     let (Some(key), Some(kind)) = (el.attr(key_name), el.attr("ContentType")) else {
                         return Err("a content type entry without its attributes".into());
                     };
-                    let key = key.strip_prefix('/').unwrap_or(key).to_lowercase();
-                    budget.hold(REL_BYTES.saturating_add(units(key.len().saturating_add(kind.len()))))?;
+                    let key = key.strip_prefix('/').unwrap_or(key);
+                    // Lowered, a key can grow by half (and its room by doubling): held at that most.
+                    let lowered_room = units(key.len()).saturating_mul(3);
+                    budget.hold(TYPE_BYTES.saturating_add(lowered_room).saturating_add(units(kind.len())))?;
                     budget.work(40 + units(key.len()) / 4)?;
-                    if map.insert(key.clone(), kind.to_string()).is_some() {
-                        return Err(format!("two content types for {key}"));
+                    match map.entry(key.to_lowercase()) {
+                        std::collections::btree_map::Entry::Occupied(entry) => return Err(format!("two content types for {}", entry.key())),
+                        std::collections::btree_map::Entry::Vacant(entry) => {
+                            entry.insert(kind.to_string());
+                        }
                     }
                 }
             }
@@ -210,21 +221,39 @@ pub(super) const REVISION_ELEMENTS: &[&str] = &[
 /// Bookmark id → name in one part; `None` for an id two bookmarks share.
 pub(super) type Bookmarks = HashMap<String, Option<String>>;
 
-pub(super) fn bookmarks(root: &XEl) -> Bookmarks {
-    fn walk(el: &XEl, out: &mut Bookmarks) {
+/// A story part's bookmarks, each charged as it is kept; the caller releases what it answers held.
+pub(super) fn bookmarks(root: &XEl, budget: &mut Budget) -> Result<(Bookmarks, u64), String> {
+    fn walk(el: &XEl, out: &mut Bookmarks, held: &mut u64, budget: &mut Budget) -> Result<(), String> {
         for child in el.els() {
+            budget.work(1)?;
             if &*child.name == "w:bookmarkStart"
                 && let Some(id) = child.attr("w:id")
             {
-                let name = child.attr("w:name").unwrap_or("").to_string();
-                out.entry(id.to_string()).and_modify(|entry| *entry = None).or_insert(Some(name));
+                match out.get_mut(id) {
+                    Some(entry) => *entry = None,
+                    None => {
+                        let name = child.attr("w:name").unwrap_or("");
+                        let bytes = BOOKMARK_BYTES.saturating_add(units(id.len().saturating_add(name.len())));
+                        budget.hold(bytes)?;
+                        *held = held.saturating_add(bytes);
+                        out.insert(id.to_string(), Some(name.to_string()));
+                    }
+                }
             }
-            walk(child, out);
+            walk(child, out, held, budget)?;
         }
+        Ok(())
     }
     let mut out = Bookmarks::new();
-    walk(root, &mut out);
-    out
+    let mut held = table_room::<(String, Option<String>)>();
+    budget.hold(held)?;
+    match walk(root, &mut out, &mut held, budget) {
+        Ok(()) => Ok((out, held)),
+        Err(error) => {
+            budget.release(held);
+            Err(error)
+        }
+    }
 }
 
 /// How a part's XML is compared: bookkeeping attributes dropped, relationship ids read as what

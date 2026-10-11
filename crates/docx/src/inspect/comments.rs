@@ -4,15 +4,15 @@
 
 use std::collections::{BTreeMap, HashMap};
 
-use super::budget::{Budget, units};
+use super::budget::{Budget, table_room, table_slot, tree_slot, units, vector_slot};
 
 /// Memory charged for each comment kept, besides its strings and identities.
-const COMMENT_BYTES: u64 = 320;
+const COMMENT_BYTES: u64 = tree_slot::<String, Comment>();
 /// Memory charged for each entry of the paragraph map used while reading, besides its strings.
-const MAP_BYTES: u64 = 128;
+const MAP_BYTES: u64 = table_slot::<(String, Option<String>)>();
 /// Memory charged for each attribute copied while a comment's attributes are compared, besides its
 /// value: its entry, in a vector that grows by doubling.
-const ATTRIBUTE_COPY_BYTES: u64 = 2 * std::mem::size_of::<(std::rc::Rc<str>, String)>() as u64;
+const ATTRIBUTE_COPY_BYTES: u64 = vector_slot::<(std::rc::Rc<str>, String)>();
 use super::digest::{Digest, Hasher};
 use super::opc::{Canon, finish};
 use super::xml::{XEl, XNode, is_space};
@@ -37,7 +37,8 @@ pub(super) type Comments = BTreeMap<String, Comment>;
 /// The comments of `w:comments`, with their state from `w15:commentsEx`.
 pub(super) fn read(comments: &XEl, extended: Option<&XEl>, canon: &Canon<'_>, budget: &mut Budget) -> Result<Comments, String> {
     // The paragraph map lives only while reading: held, then released.
-    let mut map_held = 0u64;
+    budget.hold(table_room::<(String, Option<String>)>())?;
+    let mut map_held = table_room::<(String, Option<String>)>();
     let read = read_held(comments, extended, canon, budget, &mut map_held);
     budget.release(map_held);
     read

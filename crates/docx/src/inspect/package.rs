@@ -12,7 +12,7 @@ use std::io::{Cursor, Read};
 use zip::ZipArchive;
 
 use super::InspectError;
-use super::budget::{BYTES_PER_UNIT_INFLATED, Budget, units};
+use super::budget::{BYTES_PER_UNIT_INFLATED, Budget, tree_slot, units, vector_slot};
 use crate::package::{MAX_ENTRIES, ReadLimits};
 
 /// A package whose every entry was read once, in full, within the limits.
@@ -39,10 +39,14 @@ const UNICODE_PATH: u16 = 0x7075;
 pub(super) const INFLATE_BYTES: u64 = 128 * 1024;
 /// Work charged for opening one entry's stream (its decompressor and buffers).
 const ENTRY_WORK: u64 = 2_000;
-/// Memory charged for each entry, besides three times the directory's bytes (its names and extra
-/// fields, kept by the zip reader, this index and the case-folded check): the zip reader's record,
-/// the layout check's extent, the index entries.
-const ENTRY_BYTES: u64 = 640;
+/// Memory charged for each entry, besides `DIRECTORY_COPIES` times the directory's bytes: the zip
+/// reader's record (built in a growing vector, then moved into its index), the layout check's
+/// extent, and this index's and the case-folded check's entries.
+const ENTRY_BYTES: u64 = 640 + vector_slot::<(usize, usize)>() + tree_slot::<String, (usize, u64)>() + tree_slot::<String, ()>();
+/// How many times the directory's bytes (names, extra fields, comments) are held: the zip reader
+/// keeps each name three times and each extra field twice, this index once, and the case-folded
+/// check a lowered copy, which can grow by half and its room by doubling.
+const DIRECTORY_COPIES: u64 = 8;
 
 /// How many entries the directory holds and its size in bytes, from the end record (or the ZIP64
 /// end record it points at).
@@ -286,7 +290,7 @@ impl<'a> StrictPackage<'a> {
         if entries > MAX_ENTRIES {
             return Err(format!("{entries} zip entries"));
         }
-        budget.hold(ENTRY_BYTES.saturating_mul(units(entries)).saturating_add(directory_bytes.saturating_mul(3)))?;
+        budget.hold(ENTRY_BYTES.saturating_mul(units(entries)).saturating_add(directory_bytes.saturating_mul(DIRECTORY_COPIES)))?;
         let mut archive = ZipArchive::new(Cursor::new(bytes)).map_err(|error| format!("not a readable zip package: {error}"))?;
         if archive.len() > MAX_ENTRIES {
             return Err(format!("{} zip entries", archive.len()));

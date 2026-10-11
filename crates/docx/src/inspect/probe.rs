@@ -97,6 +97,7 @@ pub fn revision_pairs(count: u32, mark: &mut dyn FnMut()) -> Result<Measured, St
 }
 
 /// Which of the tables a probe fills.
+#[derive(Clone)]
 pub enum Entries {
     /// Content identities of this many bytes each (up to 256 kept exact).
     Contents(usize),
@@ -178,7 +179,7 @@ pub fn story(xml: &[u8], mark: &mut dyn FnMut()) -> Result<Measured, String> {
     let mut names = Names::default();
     let parsed = xml::parse(xml, &mut names, &mut limits(), &mut unlimited())?;
     let rels = Rels::default();
-    let bookmarks = super::opc::bookmarks(&parsed.root);
+    let (bookmarks, _) = super::opc::bookmarks(&parsed.root, &mut unlimited())?;
     let canon = Canon { rels: &rels, bookmarks: Some(&bookmarks) };
     let hiding = StyleHiding::default();
     let mut tables = Tables::new();
@@ -206,7 +207,7 @@ fn walked(xml: &[u8], tables: Option<Tables>) -> Result<Walked, String> {
     let mut budget = unlimited();
     let parsed = xml::parse(xml, &mut names, &mut limits(), &mut budget)?;
     let rels = Rels::default();
-    let bookmarks = super::opc::bookmarks(&parsed.root);
+    let (bookmarks, _) = super::opc::bookmarks(&parsed.root, &mut unlimited())?;
     let canon = Canon { rels: &rels, bookmarks: Some(&bookmarks) };
     let mut tables = tables.unwrap_or_else(Tables::new);
     let mut revisions = Revisions::default();
@@ -337,7 +338,7 @@ pub fn tally(pairs: &[(Vec<u8>, Vec<u8>)], mark: &mut dyn FnMut()) -> Result<Mea
             let mut names = Names::default();
             let parsed = xml::parse(xml, &mut names, &mut limits(), budget)?;
             let rels = Rels::default();
-            let bookmarks = super::opc::bookmarks(&parsed.root);
+            let (bookmarks, _) = super::opc::bookmarks(&parsed.root, &mut unlimited())?;
             let canon = Canon { rels: &rels, bookmarks: Some(&bookmarks) };
             let mut items_left = super::MAX_STORY_ITEMS;
             let items = story::walk(&parsed.root, &canon, tables, revisions, &mut items_left, parsed.most_items, &StyleHiding::default(), budget)?;
@@ -418,4 +419,18 @@ pub fn compared(base: &[u8], edited: &[u8], phase: Phase, mark: &mut dyn FnMut()
         };
         Ok(Box::new((kept, inspection, tally)))
     })
+}
+
+/// A story part's bookmarks.
+pub fn bookmarks(xml: &[u8], mark: &mut dyn FnMut()) -> Result<Measured, String> {
+    let (root, _names) = parsed(xml)?;
+    measure(&mut unlimited(), mark, |budget| Ok(Box::new(super::opc::bookmarks(&root, budget)?.0)))
+}
+
+/// A story's tokens: `count` items, each a mark of its own, so each is a token.
+pub fn tokens(count: usize, mark: &mut dyn FnMut()) -> Result<Measured, String> {
+    let piece = |n: usize| story::MARK_BASE.saturating_add(u32::try_from(n).unwrap_or(u32::MAX));
+    let items: Vec<story::Item> = (0..count).map(|n| story::Item { piece: piece(n), wraps: 0, format: 0, context: 0 }).collect();
+    let hasher = std::collections::hash_map::RandomState::new();
+    measure(&mut unlimited(), mark, |budget| Ok(Box::new(super::compare::tokens(&items, &hasher, budget).ok_or("no tokens")?)))
 }

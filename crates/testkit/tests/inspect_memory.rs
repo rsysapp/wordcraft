@@ -58,6 +58,11 @@ fn size(full: usize) -> usize {
     if std::env::var_os("INSPECT_MEMORY_FULL").is_some() { full } else { (full / 10).max(1) }
 }
 
+/// One past 2^k (a growth point), at full size; one past 2^(k-3) otherwise.
+fn point(k: u32) -> usize {
+    if std::env::var_os("INSPECT_MEMORY_FULL").is_some() { (1 << k) + 1 } else { (1 << (k - 3)) + 1 }
+}
+
 fn braces(length: usize) -> String {
     "{".repeat(length)
 }
@@ -193,6 +198,30 @@ fn cases() -> Vec<(&'static str, Vec<u8>, Vec<u8>)> {
     let words = |prefix: &str| (0..size(600_000)).map(|n| format!("{prefix}{n} ")).collect::<String>();
     cases.push(("every word different", package(&para(&words("a")), "", vec![]), package(&para(&words("b")), "", vec![])));
 
+    // Text nodes between elements: the reviewer's 26.5 KB upload, 2^20 + 1 pairs of `<a/> `.
+    let slots = format!("<data>{}<a/></data>", "<a/> ".repeat(point(20) - 1));
+    cases.push((
+        "text-node slots",
+        package(&para("Rent."), "", vec![]),
+        package(&para("Rent."), "", vec![("customXml/item1.xml".into(), slots.into_bytes())]),
+    ));
+    let paragraphs = format!("{}<w:p/>", "<w:p/> ".repeat(point(18) - 1));
+    cases.push(("paragraphs between spaces", package(&para("Rent."), "", vec![]), package(&paragraphs, "", vec![])));
+    // Text built in pieces, at its string's doubling point, in custom XML and in a run.
+    let pieces = |count: usize| format!("{}x", "x&#65;".repeat(count / 2));
+    let custom = format!("<data>{}</data>", pieces(point(24) - 1));
+    cases.push((
+        "text in pieces (custom XML)",
+        package(&para("Rent."), "", vec![]),
+        package(&para("Rent."), "", vec![("customXml/item1.xml".into(), custom.into_bytes())]),
+    ));
+    let run_pieces = format!(r#"<w:p><w:r><w:t xml:space="preserve">{}</w:t></w:r></w:p>"#, pieces(point(22) - 1));
+    cases.push(("text in pieces (a run)", package(&para("Rent."), "", vec![]), package(&run_pieces, "", vec![])));
+    // Bookmarks with long names.
+    let marks: String = (0..size(20_000)).map(|n| format!(r#"<w:bookmarkStart w:id="{n}" w:name="{}"/>"#, "b".repeat(2_000))).collect();
+    let marked = package(&format!("<w:p>{marks}</w:p>"), "", vec![]);
+    cases.push(("bookmarks", marked.clone(), marked));
+
     // Many header stories.
     let mut overrides = String::new();
     let mut headers = Vec::new();
@@ -227,14 +256,15 @@ fn the_inspection_never_holds_more_than_it_charged() {
     for (name, base, edited) in cases() {
         let baseline = reset_peak();
         let started = Instant::now();
-        let (result, charged, _work) = inspect_measured(&base, &edited);
+        let (result, charged, work) = inspect_measured(&base, &edited);
         let elapsed = started.elapsed();
         let held = peak().saturating_sub(baseline) as u64;
         let ratio = held as f64 / charged.max(1) as f64;
         eprintln!(
-            "{name:<24} held {:>7.1} MB  charged {:>7.1} MB  ratio {ratio:.2}  {elapsed:>9.2?}  {}",
+            "{name:<24} held {:>7.1} MB  charged {:>7.1} MB  ratio {ratio:.3}  {elapsed:>9.2?}  {:>5.1} ns/unit  {}",
             held as f64 / 1e6,
             charged as f64 / 1e6,
+            elapsed.as_secs_f64() * 1e9 / work.max(1) as f64,
             match &result {
                 Ok(_) => "Ok".to_string(),
                 Err(error) => format!("{error:?}").chars().take(60).collect(),
@@ -248,6 +278,6 @@ fn the_inspection_never_holds_more_than_it_charged() {
         }
         drop(result);
     }
-    eprintln!("largest held/charged ratio: {:.2} ({})", worst.0, worst.1);
+    eprintln!("largest held/charged ratio: {:.3} ({})", worst.0, worst.1);
     assert!(over.is_empty(), "held more than charged: {over:?}");
 }

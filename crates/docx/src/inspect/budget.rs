@@ -98,3 +98,64 @@ impl Budget {
 pub(super) fn units(count: usize) -> u64 {
     u64::try_from(count).unwrap_or(u64::MAX)
 }
+
+// Collections are charged for the room they can hold, never for their length. Where the room is
+// known beforehand it is reserved exactly; otherwise each entry is charged for the most its
+// collection can hold per entry at its worst moment, which these give from the entry's size.
+
+/// The size of `T`, as bytes.
+const fn size<T>() -> u64 {
+    std::mem::size_of::<T>() as u64
+}
+
+/// Memory one element of a growing vector can hold: a vector grows by doubling, and holds its old
+/// room beside the new (twice the old) while it moves, so three times its length at worst.
+pub(super) const fn vector_slot<T>() -> u64 {
+    3 * size::<T>()
+}
+
+/// Memory a growing vector holds besides [`vector_slot`] per element: its first room is four
+/// elements, whatever it holds.
+pub(super) const fn vector_room<T>() -> u64 {
+    4 * size::<T>()
+}
+
+/// Memory one entry of a hash table can hold. A table holds at most seven entries for every eight
+/// buckets, each bucket an entry's room and a control byte; when full it doubles its buckets and
+/// holds the old table beside the new while it moves. Just past that point it holds three times
+/// its old buckets for 7/8 of them in entries: 24/7 buckets per entry.
+pub(super) const fn table_slot<T>() -> u64 {
+    (24 * (size::<T>() + 1)).div_ceil(7)
+}
+
+/// Memory a hash table holds besides [`table_slot`] per entry: its first table (four buckets for up
+/// to three entries) and, for each of two tables, its control bytes' tail and alignment.
+pub(super) const fn table_room<T>() -> u64 {
+    4 * (size::<T>() + 1) + 64
+}
+
+/// The most entries a B-tree node holds, and the fewest a node other than the root keeps.
+const TREE_CAPACITY: u64 = 11;
+const TREE_FEWEST: u64 = 5;
+
+/// One B-tree node of entries of `K` and `V`, with room for its children's pointers.
+const fn tree_node<K, V>() -> u64 {
+    TREE_CAPACITY * (size::<K>() + size::<V>()) + 16 + (TREE_CAPACITY + 1) * 8
+}
+
+/// Memory one entry of a B-tree map can hold: every node but the root keeps at least five of its
+/// eleven entries, so a tree holds at most one node per five entries, and the root.
+pub(super) const fn tree_slot<K, V>() -> u64 {
+    tree_node::<K, V>().div_ceil(TREE_FEWEST)
+}
+
+/// Memory a B-tree map holds besides [`tree_slot`] per entry: its root.
+pub(super) const fn tree_room<K, V>() -> u64 {
+    tree_node::<K, V>()
+}
+
+/// Memory a shared string (`Rc<str>`) of `length` bytes holds: its two counts, and its bytes
+/// rounded up to the counts' alignment.
+pub(super) fn shared_string(length: usize) -> u64 {
+    16u64.saturating_add(units(length).next_multiple_of(8))
+}

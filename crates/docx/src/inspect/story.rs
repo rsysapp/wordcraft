@@ -11,7 +11,7 @@
 use std::collections::{BTreeMap, HashMap};
 use std::rc::Rc;
 
-use super::budget::{Budget, units};
+use super::budget::{Budget, shared_string, table_room, table_slot, tree_room, tree_slot, units, vector_room, vector_slot};
 use super::digest::{Digest, Hasher};
 use super::opc::{Canon, finish};
 use super::xml::{XEl, XNode, is_space};
@@ -31,9 +31,30 @@ pub(super) const ITEM_BYTES: u64 = 18;
 pub(super) fn items_held(items: &Vec<Item>) -> u64 {
     units(items.capacity()).saturating_mul(ITEM_BYTES)
 }
-/// Memory charged for each entry a table interns, besides any text it keeps: the entry, kept in a
-/// vector and as a map key (formats and contexts in both), with each one's share of spare room.
-const ENTRY_BYTES: u64 = 192;
+// Memory charged for each entry the tables intern, besides what it keeps on its own (a text's
+// characters, a digest's bytes, a format's slots, a mark's comment id): its entry in its hash
+// table and, for those kept in order, in its growing vector.
+const CONTENT_BYTES: u64 = table_slot::<(Digest, u32)>();
+const TEXT_BYTES: u64 = table_slot::<(Rc<str>, u32)>() + vector_slot::<Rc<str>>();
+const WRAP_BYTES: u64 = table_slot::<(Wrap, u32)>() + vector_slot::<Wrap>();
+const STACK_BYTES: u64 = table_slot::<((u32, u32), u32)>() + vector_slot::<(u32, u32)>();
+const FORMAT_BYTES: u64 = table_slot::<(Format, u32)>() + vector_slot::<Format>();
+/// A mark's record, and a name of its own (`#text`, `w:sectPr`) when it has one.
+const MARK_BYTES: u64 = table_slot::<(Digest, u32)>() + vector_slot::<MarkInfo>() + 32;
+const CONTEXT_BYTES: u64 = table_slot::<(Context, u32)>() + vector_slot::<Context>();
+/// The tables' first rooms.
+const TABLES_ROOM: u64 = table_room::<(Digest, u32)>() * 2
+    + table_room::<(Rc<str>, u32)>()
+    + table_room::<(Wrap, u32)>()
+    + table_room::<((u32, u32), u32)>()
+    + table_room::<(Format, u32)>()
+    + table_room::<(Context, u32)>()
+    + vector_room::<Rc<str>>()
+    + vector_room::<Wrap>()
+    + vector_room::<(u32, u32)>()
+    + vector_room::<Format>()
+    + vector_room::<MarkInfo>()
+    + vector_room::<Context>();
 
 /// A character or mark, with its tracked-change wrappers, formatting and context (ids in
 /// [`Tables`]).
@@ -253,7 +274,7 @@ impl Tables {
             marks: Vec::new(),
             context_ids: HashMap::new(),
             contexts: Vec::new(),
-            pending: 0,
+            pending: TABLES_ROOM,
             overflow: false,
         };
         tables.text("");
@@ -262,12 +283,12 @@ impl Tables {
         tables
     }
 
-    /// The next id for a table of `len` entries, or the last one with the overflow recorded (the
-    /// inspection is then refused).
-    fn next(&mut self, len: usize) -> u32 {
+    /// The next id for a table of `len` entries, whose entry holds `bytes`, or the last one with the
+    /// overflow recorded (the inspection is then refused).
+    fn next(&mut self, len: usize, bytes: u64) -> u32 {
         match u32::try_from(len).ok().filter(|id| *id < u32::MAX >> 1) {
             Some(id) => {
-                self.pending = self.pending.saturating_add(ENTRY_BYTES);
+                self.pending = self.pending.saturating_add(bytes);
                 id
             }
             None => {
@@ -292,7 +313,7 @@ impl Tables {
         if let Some(id) = self.content_ids.get(&digest) {
             return *id;
         }
-        let id = self.next(usize::try_from(self.contents).unwrap_or(usize::MAX));
+        let id = self.next(usize::try_from(self.contents).unwrap_or(usize::MAX), CONTENT_BYTES);
         self.contents = self.contents.saturating_add(1);
         self.pending = self.pending.saturating_add(digest.held());
         self.content_ids.insert(digest, id);
@@ -304,8 +325,8 @@ impl Tables {
         if let Some(id) = self.text_ids.get(text) {
             return *id;
         }
-        let id = self.next(self.texts.len());
-        self.pending = self.pending.saturating_add(units(text.len()));
+        let id = self.next(self.texts.len(), TEXT_BYTES);
+        self.pending = self.pending.saturating_add(shared_string(text.len()));
         let shared: Rc<str> = Rc::from(text);
         self.texts.push(shared.clone());
         self.text_ids.insert(shared, id);
@@ -321,7 +342,7 @@ impl Tables {
         let wrap_id = match self.wrap_ids.get(&wrap) {
             Some(id) => *id,
             None => {
-                let id = self.next(self.wraps.len());
+                let id = self.next(self.wraps.len(), WRAP_BYTES);
                 self.wraps.push(wrap);
                 self.wrap_ids.insert(wrap, id);
                 id
@@ -330,7 +351,7 @@ impl Tables {
         if let Some(id) = self.stack_ids.get(&(parent, wrap_id)) {
             return *id;
         }
-        let id = self.next(self.stacks.len());
+        let id = self.next(self.stacks.len(), STACK_BYTES);
         self.stacks.push((parent, wrap_id));
         self.stack_ids.insert((parent, wrap_id), id);
         id
@@ -361,13 +382,14 @@ impl Tables {
         out
     }
 
-    pub(super) fn format(&mut self, format: Format) -> u32 {
+    pub(super) fn format(&mut self, mut format: Format) -> u32 {
         if let Some(id) = self.format_ids.get(&format) {
             return *id;
         }
-        let id = self.next(self.formats.len());
-        // Each slot, in the vector's copy and the map key's.
-        self.pending = self.pending.saturating_add(units(format.slots.len()).saturating_mul(2 * 48));
+        let id = self.next(self.formats.len(), FORMAT_BYTES);
+        // Each slot, in the vector's copy and the map key's, both made to size.
+        format.slots.shrink_to_fit();
+        self.pending = self.pending.saturating_add(units(format.slots.len()).saturating_mul(2 * std::mem::size_of::<Slot>() as u64));
         self.formats.push(format.clone());
         self.format_ids.insert(format, id);
         id
@@ -381,13 +403,10 @@ impl Tables {
         let id = match self.mark_ids.get(&digest) {
             Some(id) => *id,
             None => {
-                let id = self.next(self.marks.len());
-                // The mark's record, in a vector that grows by doubling, and the comment id it keeps.
+                let id = self.next(self.marks.len(), MARK_BYTES);
+                // The comment id it keeps.
                 let info = info();
-                self.pending = self
-                    .pending
-                    .saturating_add(2 * std::mem::size_of::<MarkInfo>() as u64)
-                    .saturating_add(units(info.comment.as_ref().map_or(0, String::len)));
+                self.pending = self.pending.saturating_add(units(info.comment.as_ref().map_or(0, String::len)));
                 self.marks.push(info);
                 self.pending = self.pending.saturating_add(digest.held());
                 self.mark_ids.insert(digest, id);
@@ -406,7 +425,7 @@ impl Tables {
         if let Some(id) = self.context_ids.get(&context) {
             return *id;
         }
-        let id = self.next(self.contexts.len());
+        let id = self.next(self.contexts.len(), CONTEXT_BYTES);
         self.contexts.push(context);
         self.context_ids.insert(context, id);
         id
@@ -439,12 +458,13 @@ pub(super) struct Revisions {
 }
 
 /// Memory charged for each author and date kept: the entry and its share of the tree's nodes.
-const PAIR_BYTES: u64 = 64;
+const PAIR_BYTES: u64 = tree_slot::<(u32, u32), Counts>();
 
 impl Revisions {
     pub(super) fn note(&mut self, author: u32, date: u32, kind: RevisionKind, budget: &mut Budget) -> Result<(), String> {
         if !self.by_pair.contains_key(&(author, date)) {
-            budget.hold(PAIR_BYTES)?;
+            let room = if self.by_pair.is_empty() { tree_room::<(u32, u32), Counts>() } else { 0 };
+            budget.hold(PAIR_BYTES.saturating_add(room))?;
         }
         let entry = self.by_pair.entry((author, date)).or_default();
         match kind {
@@ -576,8 +596,8 @@ pub(super) struct StyleHiding {
     default: bool,
 }
 
-/// Memory charged for each style kept, besides its id and base's.
-const STYLE_BYTES: u64 = 160;
+/// Memory charged for each style kept, besides its id and base's: its entry in its table.
+const STYLE_BYTES: u64 = table_slot::<(String, (Option<bool>, Option<String>))>();
 /// The longest style chain followed; a longer one (or a loop) reads as hiding, since what lies
 /// past it is unknown.
 const MAX_STYLE_CHAIN: usize = 32;
@@ -595,7 +615,10 @@ impl StyleHiding {
                 "w:style" => {
                     let Some(id) = child.attr("w:styleId") else { continue };
                     let based = child.child("w:basedOn").and_then(|based| based.attr("w:val")).map(str::to_string);
-                    budget.hold(STYLE_BYTES.saturating_add(units(id.len().saturating_add(based.as_ref().map_or(0, String::len)))))?;
+                    let room = if hiding.styles.is_empty() { table_room::<(String, (Option<bool>, Option<String>))>() } else { 0 };
+                    budget.hold(
+                        STYLE_BYTES.saturating_add(room).saturating_add(units(id.len().saturating_add(based.as_ref().map_or(0, String::len)))),
+                    )?;
                     hiding.styles.insert(id.to_string(), (vanish(child.child("w:rPr")), based));
                 }
                 _ => {}
@@ -1078,11 +1101,15 @@ impl Walker<'_, '_> {
         // Text reads exactly as written when it keeps its white space (`xml:space="preserve"`)
         // or has none a reader could trim or collapse; otherwise how it reads is the reader's,
         // so the attribute is kept and any change of it is a change.
-        let content = child.text();
-        let plain = !content.starts_with(char::is_whitespace)
-            && !content.ends_with(char::is_whitespace)
-            && !content.contains(|c: char| c.is_whitespace() && c != ' ')
-            && !content.contains("  ");
+        // Read in place, never copied: the text can be as long as its part.
+        let characters = || child.texts().flat_map(str::chars);
+        let mut previous_space = false;
+        let inner = characters().all(|c| {
+            let double = c == ' ' && previous_space;
+            previous_space = c == ' ';
+            !double && (!c.is_whitespace() || c == ' ')
+        });
+        let plain = inner && !characters().next().is_some_and(char::is_whitespace) && !characters().next_back().is_some_and(char::is_whitespace);
         let space = child.attr("xml:space");
         let exact = plain || space == Some("preserve");
         let mut hasher = Hasher::default();
@@ -1101,19 +1128,21 @@ impl Walker<'_, '_> {
         let properties = first(table, "w:tblPr");
         let grid = first(table, "w:tblGrid");
         // A table whose every row is one tracked insertion or deletion goes with it: its own
-        // start and end carry that change too.
-        let mut row_wraps: Vec<Vec<Wrap>> = Vec::new();
+        // start and end carry that change too. Each row's changes are compared with the first
+        // row's, one row at a time.
+        let mut shared: Option<Vec<Wrap>> = None;
+        let mut all_alike = true;
         for row in table.els().filter(|row| &*row.name == "w:tr") {
             let mut wraps = Vec::new();
             for (kind, el) in row_changes(row) {
                 wraps.push(self.silent_wrap(el, kind)?);
             }
-            row_wraps.push(wraps);
+            match &shared {
+                None => shared = Some(wraps),
+                Some(first_row) => all_alike &= *first_row == wraps,
+            }
         }
-        let shared: Vec<Wrap> = match row_wraps.split_first() {
-            Some((first_row, rest)) if !first_row.is_empty() && rest.iter().all(|row| row == first_row) => first_row.clone(),
-            _ => Vec::new(),
-        };
+        let shared: Vec<Wrap> = shared.filter(|first_row| all_alike && !first_row.is_empty()).unwrap_or_default();
         let depth = self.stack.len();
         for wrap in &shared {
             self.enter(*wrap);
