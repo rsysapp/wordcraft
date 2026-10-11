@@ -239,7 +239,8 @@ selection reported in view mode is cleared first (`selectionCleared`, then `mode
 again to discard them. A malformed request (an unknown mode, a missing author, a blank author name
 or one over 255 characters, a `revisionDate` that is not ISO 8601 UTC on a calendar day, a
 permission that is missing, not a boolean, or not one of the six the API names) throws a `TypeError`
-and queues nothing.
+and queues nothing. An unknown permission is refused, never ignored (a restriction the editor cannot
+read must not become a tool it offers); fields of `author` it does not read are ignored.
 
 Every change is a tracked change by `author.name`, dated `revisionDate` stored to the second
 (`2026-10-10T08:00:00.123Z` is `2026-10-10T08:00:00Z`); tracking is forced on and is on in the saved
@@ -278,12 +279,14 @@ the strip then says "Header (shared with sections N–M)". Making a new header o
   always a Word `.docx` package, also for a file opened as `.docm` or `.dotx`. **Saves are answered
   when requested**: each from the document and mode at its own request, before a later command of
   the same frame (an `open`, a `setMode`), so a save asked in view mode answers `saveFailed` even
-  when a later one in the same frame, after `setMode`, answers `saveRequested`. Two consecutive
-  requests in one frame, for the same document in the same mode, answer once. In view mode
-  `requestSave()` answers `saveFailed` ("Nothing to save: the document is open for viewing only.")
-  and Ctrl/⌘+S sends nothing; a document that cannot be written answers `saveFailed` ("The document
-  could not be written."). Saving never leaves edit mode and never downloads: the host decides what
-  a save becomes. The size of a save is not limited here.
+  when a later one in the same frame, after `setMode`, answers `saveRequested`. Two requests in one
+  frame, for the same document in the same mode with nothing changed in between, answer once. Every
+  other save gets exactly one answer. In view mode `requestSave()` answers `saveFailed` ("Nothing to
+  save: the document is open for viewing only.") and Ctrl/⌘+S sends nothing; a document that cannot
+  be written answers `saveFailed` ("The document could not be written."), and so does a save whose
+  bytes the page cannot take, when allocating their array fails ("The document could not be handed
+  to the page."); the editor keeps working. Saving never leaves edit mode and never downloads: the
+  host decides what a save becomes. The size of a save is not limited here.
 - **Comments.** The editor's comment command (New Comment and its shortcut) never writes into the
   file: with text selected it sends `commentRequested` with the fields and meaning of `selection`;
   with nothing to quote (a collapsed caret, or only tracked-deleted or hidden text) it sends
@@ -522,8 +525,8 @@ with `view`. Every open, a refused one included, ends edit mode first.
 - **Saves** are answered when asked: `requestSave` and Ctrl/Cmd+S serialise the document then, before
   a later command of the same frame (an open, a mode change), each from the state at its own
   request: a save asked in view mode answers `saveFailed` even when a later one in the same frame,
-  after `setMode`, answers `saveRequested`. Two consecutive requests in one frame, for the same
-  document in the same mode, answer once.
+  after `setMode`, answers `saveRequested`. Two requests in one frame, for the same document in the
+  same mode with nothing changed in between, answer once.
 - **The edit strip** follows the zoom controls, and wraps onto a second row of the view bar when the
   bar is too narrow for it and the find controls. While the caret is in a header or footer several
   sections show, it says so ("Header (shared with sections 1–3)").

@@ -91,6 +91,24 @@ pub enum EditorMode {
     Edit,
 }
 
+/// What `saveFailed` says when a save's value could not be made for the host page (its bytes could
+/// not be allocated or attached there).
+pub const SAVE_NOT_HANDED_OVER: &str = "The document could not be handed to the page.";
+
+/// The value the host page receives for `event`, made by `encode` (the embed crate's JavaScript
+/// object). A save never goes unanswered: when its value cannot be made, the host receives
+/// `SaveFailed` ([`SAVE_NOT_HANDED_OVER`]) instead. Any other event that cannot be made is the
+/// caller's to log; the error of the first attempt is logged here for a save.
+pub fn encode_for_host<V, E: std::fmt::Display>(event: &HostEvent, mut encode: impl FnMut(&HostEvent) -> Result<V, E>) -> Result<V, E> {
+    match encode(event) {
+        Err(error) if matches!(event, HostEvent::SaveRequested { .. }) => {
+            log::error!("embed: a save could not be handed to the page: {error}");
+            encode(&HostEvent::SaveFailed { message: SAVE_NOT_HANDED_OVER.into() })
+        }
+        result => result,
+    }
+}
+
 #[derive(Default)]
 struct Queues {
     commands: VecDeque<HostCommand>,
@@ -267,6 +285,28 @@ mod tests {
             let event = HostEvent::EditRefused { code: code.to_string() };
             assert_eq!(serde_json::to_value(&event).unwrap(), json!({"type": "editRefused", "code": code}));
         }
+    }
+
+    /// A save whose value cannot be made for the page is answered `saveFailed`; other events are
+    /// left to the caller, and a value that can be made is passed through untouched.
+    #[test]
+    fn a_save_that_cannot_be_handed_over_is_answered_save_failed() {
+        let save = HostEvent::SaveRequested { file_name: "a.docx".into(), bytes: vec![1, 2] };
+        let failing_saves = |event: &HostEvent| match event {
+            HostEvent::SaveRequested { .. } => Err("no memory"),
+            other => Ok(other.clone()),
+        };
+        assert_eq!(encode_for_host(&save, failing_saves), Ok(HostEvent::SaveFailed { message: SAVE_NOT_HANDED_OVER.into() }));
+        assert_eq!(encode_for_host(&save, |event: &HostEvent| Ok::<_, &str>(event.clone())), Ok(save.clone()));
+        let page = HostEvent::PageChanged { page: 1 };
+        assert_eq!(encode_for_host(&page, |_: &HostEvent| Err::<HostEvent, _>("broken")), Err("broken"), "only a save is answered another way");
+        let mut attempts = 0;
+        let nothing_works = |_: &HostEvent| {
+            attempts += 1;
+            Err::<HostEvent, _>("broken")
+        };
+        assert_eq!(encode_for_host(&save, nothing_works), Err("broken"));
+        assert_eq!(attempts, 2, "one attempt for the save, one for its saveFailed");
     }
 
     #[test]

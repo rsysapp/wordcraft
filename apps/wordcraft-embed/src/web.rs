@@ -262,29 +262,38 @@ async fn deliver(listener: Listener, events: Vec<HostEvent>) {
         // Read per event and cloned out of the cell before the call: the listener may replace
         // itself or destroy the editor, after which nothing more is delivered.
         let Some(listener) = listener.try_borrow().ok().and_then(|slot| slot.clone()) else { return };
-        let value = match serde_json::to_string(&event).map(|json| js_sys::JSON::parse(&json)) {
-            Ok(Ok(value)) => value,
-            Ok(Err(error)) => {
-                log::error!("embed: an event could not be read back: {error:?}");
-                continue;
-            }
+        // A save that cannot be handed over is answered `saveFailed`: a save never goes unanswered.
+        let value = match host::encode_for_host(&event, event_value) {
+            Ok(value) => value,
             Err(error) => {
-                log::error!("embed: an event could not be encoded: {error}");
+                log::error!("embed: an event could not be delivered: {error}");
                 continue;
             }
         };
-        // A save's bytes travel as a Uint8Array the host owns (a copy outside the module's memory),
-        // not as JSON numbers.
-        if let HostEvent::SaveRequested { bytes, .. } = &event
-            && js_sys::Reflect::set(&value, &JsValue::from_str("bytes"), &js_sys::Uint8Array::from(bytes.as_slice())).is_err()
-        {
-            log::error!("embed: a save's bytes could not be attached");
-            continue;
-        }
         if let Err(error) = listener.call1(&JsValue::NULL, &value) {
             log::warn!("embed: the event listener threw: {error:?}");
         }
     }
+}
+
+/// The event as the object the host's listener receives. A save's bytes travel as a `Uint8Array`
+/// the host owns (a copy outside the module's memory), not as JSON numbers. Every step that can
+/// fail answers `Err`, allocating the array included: it goes through a `catch` import, because a
+/// `RangeError` thrown through Rust frames would skip their cleanup and never reach the caller.
+fn event_value(event: &HostEvent) -> Result<JsValue, String> {
+    let json = serde_json::to_string(event).map_err(|error| format!("an event could not be encoded: {error}"))?;
+    let value = js_sys::JSON::parse(&json).map_err(|error| format!("an event could not be read back: {error:?}"))?;
+    if let HostEvent::SaveRequested { bytes, .. } = event {
+        let length = u32::try_from(bytes.len()).map_err(|_| format!("a save of {} bytes is too large to hand over", bytes.len()))?;
+        let array: js_sys::Uint8Array =
+            OwnedBytes::new(length).map(Into::into).map_err(|error| format!("{length} bytes could not be allocated for a save: {error:?}"))?;
+        // Same length by construction, so `copy_from`'s length check holds; its view of the
+        // module's memory allocates nothing.
+        array.copy_from(bytes);
+        js_sys::Reflect::set(&value, &JsValue::from_str("bytes"), &array)
+            .map_err(|error| format!("a save's bytes could not be attached: {error:?}"))?;
+    }
+    Ok(value)
 }
 
 /// A JavaScript value as JSON, for the bridge's parsers.
@@ -341,6 +350,15 @@ extern "C" {
     /// between, so a memory growth cannot detach the view between the two.
     #[wasm_bindgen(catch, js_namespace = Uint8Array, js_name = "prototype.set.call")]
     fn set_into(target: &mut [u8], source: &js_sys::Uint8Array) -> Result<(), JsValue>;
+
+    /// A `Uint8Array` made by [`OwnedBytes::new`].
+    #[wasm_bindgen(extends = js_sys::Uint8Array, js_name = Uint8Array)]
+    type OwnedBytes;
+
+    /// `new Uint8Array(length)`, answering what it throws (a `RangeError` when the page cannot
+    /// allocate it). js-sys's own constructors do not catch.
+    #[wasm_bindgen(catch, constructor, js_class = "Uint8Array")]
+    fn new(length: u32) -> Result<OwnedBytes, JsValue>;
 }
 
 /// The array's `length`, read once. Through `Reflect::get`, so a subclass's throwing getter is an

@@ -17,7 +17,7 @@ pub mod text_match;
 pub mod view;
 pub mod wire;
 
-pub use bridge::{EditorMode, HostBridge, HostCommand, HostEvent};
+pub use bridge::{EditorMode, HostBridge, HostCommand, HostEvent, encode_for_host};
 #[doc(hidden)]
 pub use profile::EmbedProfile;
 #[doc(hidden)]
