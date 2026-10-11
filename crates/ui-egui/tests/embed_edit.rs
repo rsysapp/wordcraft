@@ -1127,6 +1127,8 @@ fn sends_no_comment_request_for_a_selection_with_nothing_to_quote() {
     // A collapsed caret.
     harness.state_mut().run("review.newComment", json!({ "text": "" })).unwrap();
     harness.run_steps(3);
+    let events = bridge.take_events();
+    assert!(!events.iter().any(|event| matches!(event, HostEvent::CommentRequested { .. })), "a collapsed caret: {events:?}");
     // Only text that is tracked as deleted: the reader sees nothing there to quote.
     harness.state_mut().run("select.all", json!({})).unwrap();
     harness.state_mut().run("text.delete", json!({})).unwrap();
@@ -1137,6 +1139,24 @@ fn sends_no_comment_request_for_a_selection_with_nothing_to_quote() {
     harness.state_mut().run("review.newComment", json!({ "text": "" })).unwrap();
     harness.run_steps(3);
     let events = bridge.take_events();
-    assert!(!events.iter().any(|event| matches!(event, HostEvent::CommentRequested { .. })), "{events:?}");
+    assert!(!events.iter().any(|event| matches!(event, HostEvent::CommentRequested { .. })), "only deleted text: {events:?}");
     assert!(harness.state().session.doc.comments.is_empty());
+}
+
+#[test]
+fn a_save_echoes_the_opened_name_verbatim_and_carries_word_bytes() {
+    let (mut harness, bridge) = common::view_app(Document::from_text(""), 1.0);
+    bridge.send(HostCommand::Open { name: "LEASE.DOCX".into(), bytes: docx("Rent is due monthly.") });
+    harness.run_steps(3);
+    bridge.send(edit(false));
+    harness.run_steps(2);
+    bridge.take_events();
+    bridge.send(HostCommand::RequestSave);
+    harness.run_steps(2);
+    let events = bridge.take_events();
+    let [HostEvent::SaveRequested { file_name, bytes }] = events.as_slice() else { panic!("one save answer: {events:?}") };
+    assert_eq!(file_name, "LEASE.DOCX", "the host's name, case and all");
+    assert!(bytes.starts_with(b"PK"), "a Word package (a zip)");
+    let reopened = wordcraft_engine::io::open_bytes("reopened.docx", bytes).unwrap();
+    assert_eq!(reopened.plain_text(StoryRef::Body), "Rent is due monthly.");
 }
