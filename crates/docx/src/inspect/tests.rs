@@ -2326,3 +2326,36 @@ fn counts_every_hiding_run_property_set_inside_content_compared_whole() {
         assert!(inspection.new_revisions[0].hidden_text >= 1, "{inside}: {inspection:#?}");
     }
 }
+
+/// A story walked on its own, with these tables.
+fn walk_story(body: &str, tables: &mut story::Tables, budget: &mut budget::Budget) -> Vec<story::Item> {
+    let xml = document(body);
+    let mut names = xml::Names::default();
+    let mut limits = xml::Limits { elements_left: INSPECT_LIMITS.max_elements, max_depth: INSPECT_LIMITS.max_depth };
+    let parsed = xml::parse(xml.as_bytes(), &mut names, &mut limits, budget).unwrap();
+    let rels = opc::Rels::default();
+    let (marks, _) = opc::bookmarks(&parsed.root, budget).unwrap();
+    let canon = opc::Canon { rels: &rels, bookmarks: Some(&marks) };
+    let mut revisions = story::Revisions::default();
+    let mut left = MAX_STORY_ITEMS;
+    story::walk(&parsed.root, &canon, tables, &mut revisions, &mut left, parsed.most_items, &story::StyleHiding::default(), budget).unwrap()
+}
+
+/// W1-23 (H2): the tally's entries are charged as the story is compared, while its tokens and edit
+/// script are held, not once the story is done.
+#[test]
+fn charges_the_tally_while_a_story_is_compared() {
+    let mut tables = story::Tables::new();
+    let mut budget = budget::Budget::new(u64::MAX, u64::MAX);
+    let anchors: String = (0..1_000).map(|n| format!(r#"<w:r><w:commentReference w:id="{n:01000}"/></w:r>"#)).collect();
+    let before = walk_story(&para(&format!("{}{anchors}", text("Rent."))), &mut tables, &mut budget);
+    let after = walk_story(&para(&text("Rent.")), &mut tables, &mut budget);
+    tables.charge(&mut budget).unwrap();
+    let (base_ids, removed) = (BTreeSet::new(), BTreeSet::new());
+    let ids = compare::CommentIds { base: &base_ids, removed: &removed };
+    let mut tally = compare::Tally::default();
+    let held = budget.held();
+    assert!(compare::compare_story("word/document.xml", &before, &after, &tables, &ids, MAX_CHANGES, &mut budget, &mut tally));
+    assert_eq!(tally.comments_altered.len(), 1_000);
+    assert!(budget.held() - held >= 1_000 * 1_000, "held {} for 1,000 ids of 1,000 bytes", budget.held() - held);
+}
