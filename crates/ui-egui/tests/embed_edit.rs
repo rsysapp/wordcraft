@@ -837,3 +837,139 @@ fn refuses_another_author_while_the_document_has_unsaved_changes() {
     clean.state_mut().run("text.insert", json!({ "text": "x" })).unwrap();
     assert_eq!(clean.state().session.doc.revisions.last().map(|revision| revision.author.as_str()), Some("Ana Setia"));
 }
+
+// ---- Fix round 3 (Rulings W3-6 to W3-8) ----
+
+fn header_part(doc: &mut Document, text: &str) -> u32 {
+    let para = wordcraft_engine::doc::Paragraph::with_text(text, wordcraft_engine::doc::CharProps::default()).styled("Header");
+    doc.add_part(wordcraft_engine::doc::PartKind::Header, vec![wordcraft_engine::doc::para_block(para)])
+}
+
+fn long_text() -> Document {
+    let mut doc = common::clauses(150);
+    doc.ensure_nonempty();
+    doc
+}
+
+/// Opens `bytes` through the host and starts editing.
+fn editing_file(bytes: Vec<u8>) -> (Harness<'static, WordApp>, HostBridge) {
+    let (mut harness, bridge) = common::view_app(Document::from_text(""), 1.0);
+    bridge.send(HostCommand::Open { name: "lease.docx".into(), bytes });
+    harness.run_steps(3);
+    bridge.send(edit(false));
+    harness.run_steps(2);
+    bridge.take_events();
+    (harness, bridge)
+}
+
+fn caret_story_text(harness: &Harness<'static, WordApp>) -> String {
+    let session = &harness.state().session;
+    session.doc.plain_text(session.sel.focus.story)
+}
+
+// W3-6 and M3: a real double-click into page 1's header enters the first-page header the page shows,
+// not the section's default one; page 2 of the same section enters the default.
+#[test]
+fn double_clicking_page_one_s_header_enters_its_first_page_header() {
+    let mut doc = long_text();
+    let default = header_part(&mut doc, "Default letterhead");
+    let first = header_part(&mut doc, "First letterhead");
+    doc.last_section.headers.default = Some(default);
+    doc.last_section.headers.first = Some(first);
+    doc.last_section.title_page = true;
+    let (mut harness, bridge) = editing_file(wordcraft_engine::io::save_bytes("lease.docx", &doc).unwrap());
+    focus_canvas(&mut harness);
+    let page = harness.state().canvas.page_rects.first().copied().unwrap();
+    common::double_click(&mut harness, egui::pos2(page.center().x, page.min.y + 20.0));
+    assert!(matches!(harness.state().session.sel.focus.story, StoryRef::Part(_)), "the double-click entered a header");
+    assert!(caret_story_text(&harness).contains("First letterhead"), "{:?}", caret_story_text(&harness));
+    harness.key_press(egui::Key::Escape);
+    harness.run_steps(2);
+    harness.state_mut().run("insert.editHeader", json!({ "page": 1 })).unwrap();
+    assert!(caret_story_text(&harness).contains("Default letterhead"), "{:?}", caret_story_text(&harness));
+    assert_eq!(refusals(&bridge.take_events()), 0);
+}
+
+/// Two sections, a header defined in the first only: the second inherits it.
+fn inherited_header_file() -> Vec<u8> {
+    let mut session = wordcraft_engine::Session::new(long_text());
+    session.run("select.text", &json!({ "text": "Clause 60." })).unwrap();
+    session.run("select.collapse", &json!({})).unwrap();
+    session.run("layout.break", &json!({ "kind": "nextPage" })).unwrap();
+    session.run("caret.docStart", &json!({})).unwrap();
+    session.run("insert.header", &json!({ "text": "Lease of the warehouse" })).unwrap();
+    session.run("insert.closeHeader", &json!({})).unwrap();
+    wordcraft_engine::io::save_bytes("lease.docx", &session.doc).unwrap()
+}
+
+// W3-6: typing into the header a later section inherits edits the shared part, tracked, and the
+// strip says it is shared; the save passes W1's inspector with the author's date only.
+#[test]
+fn typing_in_an_inherited_header_through_the_host_passes_the_save_inspector() {
+    use wordcraft_docx::inspect::{Resolved, inspect};
+
+    let base = inherited_header_file();
+    let (mut harness, bridge) = editing_file(base.clone());
+    focus_canvas(&mut harness);
+    let last = harness.state_mut().session.layout().pages.len() - 1;
+    assert_eq!(harness.state_mut().session.layout().pages[last].section, 1, "the last page is the second section's");
+    harness.state_mut().run("insert.editHeader", json!({ "page": last })).unwrap();
+    harness.run_steps(3);
+    assert!(caret_story_text(&harness).contains("Lease of the warehouse"));
+    assert!(harness.query_by_label("Header (shared with sections 1–2)").is_some(), "the strip says the header is shared");
+    harness.event(egui::Event::Text(" draft".into()));
+    harness.run_steps(2);
+    assert!(caret_story_text(&harness).contains("warehouse draft"));
+    bridge.take_events();
+    bridge.send(HostCommand::RequestSave);
+    harness.run_steps(2);
+    let bytes = bridge
+        .take_events()
+        .into_iter()
+        .find_map(|event| match event {
+            HostEvent::SaveRequested { bytes, .. } => Some(bytes),
+            _ => None,
+        })
+        .expect("a save answer");
+    let inspection = inspect(&base, &bytes).unwrap();
+    assert_eq!((inspection.untracked_changes, inspection.altered_revisions), (0, 0), "{inspection:#?}");
+    assert!(inspection.losses.is_empty() && !inspection.too_many_changes, "{inspection:#?}");
+    assert!(
+        inspection.added_parts.is_empty() && inspection.changed_relationships.is_empty() && inspection.content_types.is_empty(),
+        "{inspection:#?}"
+    );
+    assert_eq!(inspection.resolved, Resolved::default());
+    assert_eq!(inspection.new_revisions.len(), 1, "{inspection:#?}");
+    let revisions = &inspection.new_revisions[0];
+    assert_eq!((revisions.author.as_str(), revisions.insertions), (AUTHOR, 1), "{inspection:#?}");
+    assert_eq!((revisions.earliest_date.as_deref(), revisions.latest_date.as_deref(), revisions.undated), (Some(DATE), Some(DATE), 0));
+}
+
+// W3-8: each save is answered from the state at its own request.
+#[test]
+fn answers_each_save_from_the_state_at_its_own_request() {
+    let (mut harness, bridge) = opened();
+    bridge.send(HostCommand::RequestSave);
+    bridge.send(edit(false));
+    bridge.send(HostCommand::RequestSave);
+    harness.run_steps(2);
+    let events = bridge.take_events();
+    assert!(matches!(events.first(), Some(HostEvent::SaveFailed { .. })), "{events:?}");
+    assert_eq!(events.get(1), Some(&HostEvent::ModeChanged { mode: EditorMode::Edit }), "{events:?}");
+    assert!(matches!(events.get(2), Some(HostEvent::SaveRequested { .. })), "{events:?}");
+}
+
+// W3-7: Accept with nothing to accept, or an empty paste, changes nothing: the host hears nothing.
+#[test]
+fn a_command_that_changes_nothing_tells_the_host_nothing() {
+    let (mut harness, bridge) = editing(true);
+    focus_canvas(&mut harness);
+    bridge.take_events();
+    harness.state_mut().run("review.accept", json!({})).unwrap();
+    harness.state_mut().run("review.acceptAll", json!({})).unwrap();
+    harness.event(egui::Event::Paste(String::new()));
+    harness.run_steps(3);
+    assert!(bridge.take_events().is_empty());
+    assert!(harness.state().session.doc.revisions.is_empty());
+    assert!(!harness.state().session.can_undo());
+}

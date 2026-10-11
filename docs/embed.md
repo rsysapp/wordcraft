@@ -297,9 +297,14 @@ The engine does not keep one date per save by itself: the host bridge refuses an
 the document has unsaved changes (below). Only `begin_edit` names the session's author: `Session::author` is
 put back to it before every command of the session, whatever wrote it since. In a session, `Session::run` runs only `wordcraft_engine::edit_mode`'s
 allow-list: typing, deleting, line breaks, nonbreaking spaces and hyphens, Tab as a tracked tab
-character, cut, paste as plain text, undo, redo, moving between changes, and going into a header or
-footer the document already has and back (making a new one is refused); accepting and rejecting
-only with the permission to decide. Every change is a tracked change by the session's author,
+character, cut, paste as plain text, undo, redo, moving between changes, and going into the header or footer
+a page shows and back (making a new one is refused); accepting and rejecting only with the
+permission to decide. The part entered is the one the page shows, as Word renders it: the
+first-page part on a section's title page, the even part on even pages when odd and even differ,
+and a part inherited from an earlier section when the page's own section has none. Editing an
+inherited part edits every section that shows it (Word's "link to previous"). A command that
+changes nothing (Accept with nothing to accept, an empty paste) leaves no revision record, no undo
+step and the content version as it was. Every change is a tracked change by the session's author,
 dated with its date. A change counts as the session's own only when the session made its revision
 record, whatever a file revision's author or date. Deleting the session's own insertion removes
 it, deleting anything else marks it deleted, and accepting leaves the session's own changes
@@ -346,10 +351,16 @@ with `view`. Every open, a refused one included, ends edit mode first.
   contract: saving never clears dirty). The next `opened` starts clean, without a `dirtyChanged`, so
   a host resets its own dirty state on `opened`; a host that keeps a saved file opens it again.
 - **Saves** are answered when asked: `requestSave` and Ctrl/Cmd+S serialise the document then, before
-  a later command of the same frame (an open, a mode change). Two in one frame for the same document
+  a later command of the same frame (an open, a mode change), each from the state at its own
+  request: a save asked in view mode answers `saveFailed` even when a later one in the same frame,
+  after `setMode`, answers `saveRequested`. Two in one frame for the same document in the same mode
   answer once.
 - **The edit strip** follows the zoom controls, and wraps onto a second row of the view bar when the
-  bar is too narrow for it and the find controls.
+  bar is too narrow for it and the find controls. While the caret is in a header or footer several
+  sections show, it says so ("Header (shared with sections 1–3)").
+- **Headers and footers** are entered by double-clicking them, on the page clicked
+  (`insert.editHeader` and `insert.editFooter` take `{ "page": <0-based index> }`, else the caret's
+  page), and left with Escape or a double-click in the text.
 
 **Known limitation: new paragraphs.** API 0.2 lists new paragraphs among edit mode's edits, but
 Enter is not available in edit mode yet, and pasted text with paragraph breaks is refused. The

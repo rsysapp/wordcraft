@@ -104,7 +104,7 @@ pub struct HostState {
     /// This frame (`Context::cumulative_frame_nr`), and the frame and document revision a save last
     /// answered: two requests in one frame for the same document answer once.
     pub(crate) frame: u64,
-    pub(crate) last_save: Option<(u64, u64)>,
+    pub(crate) last_save: Option<(u64, u64, bool)>,
     /// Rows of the view bar while editing: the edit strip goes on a second row when one is too narrow.
     pub(crate) bar_rows: u8,
 }

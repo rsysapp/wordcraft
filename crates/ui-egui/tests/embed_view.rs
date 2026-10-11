@@ -327,7 +327,20 @@ fn copy_still_copies_the_selection() {
 
 #[test]
 fn double_click_in_the_header_does_not_start_header_editing() {
-    let (mut h, _bridge) = view_app(clauses(5), 1.0);
+    // A header to double-click into.
+    let mut with_header = wordcraft_engine::Session::new(clauses(5));
+    with_header.run("insert.header", &json!({ "text": "Lease of the warehouse" })).expect("a header");
+    with_header.run("insert.closeHeader", &json!({})).expect("back to the text");
+    let doc = with_header.doc;
+    // Control: the same double-click in the full application edits the header, so the helper does
+    // double-click.
+    let mut full = full_app(doc.clone());
+    frames(&mut full, 3);
+    let page = full.state().canvas.page_rects.first().copied().expect("a page");
+    double_click(&mut full, egui::pos2(page.center().x, page.min.y + 20.0));
+    assert!(matches!(full.state().session.sel.focus.story, StoryRef::Part(_)), "no double-click reached the app, so this proves nothing");
+
+    let (mut h, _bridge) = view_app(doc, 1.0);
     let before = doc_json(&h);
     let page = h.state().canvas.page_rects.first().copied().expect("a page");
     double_click(&mut h, egui::pos2(page.center().x, page.min.y + 20.0));

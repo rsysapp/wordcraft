@@ -547,7 +547,9 @@ fn mouse(app: &mut WordApp, ui: &Ui, resp: &egui::Response, rects: &[Rect], layo
             && story == StoryRef::Body
         {
             let id = if header { "insert.editHeader" } else { "insert.editFooter" };
-            let _ = app.run(id, json!({}));
+            // embed: the page clicked, so an edit session enters the part that page shows (first-page,
+            // even-page or inherited); the full application's command takes no parameters.
+            let _ = app.run(id, json!({ "page": page }));
             let _ = s;
             if let Some(pos) = app.session.layout().hit(page, x, y, app.session.sel.focus.story) {
                 app.session.sel = wordcraft_engine::Selection::caret(pos);

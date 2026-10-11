@@ -224,11 +224,11 @@ pub(crate) fn after_frame(app: &mut WordApp, host: &mut HostState, ctx: &egui::C
     }
 }
 
-/// Answer a save with the document as it is at the request: a later command of the same frame (an
-/// open, a mode change) must not change what this save holds. Two requests in one frame for the
-/// same document answer once.
+/// Answer a save with the document and the mode as they are at the request: a later command of the
+/// same frame (an open, a mode change) must not change what this save holds. Two requests in one
+/// frame for the same document in the same mode answer once; any other is answered on its own.
 pub(crate) fn save(app: &mut WordApp, host: &mut HostState) {
-    let request = (host.frame, app.session.rev());
+    let request = (host.frame, app.session.rev(), host.edit.is_some());
     if host.last_save == Some(request) {
         return;
     }
@@ -278,12 +278,49 @@ fn strip_permissions(app: &WordApp) -> Option<PermissionsSpec> {
     app.host.as_ref().and_then(|host| host.edit.as_ref()).map(|edit| edit.permissions)
 }
 
+/// Sections as the person counts them (1-based), runs joined: `[1, 2, 3, 5]` is "2–4, 6".
+fn section_list(sections: &[usize]) -> String {
+    let mut runs: Vec<(usize, usize)> = Vec::new();
+    for &section in sections {
+        match runs.last_mut() {
+            Some((_, end)) if end.checked_add(1) == Some(section) => *end = section,
+            _ => runs.push((section, section)),
+        }
+    }
+    let number = |section: usize| section.saturating_add(1);
+    runs.iter()
+        .map(|(start, end)| if start == end { number(*start).to_string() } else { format!("{}–{}", number(*start), number(*end)) })
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+/// While the caret is in a header or footer that several sections show (later ones inherit it),
+/// editing it edits them all: the strip says so, "Header (shared with sections 1–3)".
+fn shared_part_label(app: &mut WordApp) -> Option<String> {
+    let wordcraft_engine::doc::StoryRef::Part(id) = app.session.sel.focus.story else { return None };
+    let name = match app.session.doc.parts.get(&id)?.kind {
+        wordcraft_engine::doc::PartKind::Header => "Header",
+        wordcraft_engine::doc::PartKind::Footer => "Footer",
+        _ => return None,
+    };
+    let sections = edit_mode::sections_showing(&app.session.layout(), id);
+    (sections.len() > 1).then(|| format!("{name} (shared with sections {})", section_list(&sections)))
+}
+
+fn part_label_text(text: String) -> egui::RichText {
+    egui::RichText::new(text).font(regular(12.0))
+}
+
 /// The width the strip takes in `ui`, separators included (0 outside edit mode).
-pub(crate) fn strip_width(app: &WordApp, ui: &Ui) -> f32 {
+pub(crate) fn strip_width(app: &mut WordApp, ui: &Ui) -> f32 {
     let Some(permissions) = strip_permissions(app) else { return 0.0 };
+    let label = shared_part_label(app);
     let spacing = ui.spacing();
     let font = egui::TextStyle::Button.resolve(ui.style());
-    let mut width = 0.0;
+    let mut width = match label {
+        Some(text) => ui.painter().layout_no_wrap(text, regular(12.0), egui::Color32::PLACEHOLDER).size().x + spacing.item_spacing.x,
+        None => 0.0,
+    };
     for group in strip_groups(permissions.accept_reject_changes) {
         // A separator: its own spacing and the item spacing on both sides.
         width += 6.0 + spacing.item_spacing.x * 2.0;
@@ -300,8 +337,14 @@ pub(crate) fn strip_width(app: &WordApp, ui: &Ui) -> f32 {
 pub(crate) fn strip(app: &mut WordApp, ui: &mut Ui, leading: bool) {
     let Some(permissions) = strip_permissions(app) else { return };
     let (can_undo, can_redo) = (app.session.can_undo(), app.session.can_redo());
+    if leading {
+        ui.separator();
+    }
+    if let Some(text) = shared_part_label(app) {
+        ui.label(part_label_text(text));
+    }
     for (index, group) in strip_groups(permissions.accept_reject_changes).into_iter().enumerate() {
-        if leading || index > 0 {
+        if index > 0 {
             ui.separator();
         }
         for (label, command) in group {
@@ -361,4 +404,15 @@ pub(crate) fn notice(app: &mut WordApp, ctx: &egui::Context) {
                 ui.label(egui::RichText::new(notice_text(refusal)).font(regular(12.0)).color(t.text));
             });
     });
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn section_lists_are_one_based_and_join_runs() {
+        assert_eq!(super::section_list(&[0, 1]), "1–2");
+        assert_eq!(super::section_list(&[1, 2, 3, 5]), "2–4, 6");
+        assert_eq!(super::section_list(&[0, 2]), "1, 3");
+        assert_eq!(super::section_list(&[usize::MAX]), usize::MAX.to_string());
+    }
 }

@@ -120,12 +120,17 @@ pub fn click(h: &mut Harness<'_, WordApp>, at: egui::Pos2, button: egui::Pointer
     frames(h, 4);
 }
 
+/// A real double-click at `at`. kittest runs one frame per queued event, a quarter second apart,
+/// so two queued clicks are further apart than egui's double-click delay; both clicks go into one
+/// frame's input instead.
 pub fn double_click(h: &mut Harness<'_, WordApp>, at: egui::Pos2) {
     h.event(egui::Event::PointerMoved(at));
+    h.step();
     for _ in 0..2 {
-        h.event(press(at, egui::PointerButton::Primary));
-        h.event(release(at, egui::PointerButton::Primary));
+        h.input_mut().events.push(press(at, egui::PointerButton::Primary));
+        h.input_mut().events.push(release(at, egui::PointerButton::Primary));
     }
+    h.step();
     frames(h, 4);
 }
 
