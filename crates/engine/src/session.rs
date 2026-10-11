@@ -154,6 +154,10 @@ pub struct Session {
     pub ui_requests: Vec<Value>,
     /// embed: a view-only session runs only `crate::view_only::COMMANDS`.
     pub view_only: bool,
+    /// embed: an edit session runs only `crate::edit_mode` commands.
+    pub edit_rules: Option<crate::edit_mode::EditRules>,
+    /// embed: the date the host gives this edit session's tracked changes, instead of the clock.
+    pub revision_date: Option<String>,
 }
 
 /// Maximum undo depth.
@@ -197,6 +201,8 @@ impl Session {
             merge: Default::default(),
             ui_requests: Vec::new(),
             view_only: false,
+            edit_rules: None,
+            revision_date: None,
         }
     }
 
@@ -326,6 +332,20 @@ impl Session {
         // embed: a view-only session refuses every edit path, not just the ones marked as mutating.
         if self.view_only && !crate::view_only::allows(id) {
             return Err(CmdError::Disabled(crate::view_only::refusal(id)));
+        }
+        // embed: an edit session refuses every command that would not be a tracked change. Tab types
+        // a tab character there, never the cell, row, list-level or indent moves `text.tab` makes in
+        // the full application (embed API "Keyboard in edit mode").
+        if let Some(rules) = self.edit_rules {
+            // Tracking is on for the whole session, whatever the document's own setting, so no
+            // allowed command can make an untracked change (embed API 0.2, "WordCraft tracks every change").
+            self.doc.settings.track_changes = true;
+            if id == crate::edit_mode::TAB {
+                return self.run("text.insert", &crate::edit_mode::tab_params());
+            }
+            if !crate::edit_mode::allows(id, rules) {
+                return Err(CmdError::Disabled(crate::edit_mode::refusal(id)));
+            }
         }
         if let Some(why) = (spec.enabled)(self) {
             return Err(CmdError::Disabled(format!("{id}: {why}")));

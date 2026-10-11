@@ -50,6 +50,10 @@ fn insert(s: &mut Session, v: &Value) -> CmdResult {
     let raw = p::bool(v, "raw").unwrap_or(false);
     let t = if raw { None } else { autoformat(s, text) };
     type_text(s, t.as_deref().unwrap_or(text))?;
+    // embed: AutoCorrect and AutoFormat rewrite text already there and set list numbering, none of
+    // it tracked; an edit session types only what was typed (smart quotes replace the typed
+    // character itself, so they stay).
+    let raw = raw || s.edit_rules.is_some();
     if !raw && text.chars().count() == 1 && text.chars().all(|c| c == ' ' || ",.;:!?".contains(c)) {
         super::tools::autocorrect(s)?;
     }
@@ -210,13 +214,16 @@ fn backspace(s: &mut Session, _: &Value) -> CmdResult {
         return sel_result(s);
     }
     // At the start of a paragraph.
-    if para.props.numbering.is_some_and(|n| n.num != 0) {
+    // embed: an edit session never changes the numbering or indent here (untracked formatting);
+    // with tracking on, Backspace moves into the paragraph before.
+    let editing = s.edit_rules.is_some();
+    if !editing && para.props.numbering.is_some_and(|n| n.num != 0) {
         let p = s.doc.para_mut(f.story, &f.path)?;
         p.props.numbering = Some(NumRef { num: 0, level: 0 });
         p.touch();
         return sel_result(s);
     }
-    if para.props.indent_first.is_some_and(|x| x > 0.0) {
+    if !editing && para.props.indent_first.is_some_and(|x| x > 0.0) {
         let p = s.doc.para_mut(f.story, &f.path)?;
         p.props.indent_first = Some(0.0);
         p.touch();
@@ -243,7 +250,8 @@ fn backspace(s: &mut Session, _: &Value) -> CmdResult {
             let last = s.doc.para_paths(f.story).into_iter().rfind(|q| q.0.first() == prev_path.0.first() && q.0.len() > 1);
             if let Some(q) = last {
                 let off = s.doc.para(f.story, &q).map(|x| x.len()).unwrap_or(0);
-                if s.doc.para_at(&f).is_some_and(|x| x.is_empty()) && s.doc.container(f.story, &f.path).is_some_and(|c| c.len() > i + 1) {
+                // embed: an edit session never removes a paragraph (an untracked change).
+                if !editing && s.doc.para_at(&f).is_some_and(|x| x.is_empty()) && s.doc.container(f.story, &f.path).is_some_and(|c| c.len() > i + 1) {
                     s.doc.remove_block(f.story, &f.path)?;
                 }
                 s.sel = Selection::caret(Pos { story: f.story, path: q, off });
@@ -280,7 +288,8 @@ fn delete(s: &mut Session, _: &Value) -> CmdResult {
         s.sel = Selection::caret(at);
     } else if let Some(Block::Table(_)) = s.doc.block(f.story, &next) {
         // An empty paragraph before a table is removed; else nothing.
-        if para.is_empty() && f.path.last() > 0 {
+        // embed: not in an edit session, where removing a paragraph would be an untracked change.
+        if s.edit_rules.is_none() && para.is_empty() && f.path.last() > 0 {
             s.doc.remove_block(f.story, &f.path)?;
             let mut path = next.0.clone();
             if let Some(l) = path.last_mut() {

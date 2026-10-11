@@ -244,10 +244,25 @@ fn nav_comment(s: &mut Session, dir: i32) -> CmdResult {
 
 /// Accept or reject a revision range in one paragraph.
 fn resolve_para(s: &mut Session, story: StoryRef, path: &wordcraft_doc::Path, from: usize, to: usize, accept: bool) -> Result<(), CmdError> {
+    // embed: accepting in an edit session decides the changes on record only. This session's own
+    // stay tracked: accepted, they would be plain text the host cannot tell from an untracked edit.
+    // Rejecting them is undoing them, which leaves nothing to tell.
+    let own: Vec<u32> = match (&s.revision_date, s.edit_rules) {
+        (Some(date), Some(_)) if accept => s
+            .doc
+            .revisions
+            .iter()
+            .enumerate()
+            .filter(|(_, revision)| revision.author == s.author && &revision.date == date)
+            .filter_map(|(index, _)| u32::try_from(index).ok())
+            .collect(),
+        _ => Vec::new(),
+    };
     let para = s.doc.para_mut(story, path)?;
     let ranges: Vec<(usize, usize, bool, bool)> = para
         .run_ranges()
         .filter(|(r, _)| r.end > from && r.start < to)
+        .filter(|(_, c)| ![c.ins, c.del].into_iter().flatten().any(|revision| own.contains(&revision)))
         .map(|(r, c)| (r.start.max(from), r.end.min(to), c.ins.is_some(), c.del.is_some()))
         .collect();
     for (a, b, ins, del) in ranges.into_iter().rev() {
@@ -274,7 +289,10 @@ fn resolve_all(s: &mut Session, accept: bool) -> CmdResult {
             resolve_para(s, st, &path, 0, len, accept)?;
         }
     }
-    s.doc.revisions.clear();
+    // embed: an edit session's own changes can stay tracked (`resolve_para`), so their records stay.
+    if s.edit_rules.is_none() {
+        s.doc.revisions.clear();
+    }
     s.clamp_selection();
     sel_result(s)
 }

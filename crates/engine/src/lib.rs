@@ -14,6 +14,8 @@ pub mod sample;
 mod session;
 // embed: view-only sessions for the embed build.
 pub mod view_only;
+// embed: the commands an edit session of the embed build runs.
+pub mod edit_mode;
 
 use std::collections::HashMap;
 
