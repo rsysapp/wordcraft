@@ -311,7 +311,10 @@ fn push_text(stack: &mut [XEl], text: &str) -> Result<(), String> {
     Ok(())
 }
 
-fn close(stack: &mut [XEl], root: &mut Option<XEl>, element: XEl) {
+fn close(stack: &mut [XEl], root: &mut Option<XEl>, mut element: XEl) {
+    // A vector's first growth leaves room for four; most elements hold one child or none.
+    element.kids.shrink_to_fit();
+    element.attrs.shrink_to_fit();
     match stack.last_mut() {
         Some(parent) => parent.kids.push(XNode::El(element)),
         None => *root = Some(element),

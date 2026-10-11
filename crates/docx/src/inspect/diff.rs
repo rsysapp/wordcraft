@@ -1,6 +1,17 @@
 //! embed: Myers' shortest edit script, bounded by edits and by work.
 
-/// One step of an edit script: an element of both sides, or of one only.
+/// One step of an edit script: a run of elements both sides share (`len` of them from `left` and
+/// `right`), or an element of one side only. Runs keep a script's memory with its edits, not with
+/// the length of what matched.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum Step {
+    Same { left: usize, right: usize, len: usize },
+    Delete(usize),
+    Insert(usize),
+}
+
+/// One step with runs taken apart, for tests.
+#[cfg(test)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum Op {
     Same(usize, usize),
@@ -39,7 +50,7 @@ impl Work {
 /// insertions and deletions, or more work than is left. The common prefix and suffix are matched
 /// first, then Myers' greedy search runs on the rest: memory grows with the square of the edits,
 /// never with the length.
-pub(super) fn script(n: usize, m: usize, same: &dyn Fn(usize, usize) -> bool, max_changes: usize, work: &mut Work) -> Option<Vec<Op>> {
+pub(super) fn script(n: usize, m: usize, same: &dyn Fn(usize, usize) -> bool, max_changes: usize, work: &mut Work) -> Option<Vec<Step>> {
     // The suffix first: where a resolved change's edge is a white space either side could own,
     // the later one keeps it, which reads a deletion rejected before its text as one change.
     let mut suffix = 0;
@@ -58,15 +69,19 @@ pub(super) fn script(n: usize, m: usize, same: &dyn Fn(usize, usize) -> bool, ma
     }
     let (inner_n, inner_m) = (n - prefix - suffix, m - prefix - suffix);
     let inner = myers(inner_n, inner_m, &|i, j| same(prefix + i, prefix + j), max_changes, work)?;
-    let mut ops = Vec::with_capacity(prefix + suffix + inner.len());
-    ops.extend((0..prefix).map(|i| Op::Same(i, i)));
-    ops.extend(inner.into_iter().map(|op| match op {
-        Op::Same(i, j) => Op::Same(prefix + i, prefix + j),
-        Op::Delete(i) => Op::Delete(prefix + i),
-        Op::Insert(j) => Op::Insert(prefix + j),
+    let mut steps = Vec::with_capacity(inner.len() + 2);
+    if prefix > 0 {
+        steps.push(Step::Same { left: 0, right: 0, len: prefix });
+    }
+    steps.extend(inner.into_iter().map(|step| match step {
+        Step::Same { left, right, len } => Step::Same { left: prefix + left, right: prefix + right, len },
+        Step::Delete(i) => Step::Delete(prefix + i),
+        Step::Insert(j) => Step::Insert(prefix + j),
     }));
-    ops.extend((0..suffix).map(|k| Op::Same(n - suffix + k, m - suffix + k)));
-    Some(ops)
+    if suffix > 0 {
+        steps.push(Step::Same { left: n - suffix, right: m - suffix, len: suffix });
+    }
+    Some(steps)
 }
 
 /// A position no path reached.
@@ -96,7 +111,7 @@ fn entry(previous: &[i64], d: i64, k: i64, n: i64, m: i64) -> Option<(bool, i64)
     }
 }
 
-fn myers(n: usize, m: usize, same: &dyn Fn(usize, usize) -> bool, max_changes: usize, work: &mut Work) -> Option<Vec<Op>> {
+fn myers(n: usize, m: usize, same: &dyn Fn(usize, usize) -> bool, max_changes: usize, work: &mut Work) -> Option<Vec<Step>> {
     let (n, m) = (i64::try_from(n).ok()?, i64::try_from(m).ok()?);
     let limit = i64::try_from(max_changes).ok()?;
     // trace[d][k + d]: the furthest x on diagonal k after d edits.
@@ -133,8 +148,11 @@ fn myers(n: usize, m: usize, same: &dyn Fn(usize, usize) -> bool, max_changes: u
     None
 }
 
-fn backtrack(trace: &[Vec<i64>], n: i64, m: i64) -> Option<Vec<Op>> {
-    let mut ops = Vec::new();
+fn backtrack(trace: &[Vec<i64>], n: i64, m: i64) -> Option<Vec<Step>> {
+    let mut steps = Vec::new();
+    let run = |x: i64, y: i64, len: i64| -> Option<Option<Step>> {
+        Some((len > 0).then_some(Step::Same { left: usize::try_from(x).ok()?, right: usize::try_from(y).ok()?, len: usize::try_from(len).ok()? }))
+    };
     let (mut x, mut y) = (n, m);
     for d in (1..trace.len()).rev() {
         let d_signed = i64::try_from(d).ok()?;
@@ -146,33 +164,36 @@ fn backtrack(trace: &[Vec<i64>], n: i64, m: i64) -> Option<Vec<Op>> {
         if x < edit_x || y < edit_y || x - edit_x != y - edit_y {
             return None;
         }
-        while x > edit_x {
-            x -= 1;
-            y -= 1;
-            ops.push(Op::Same(usize::try_from(x).ok()?, usize::try_from(y).ok()?));
-        }
+        steps.extend(run(edit_x, edit_y, x - edit_x)?);
+        (x, y) = (edit_x, edit_y);
         if down {
             y -= 1;
-            ops.push(Op::Insert(usize::try_from(y).ok()?));
+            steps.push(Step::Insert(usize::try_from(y).ok()?));
         } else {
             x -= 1;
-            ops.push(Op::Delete(usize::try_from(x).ok()?));
+            steps.push(Step::Delete(usize::try_from(x).ok()?));
         }
     }
     if x != y || x < 0 {
         return None;
     }
-    while x > 0 {
-        x -= 1;
-        y -= 1;
-        ops.push(Op::Same(usize::try_from(x).ok()?, usize::try_from(y).ok()?));
-    }
-    ops.reverse();
-    Some(ops)
+    steps.extend(run(0, 0, x)?);
+    steps.reverse();
+    Some(steps)
 }
 
 /// Test helper: the script between two slices, with unbounded work.
 #[cfg(test)]
 pub(super) fn diff<T: PartialEq>(a: &[T], b: &[T], max_changes: usize) -> Option<Vec<Op>> {
-    script(a.len(), b.len(), &|i, j| a.get(i) == b.get(j), max_changes, &mut Work::new(u64::MAX))
+    let steps = script(a.len(), b.len(), &|i, j| a.get(i) == b.get(j), max_changes, &mut Work::new(u64::MAX))?;
+    Some(
+        steps
+            .into_iter()
+            .flat_map(|step| match step {
+                Step::Same { left, right, len } => (0..len).map(|k| Op::Same(left + k, right + k)).collect::<Vec<_>>(),
+                Step::Delete(i) => vec![Op::Delete(i)],
+                Step::Insert(j) => vec![Op::Insert(j)],
+            })
+            .collect(),
+    )
 }

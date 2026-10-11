@@ -7,7 +7,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::hash::{BuildHasher, Hasher};
 
 use super::LossKind;
-use super::diff::{Op, Work, script};
+use super::diff::{Step, Work, script};
 use super::story::{FormatRev, Item, MARK_BASE, Tables, Wrap};
 
 /// The edited story with this save's own changes undone: its insertions dropped, its deletions and
@@ -318,7 +318,7 @@ pub(super) fn compare_story(
         (Some(a), Some(b)) => a.hash == b.hash && pieces(base, a) == pieces(edited, b),
         _ => false,
     };
-    let Some(ops) = script(base_tokens.len(), edited_tokens.len(), &same_token, max_changes, work) else { return false };
+    let Some(steps) = script(base_tokens.len(), edited_tokens.len(), &same_token, max_changes, work) else { return false };
     // Runs of deleted and inserted tokens between matched ones, compared character by character.
     let mut deleted: Option<(usize, usize)> = None;
     let mut inserted: Option<(usize, usize)> = None;
@@ -328,10 +328,10 @@ pub(super) fn compare_story(
             None => (0, 0),
         }
     };
-    for op in ops.into_iter().map(Some).chain(std::iter::once(None)) {
-        match op {
-            Some(Op::Delete(index)) => deleted = Some(deleted.map_or((index, index), |(first, _)| (first, index))),
-            Some(Op::Insert(index)) => inserted = Some(inserted.map_or((index, index), |(first, _)| (first, index))),
+    for step in steps.into_iter().map(Some).chain(std::iter::once(None)) {
+        match step {
+            Some(Step::Delete(index)) => deleted = Some(deleted.map_or((index, index), |(first, _)| (first, index))),
+            Some(Step::Insert(index)) => inserted = Some(inserted.map_or((index, index), |(first, _)| (first, index))),
             other => {
                 let (from, to) = item_range(&base_tokens, deleted.take());
                 let (edited_from, edited_to) = item_range(&edited_tokens, inserted.take());
@@ -344,11 +344,11 @@ pub(super) fn compare_story(
                 ) {
                     return false;
                 }
-                if let Some(Op::Same(left, right)) = other {
-                    let (Some(before), Some(after)) = (base_tokens.get(left), edited_tokens.get(right)) else { return false };
-                    for (old, new) in pieces(base, before).iter().zip(pieces(edited, after)) {
-                        story.same(old, new);
-                    }
+                // Matched words are equal whole, changes and formatting included: nothing to tally.
+                if let Some(Step::Same { left, right, len }) = other
+                    && (base_tokens.get(left..left.saturating_add(len)).is_none() || edited_tokens.get(right..right.saturating_add(len)).is_none())
+                {
+                    return false;
                 }
             }
         }
@@ -361,23 +361,24 @@ fn compare_stretch(base: &[Item], edited: &[Item], max_changes: usize, work: &mu
         return true;
     }
     let same = |i: usize, j: usize| matches!((base.get(i), edited.get(j)), (Some(a), Some(b)) if a.piece == b.piece);
-    let Some(ops) = script(base.len(), edited.len(), &same, max_changes, work) else { return false };
-    for op in ops {
-        match op {
-            Op::Same(left, right) => {
-                if let (Some(before), Some(after)) = (base.get(left), edited.get(right)) {
-                    story.same(before, after);
+    let Some(steps) = script(base.len(), edited.len(), &same, max_changes, work) else { return false };
+    for step in steps {
+        match step {
+            Step::Same { left, right, len } => {
+                let (Some(before), Some(after)) = (base.get(left..left.saturating_add(len)), edited.get(right..right.saturating_add(len))) else {
+                    return false;
+                };
+                for (old, new) in before.iter().zip(after) {
+                    story.same(old, new);
                 }
             }
-            Op::Delete(left) => {
-                if let Some(before) = base.get(left) {
-                    story.deleted(before);
-                }
+            Step::Delete(left) => {
+                let Some(before) = base.get(left) else { return false };
+                story.deleted(before);
             }
-            Op::Insert(right) => {
-                if let Some(after) = edited.get(right) {
-                    story.inserted(after);
-                }
+            Step::Insert(right) => {
+                let Some(after) = edited.get(right) else { return false };
+                story.inserted(after);
             }
         }
     }
