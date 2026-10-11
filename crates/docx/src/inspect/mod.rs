@@ -142,10 +142,12 @@ pub struct Resolved {
     pub rejected: u32,
 }
 
+/// Something of the base the save does not keep as it was.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Loss {
     /// The part's name in the package.
     pub part: String,
+    /// What was lost.
     pub kind: LossKind,
     /// For [`LossKind::ElementMissing`], the element (`w:bookmarkStart`, `w:p`, `w:tbl`…).
     pub element: Option<String>,
@@ -153,6 +155,7 @@ pub struct Loss {
     pub count: u32,
 }
 
+/// What kind of thing a [`Loss`] lost.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum LossKind {
     /// A part of the base the save does not have.
@@ -166,6 +169,7 @@ pub enum LossKind {
 /// A part the save added.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AddedPart {
+    /// The part's name in the package.
     pub part: String,
     /// The content type `[Content_Types].xml` gives it, if any.
     pub content_type: Option<String>,
@@ -198,8 +202,11 @@ pub struct RelationshipChange {
 /// A part whose content type changed.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ContentTypeChange {
+    /// The part's name in the package.
     pub part: String,
+    /// The content type the base gives it, if any.
     pub base: Option<String>,
+    /// The content type the save gives it, if any.
     pub edited: Option<String>,
 }
 
@@ -222,6 +229,7 @@ pub struct CommentChanges {
 pub struct AuthorCount {
     /// `w:author` as written; an empty string when the comment names none.
     pub author: String,
+    /// How many.
     pub count: u32,
 }
 
@@ -235,10 +243,13 @@ pub enum InspectError {
     Edited(String),
 }
 
+/// What `edited` changed against `base`, read within [`INSPECT_LIMITS`] and each diff bounded by
+/// [`MAX_CHANGES`].
 pub fn inspect(base: &[u8], edited: &[u8]) -> Result<Inspection, InspectError> {
     inspect_with_limit(base, edited, MAX_CHANGES)
 }
 
+/// [`inspect`] with each diff bounded by `max_changes`.
 pub fn inspect_with_limit(base: &[u8], edited: &[u8], max_changes: usize) -> Result<Inspection, InspectError> {
     inspect_within(base, edited, &INSPECT_LIMITS, max_changes)
 }
