@@ -86,6 +86,24 @@ impl EmbeddedEditor {
         Ok(())
     }
 
+    /// Switches the open document to view or edit mode; answered by `modeChanged`.
+    #[wasm_bindgen(js_name = setMode)]
+    pub fn set_mode(&self, #[wasm_bindgen(unchecked_param_type = "ModeRequest")] request: JsValue) -> Result<(), JsValue> {
+        let request = wire::parse_mode_request(&json_of(&request)?).map_err(|e| type_error(&e))?;
+        self.send(HostCommand::SetMode(request));
+        Ok(())
+    }
+
+    /// Serialises the document; answered by `saveRequested` or `saveFailed`.
+    #[wasm_bindgen(js_name = requestSave)]
+    pub fn request_save(&self) {
+        self.send(HostCommand::RequestSave);
+    }
+
+    /// The API's redaction step; this editor has no redactions, so it does nothing.
+    #[wasm_bindgen(js_name = applyRedactions)]
+    pub fn apply_redactions(&self) {}
+
     /// One listener; a second call replaces the first. Events are delivered after the frame that
     /// produced them.
     #[wasm_bindgen(js_name = setListener)]
@@ -196,7 +214,8 @@ fn stop_later(runner: eframe::WebRunner) {
     wasm_bindgen_futures::spawn_local(async move { runner.destroy() });
 }
 
-/// The app the runner drives: WordCraft in view mode, plus handing its events to the host.
+/// The app the runner drives: WordCraft in view mode (edit mode on the host's `setMode`), plus
+/// handing its events to the host.
 struct EmbedShell {
     app: WordApp,
     bridge: HostBridge,
@@ -254,6 +273,14 @@ async fn deliver(listener: Listener, events: Vec<HostEvent>) {
                 continue;
             }
         };
+        // A save's bytes travel as a Uint8Array the host owns (a copy outside the module's memory),
+        // not as JSON numbers.
+        if let HostEvent::SaveRequested { bytes, .. } = &event
+            && js_sys::Reflect::set(&value, &JsValue::from_str("bytes"), &js_sys::Uint8Array::from(bytes.as_slice())).is_err()
+        {
+            log::error!("embed: a save's bytes could not be attached");
+            continue;
+        }
         if let Err(error) = listener.call1(&JsValue::NULL, &value) {
             log::warn!("embed: the event listener threw: {error:?}");
         }

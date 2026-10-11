@@ -134,11 +134,18 @@ for want in \
   'setTheme(theme: Theme): void;' \
   'setListener(listener: (event: EditorEvent) => void): void;' \
   'destroy(): void;' \
+  'setMode(request: ModeRequest): void;' \
+  'requestSave(): void;' \
+  'applyRedactions(): void;' \
   'export interface MountOptions' \
   'export interface Theme' \
   'export type JumpTarget' \
   'export interface Mark' \
-  'export type EditorEvent'; do
+  'export interface EditorAuthor' \
+  'export interface EditorPermissions' \
+  'export type ModeRequest' \
+  'export type EditorEvent' \
+  'export type EditRefusalCode'; do
   grep -qF -- "$want" "$OUT/wordcraft_embed.d.ts" || { echo "error: wordcraft_embed.d.ts lacks: $want" >&2; exit 1; }
 done
 # docs/brand/LICENSE-brand.txt: a modified build carries none of the ArtCraft logo images and shows

@@ -131,7 +131,7 @@ fn checked_theme(theme: &ThemeSpec, what: &str) -> Result<(), String> {
 pub fn parse_mount_options(json: &str) -> Result<MountOptions, String> {
     let options: MountOptions = serde_json::from_str(json).map_err(|error| format!("mount: {error}"))?;
     if options.mode != "view" {
-        return Err(format!("mount: mode '{}' is not supported: this build has view mode only", options.mode));
+        return Err(format!("mount: mode '{}' is not supported: an editor mounts in view mode; setMode switches to edit mode", options.mode));
     }
     checked_theme(&options.theme, "mount")?;
     Ok(options)
@@ -255,7 +255,7 @@ mod tests {
         let ok = parse_mount_options(r##"{"mode":"view","theme":{"dark":false,"accent":"#0f766e","accentContent":"#ffffff"}}"##).unwrap();
         assert_eq!(ok.theme.colors(), Some((Color32::from_rgb(0x0f, 0x76, 0x6e), Color32::WHITE)));
         let edit = parse_mount_options(r##"{"mode":"edit","theme":{"dark":false,"accent":"#0f766e","accentContent":"#ffffff"}}"##);
-        assert!(edit.unwrap_err().contains("view mode only"));
+        assert!(edit.unwrap_err().contains("mounts in view mode"));
         assert!(parse_mount_options(r##"{"mode":"view","theme":{"dark":false,"accent":"teal","accentContent":"#ffffff"}}"##).is_err());
         assert!(parse_theme(r##"{"dark":true,"accent":"#0f766e80","accentContent":"#ffffff"}"##).is_err(), "accent must be opaque");
         assert!(parse_theme(r##"{"dark":true,"accent":"#0f766e","accentContent":"#fff"}"##).is_err());

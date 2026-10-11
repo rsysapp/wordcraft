@@ -244,6 +244,31 @@ mod tests {
         }
     }
 
+    /// `editRefused` carries exactly the embed API's eleven codes (`EditRefusalCode`), one per
+    /// engine refusal, in the API's order.
+    #[test]
+    fn edit_refusals_serialise_to_the_embed_api_s_codes() {
+        let api = [
+            "command_not_allowed",
+            "decision_not_allowed",
+            "paragraph_break_not_supported",
+            "character_not_allowed",
+            "outside_editable_story",
+            "invalid_edit_session",
+            "unknown_command",
+            "invalid_parameters",
+            "not_available",
+            "document_protected",
+            "command_failed",
+        ];
+        let codes: Vec<&str> = wordcraft_engine::edit_mode::Refusal::ALL.iter().map(|refusal| refusal.code()).collect();
+        assert_eq!(codes, api);
+        for code in api {
+            let event = HostEvent::EditRefused { code: code.to_string() };
+            assert_eq!(serde_json::to_value(&event).unwrap(), json!({"type": "editRefused", "code": code}));
+        }
+    }
+
     #[test]
     fn the_bridge_keeps_order_and_is_shared_by_its_clones() {
         let host_side = HostBridge::new();

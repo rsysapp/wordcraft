@@ -1,10 +1,12 @@
 # Embed build
 
 WordCraft's embed build is a WebAssembly module that a host page mounts on its own `<canvas>`
-and drives through one typed JavaScript API, `EmbeddedEditor` (`wordcraft_embed.d.ts`). This
-version has **view mode** only: the document with the editor's own page navigation, zoom and
-find. Sources: `apps/wordcraft-embed` (wasm-bindgen glue) and `crates/ui-egui/src/host/` (host
-bridge, view mode, marks, selection, opening files).
+and drives through one typed JavaScript API, `EmbeddedEditor` (`wordcraft_embed.d.ts`). An
+editor mounts in **view mode** (the document with the editor's own page navigation, zoom and
+find); API 0.2 (release `embed-v0.2.0`) adds **edit mode**, in which every change is a tracked
+change, and save, which hands the `.docx` bytes to the host ("Edit mode (API 0.2)"). Sources:
+`apps/wordcraft-embed` (wasm-bindgen glue) and `crates/ui-egui/src/host/` (host bridge, view and
+edit mode, marks, selection, opening files).
 
 ## Build
 
@@ -130,15 +132,177 @@ The command fails for a file that was not built by this repository's release wor
 import init, { EmbeddedEditor } from './wordcraft_embed.js';
 await init({ module_or_path: './wordcraft_embed_bg.wasm' });
 const editor = await EmbeddedEditor.mount(canvas, { mode: 'view', theme: { dark: false, accent: '#0f766e', accentContent: '#ffffff' } });
-editor.setListener((event) => { /* opened, openFailed, pageChanged, selection, selectionCleared, markActivated, jumpNotFound */ });
+editor.setListener((event) => { /* see EditorEvent below */ });
 editor.open(bytes, 'agreement.docx');
 editor.jumpTo({ kind: 'text', text: 'Clause 5', page: null, occurrence: 0 });
 editor.setMarks([{ id: 'n1', text: 'Clause 5', page: null, color: '#ffd60080' }]);
+// API 0.2: edit, then save; the bytes arrive in a `saveRequested` event.
+editor.setMode({
+    mode: 'edit',
+    author: { id: 'u-1', name: 'A. Person' },
+    revisionDate: '2026-10-10T08:00:00Z',
+    permissions: { acceptRejectChanges: true, organizePages: false, fillForms: false, redact: false, stamps: false, drawing: false },
+});
+editor.requestSave();
+editor.setMode({ mode: 'view' });
 editor.destroy();
 ```
 
-The full types are in `wordcraft_embed.d.ts`; they are the embed API's types, and the package
-script fails if a declaration is missing.
+`EmbeddedEditor`'s methods are `static mount(canvas, options)`, `open(bytes, fileName)`,
+`jumpTo(target)`, `setMarks(marks)`, `setTheme(theme)`, `setListener(listener)`, `destroy()` and,
+from API 0.2, `setMode(request: ModeRequest)`, `requestSave()` and `applyRedactions()`. The types,
+as `wordcraft_embed.d.ts` declares them (the package script fails if a declaration is missing):
+
+```ts
+export interface MountOptions {
+    mode: 'view';
+    theme: Theme;
+}
+
+export interface Theme {
+    dark: boolean;
+    accent: string;
+    accentContent: string;
+}
+
+export type JumpTarget =
+    | { kind: 'page'; page: number }
+    | { kind: 'text'; text: string; page: number | null; occurrence: number };
+
+export interface Mark {
+    id: string;
+    text: string;
+    page: number | null;
+    color: string;
+}
+
+export interface EditorAuthor {
+    id: string;
+    name: string;
+}
+
+export interface EditorPermissions {
+    acceptRejectChanges: boolean;
+    organizePages: boolean;
+    fillForms: boolean;
+    redact: boolean;
+    stamps: boolean;
+    drawing: boolean;
+}
+
+export type ModeRequest =
+    | { mode: 'view' }
+    | { mode: 'edit'; author: EditorAuthor; revisionDate: string; permissions: EditorPermissions };
+
+export type EditorEvent =
+    | { type: 'opened'; pages: number }
+    | { type: 'openFailed'; message: string }
+    | { type: 'pageChanged'; page: number }
+    | { type: 'selection'; text: string; copyText: string; page: number | null; x: number; y: number }
+    | { type: 'selectionCleared' }
+    | { type: 'markActivated'; id: string }
+    | { type: 'jumpNotFound'; target: JumpTarget }
+    | { type: 'modeChanged'; mode: 'view' | 'edit' }
+    | { type: 'dirtyChanged'; dirty: boolean }
+    | { type: 'saveRequested'; bytes: Uint8Array; fileName: string }
+    | { type: 'saveFailed'; message: string }
+    | { type: 'commentRequested'; text: string; copyText: string; page: number | null; x: number; y: number }
+    | { type: 'redactionsPending'; marks: number }
+    | { type: 'editRefused'; code: EditRefusalCode };
+
+export type EditRefusalCode =
+    | 'command_not_allowed'
+    | 'decision_not_allowed'
+    | 'paragraph_break_not_supported'
+    | 'character_not_allowed'
+    | 'outside_editable_story'
+    | 'invalid_edit_session'
+    | 'unknown_command'
+    | 'invalid_parameters'
+    | 'not_available'
+    | 'document_protected'
+    | 'command_failed';
+```
+
+`MountOptions.mode` is always `'view'`: an editor mounts in view mode, needing no author, and
+`setMode` switches it. `EditorPermissions` is the API's shared shape; this editor reads
+`acceptRejectChanges` only. `redactionsPending` belongs to the other editor of the API: this one
+never sends it, and its `applyRedactions()` does nothing.
+
+## Edit mode (API 0.2)
+
+`setMode({ mode: 'edit', author, revisionDate, permissions })` switches the open document to edit
+mode on the next frame; `modeChanged` answers with the mode now in force. With no document open
+(none opened yet, or the last open answered `openFailed`) it answers `modeChanged` with `view`. A
+selection reported in view mode is cleared first (`selectionCleared`, then `modeChanged`).
+`setMode({ mode: 'view' })` leaves edit mode and keeps the edits on screen; the host calls `open`
+again to discard them. A malformed request (an unknown mode, a missing author, a blank author name
+or one over 255 characters, a `revisionDate` that is not ISO 8601 UTC on a calendar day, a
+permission that is missing, not a boolean, or not one of the six the API names) throws a `TypeError`
+and queues nothing.
+
+Every change is a tracked change by `author.name`, dated `revisionDate` stored to the second
+(`2026-10-10T08:00:00.123Z` is `2026-10-10T08:00:00Z`); tracking is forced on and is on in the saved
+file. **One author and one date per save**: while the document has unsaved changes, `setMode` with
+another `revisionDate`, or another author (id or name), is refused with `editRefused`
+`invalid_edit_session`, then `modeChanged` with the mode still in force; on a clean document it
+starts a new session.
+
+Only typing, deleting, line breaks (Shift+Enter), tab characters, cut, plain paste, undo and redo
+run, and, with `acceptRejectChanges`, accepting and rejecting tracked changes; formatting, styles,
+tables, pictures, fields, find-and-replace, list levels, indents and restricting editing do not
+(each would be an untracked change). New paragraphs are refused for now ("Known limitation" below).
+The edit strip in the view bar offers Undo, Redo, Previous change, Next change and, when allowed,
+Accept, Reject, Accept all and Reject all. **Headers and footers** are entered by double-clicking
+them, and the part entered is the one the clicked page shows, as Word renders it: the first-page
+part on a title page, the even part on even pages when odd and even differ (none, so nothing to
+enter, when there is no even part), or a part inherited from an earlier section, which is shared:
+the strip then says "Header (shared with sections N–M)". Making a new header or footer is refused.
+
+- **Refusals.** An action the editor refuses (a key, a paste, a strip button) changes nothing and
+  sends `editRefused` with its code, once per action; the codes are listed under "Edit mode
+  (engine)" below. The editor also shows its own short notice. A search or move that finds nothing
+  is no refusal and sends nothing, and Shift+Tab does nothing and says nothing.
+- **A command that changes nothing leaves no trace**: Accept with nothing to accept, or an empty
+  paste, adds no revision record and no undo step, keeps the redo history, and makes the document no
+  dirtier.
+- **Dirty.** `dirtyChanged` is `true` once the document differs from what was opened and `false`
+  when it no longer does (undoing back to the opened document), at most once a frame and only on a
+  change. It compares the document's content, not the undo depth, so running out of undo leaves it
+  dirty. **Saving never clears dirty; only `opened` does**: the next `opened` starts clean without a
+  `dirtyChanged`, so a host resets its own dirty state on `opened`, and a host that keeps a save
+  opens the saved bytes again.
+- **Save.** `requestSave()`, or Ctrl/⌘+S in edit mode, answers `saveRequested` with the `.docx`
+  bytes in a new `Uint8Array` the host owns (a copy outside the module's memory) and `fileName`, the
+  name the document was opened under, verbatim (`LEASE.DOCX` stays `LEASE.DOCX`). The bytes are
+  always a Word `.docx` package, also for a file opened as `.docm` or `.dotx`. **Saves are answered
+  when requested**: each from the document and mode at its own request, before a later command of
+  the same frame (an `open`, a `setMode`), so a save asked in view mode answers `saveFailed` even
+  when a later one in the same frame, after `setMode`, answers `saveRequested`. Two consecutive
+  requests in one frame, for the same document in the same mode, answer once. In view mode
+  `requestSave()` answers `saveFailed` ("Nothing to save: the document is open for viewing only.")
+  and Ctrl/⌘+S sends nothing; a document that cannot be written answers `saveFailed` ("The document
+  could not be written."). Saving never leaves edit mode and never downloads: the host decides what
+  a save becomes. The size of a save is not limited here.
+- **Comments.** The editor's comment command (New Comment and its shortcut) never writes into the
+  file: with text selected it sends `commentRequested` with the fields and meaning of `selection`;
+  with nothing to quote (a collapsed caret, or only tracked-deleted or hidden text) it sends
+  nothing.
+- **Selection, marks and jumps.** `selection` and `selectionCleared` are not sent in edit mode, and
+  leaving it reports nothing about a selection made while editing until the person changes it. Host
+  marks are hidden while editing and shown again in view mode; `setMarks` while editing replaces
+  them for then. Jumps work as in view mode, and `pageChanged` follows the view, also when typing
+  moves the caret onto another page.
+- **Opening.** `open` always starts in view mode. Of the events one open sends, each only when it
+  applies, the order is `modeChanged` with `view` (when it was editing), `selectionCleared`, the
+  waiting jump's `jumpNotFound`, then `opened` or `openFailed`. A file over the open limit is an
+  open like any other, so it ends edit mode too.
+- **Keyboard.** Tab types a tab character, tracked, and nothing else: it never moves between table
+  cells, adds a row, changes a list level or indents. Shift+Tab does nothing. In edit mode the host
+  lets Tab and Shift+Tab reach the canvas, except right after Escape: Escape then Tab or Shift+Tab
+  moves focus out ("The host page's part"). Escape itself reaches the editor harmlessly (in a header
+  or footer it leaves it). Edit mode claims the IME, so composed and on-screen typing arrive; view
+  mode never does.
 
 ## Behaviour a host page relies on
 
@@ -151,10 +315,11 @@ script fails if a declaration is missing.
 - `open` takes `.docx`, `.docm` and `.dotx` files. It replaces the document and clears the marks.
   Of the events one successful open sends, each only when it applies, the order is:
   `selectionCleared` (a selection it reported), then the waiting jump's `jumpNotFound`, then
-  `opened`, then `pageChanged`. A file that cannot be shown answers `openFailed` with a
-  plain one-sentence message (unsupported type, empty, too large, password-protected, damaged) and
-  leaves the open document, its marks and any waiting jump as they were. There is never a password
-  prompt.
+  `opened`, then `pageChanged`; in edit mode `modeChanged` with `view` comes first. A file that
+  cannot be shown answers `openFailed` with a plain one-sentence message (unsupported type, empty,
+  too large, password-protected, damaged) and leaves the open document, its marks and any waiting
+  jump as they were, though not editable: edit mode waits for the next document that opens. There
+  is never a password prompt.
 - **Matching** (jumps and marks): whitespace runs are one space; case, Unicode compatibility forms
   (NFKC), curly quotes and the dashes U+2010–2015 and U+2212 are folded. Text in tracked deletions
   and hidden text is not matched. A match may span lines, never paragraphs. A mark shows its first
@@ -188,7 +353,10 @@ script fails if a declaration is missing.
 
 - **Keyboard:** eframe's web backend keeps Tab inside the canvas. Wrap the canvas in an element
   with a capture-phase `keydown` listener that stops Tab and Shift+Tab and moves focus to the next
-  or previous focusable element. Everything else reaches the editor.
+  or previous focusable element. Everything else reaches the editor. In edit mode, Tab types a tab
+  character, so the wrapper lets Tab and Shift+Tab through unless the key before it was Escape
+  (Escape arms the next key; any other key disarms it; Escape itself still reaches the editor), and
+  the host shows this way out beside the editor while it edits.
 - **Toolbar:** hide the host's selection toolbar on `opened` and `openFailed`, and on any pointer,
   wheel or key input in the canvas's wrapper, since a reported selection's position goes stale once
   the view moves; Tab and Shift+Tab are exempt (the wrapper consumes them to move focus, and while
@@ -287,8 +455,8 @@ not followed.
 
 ## Edit mode (engine)
 
-The engine's and the host bridge's sides of API 0.2's edit mode are in place (the JavaScript methods
-come with the 0.2 release). `Session::begin_edit(author, revisionDate, rules)` is the only way into an
+How the engine and the host bridge implement API 0.2's edit mode ("Edit mode (API 0.2)" above is
+what a host sees). `Session::begin_edit(author, revisionDate, rules)` is the only way into an
 edit session. It refuses a blank author or a date that is not UTC whole seconds on a calendar day
 (`2026-10-10T08:00:00Z`; `2026-02-31T08:00:00Z` is refused), forces tracking on and clears undo and
 redo, so neither reaches past the session's start. Starting again with another author, other rules
