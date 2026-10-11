@@ -558,6 +558,9 @@ impl Session {
         if spec.mutates && spec.id != "text.insert" {
             self.typing_open = false;
         }
+        // embed: in an edit session redo is kept aside while the command runs and given back unless
+        // it changed the document: a command that changed nothing (or failed) leaves redo as it was.
+        let redo_before = if spec.mutates && self.edit_rules.is_some() { Some(std::mem::take(&mut self.redo)) } else { None };
         if spec.mutates {
             let label = if spec.id == "text.insert" { "Typing" } else { spec.label };
             self.checkpoint(label);
@@ -596,8 +599,21 @@ impl Session {
                             self.history.truncate(h);
                             self.typing_open = t;
                             self.version = v;
+                            if let Some(redo) = redo_before {
+                                self.redo = redo;
+                            }
                         }
-                        _ => self.touch(),
+                        Some((_, _, h, ..)) => {
+                            // A coalesced typing step pushes no undo step, and only a pushed step
+                            // ends what redo could replay.
+                            if self.history.len() == h
+                                && let Some(redo) = redo_before
+                            {
+                                self.redo = redo;
+                            }
+                            self.touch();
+                        }
+                        None => self.touch(),
                     }
                 }
                 self.clamp_selection();
@@ -609,6 +625,9 @@ impl Session {
                     self.history.truncate(h);
                     self.typing_open = t;
                     self.version = v;
+                }
+                if let Some(redo) = redo_before {
+                    self.redo = redo;
                 }
                 self.status = e.to_string();
                 self.refusal = e.edit_refusal();

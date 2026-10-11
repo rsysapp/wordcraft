@@ -900,4 +900,21 @@ mod pages {
         assert_eq!(s.doc.revisions.len(), 1);
         let _ = EditRules { may_decide: true };
     }
+
+    // W3-9: a command that changes nothing leaves redo as it was.
+    #[test]
+    fn a_command_that_changes_nothing_keeps_redo() {
+        let mut s = Session::new(Document::from_text("Rent is due monthly."));
+        start_editing(&mut s, true);
+        s.run("text.insert", &json!({ "text": "x" })).unwrap();
+        let edited = s.content_version();
+        s.run("edit.undo", &json!({})).unwrap();
+        for (id, params) in [("review.accept", json!({})), ("edit.pasteText", json!({ "text": "" })), ("review.acceptAll", json!({}))] {
+            s.run(id, &params).unwrap();
+            assert!(s.can_redo(), "{id} kept redo");
+        }
+        s.run("edit.redo", &json!({})).unwrap();
+        assert_eq!(s.content_version(), edited);
+        assert!(s.doc.plain_text(StoryRef::Body).starts_with('x'));
+    }
 }
