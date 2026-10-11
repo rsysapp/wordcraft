@@ -1744,6 +1744,44 @@ fn reports_tracked_table_property_changes_as_untracked() {
     assert_eq!(inspection.untracked_changes, 0, "{inspection:#?}");
 }
 
+/// Inflating is charged at its measured cost (five units of about 10 ns for every 8 bytes), before
+/// it runs: a binary part is inflated as each package is opened and again when the two are compared,
+/// on both sides. So inflating alone cannot run past the work budget's time: three parts of 64 MiB a
+/// side are refused for work, not read.
+#[test]
+fn charges_inflation_at_its_cost() {
+    let part = vec![0u8; 8 << 20];
+    let package_with = |last: u8| {
+        let mut bytes = part.clone();
+        if let Some(byte) = bytes.last_mut() {
+            *byte = last;
+        }
+        let mut entries = vec![
+            ("[Content_Types].xml".to_string(), CONTENT_TYPES.as_bytes().to_vec()),
+            ("_rels/.rels".to_string(), ROOT_RELS.as_bytes().to_vec()),
+            ("word/document.xml".to_string(), document(&para(&text("Rent."))).into_bytes()),
+        ];
+        entries.push(("parts/zeros.bin".to_string(), bytes));
+        zip_entries(&entries).unwrap()
+    };
+    let (base, edited) = (package_with(0), package_with(1));
+    let (result, _, work) = inspect_measured(&base, &edited);
+    assert_eq!(result.unwrap().losses.len(), 1);
+    let inflated = 4 * budget::inflated(8 << 20);
+    assert!(work >= inflated, "work {work}, inflating alone {inflated}");
+    // At the size cap, inflating alone passes the work budget: refused before it runs.
+    let mut entries = vec![
+        ("[Content_Types].xml".to_string(), CONTENT_TYPES.as_bytes().to_vec()),
+        ("_rels/.rels".to_string(), ROOT_RELS.as_bytes().to_vec()),
+        ("word/document.xml".to_string(), document(&para(&text("Rent."))).into_bytes()),
+    ];
+    let big = vec![0u8; (64 << 20) - 4_096];
+    entries.extend((0..3).map(|n| (format!("parts/zeros{n}.bin"), big.clone())));
+    let capped = zip_entries(&entries).unwrap();
+    let result = inspect(&capped, &capped);
+    assert!(matches!(&result, Err(InspectError::Base(message) | InspectError::Edited(message)) if message.contains("work")), "{result:?}");
+}
+
 /// Prefix lists (`mc:Ignorable` and the like) are kept as namespace numbers, charged as they are
 /// expanded: thousands of them under a long namespace stay small. Lists past 1,024 names, or past
 /// 64 KiB in one element, are refused.

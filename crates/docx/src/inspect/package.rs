@@ -12,7 +12,7 @@ use std::io::{Cursor, Read};
 use zip::ZipArchive;
 
 use super::InspectError;
-use super::budget::{BYTES_PER_UNIT_INFLATED, Budget, tree_slot, units, vector_slot};
+use super::budget::{Budget, inflated, tree_slot, units, vector_slot};
 use crate::package::{MAX_ENTRIES, ReadLimits};
 
 /// A package whose every entry was read once, in full, within the limits.
@@ -338,10 +338,16 @@ impl<'a> StrictPackage<'a> {
                 return Err(format!("part {name} declares {} bytes", entry.size()));
             }
             let room = limits.max_part_bytes.min(limits.max_total_bytes.saturating_sub(total));
+            let declared = entry.size();
+            if declared > room {
+                return Err(format!("part {name} decompresses past the size limit"));
+            }
+            // Inflating is charged before it runs, for the size declared (a stream that runs longer
+            // is refused once it passes it).
+            budget.work(ENTRY_WORK.saturating_add(inflated(declared.saturating_add(1))))?;
             // Read to the end, so the zip crate checks the CRC, without keeping the bytes yet.
-            let read = std::io::copy(&mut (&mut entry).take(room.saturating_add(1)), &mut std::io::sink())
+            let read = std::io::copy(&mut (&mut entry).take(declared.saturating_add(1)), &mut std::io::sink())
                 .map_err(|error| format!("zip entry {name} unreadable: {error}"))?;
-            budget.work(ENTRY_WORK.saturating_add(read / BYTES_PER_UNIT_INFLATED))?;
             if read > room {
                 return Err(format!("part {name} decompresses past the size limit"));
             }
@@ -377,13 +383,13 @@ impl<'a> StrictPackage<'a> {
         }
         budget.hold(size.saturating_add(INFLATE_BYTES))?;
         let read = (|| -> Result<Vec<u8>, String> {
+            budget.work(ENTRY_WORK.saturating_add(inflated(size)))?;
             let mut entry = self.archive.by_index(position).map_err(|error| format!("zip entry {name} unreadable: {error}"))?;
             let mut bytes = Vec::with_capacity(usize::try_from(size).map_err(|_| "a part too large".to_string())?);
             (&mut entry).take(size.saturating_add(1)).read_to_end(&mut bytes).map_err(|error| format!("zip entry {name} unreadable: {error}"))?;
             if units(bytes.len()) != size {
                 return Err(format!("part {name} decompresses to another size than it declares"));
             }
-            budget.work(ENTRY_WORK.saturating_add(size / BYTES_PER_UNIT_INFLATED))?;
             Ok(bytes)
         })();
         budget.release(INFLATE_BYTES);
@@ -436,9 +442,10 @@ fn compare_streams(
     while remaining > 0 {
         let chunk = usize::try_from(remaining).map_or(CHUNK, |remaining| remaining.min(CHUNK));
         let (Some(left), Some(right)) = (left.get_mut(..chunk), right.get_mut(..chunk)) else { return Ok(false) };
+        // Both streams' chunks inflated, then compared.
+        budget.work(1 + inflated(units(chunk).saturating_mul(2))).map_err(InspectError::Edited)?;
         before.read_exact(left).map_err(|error| InspectError::Base(unreadable(error.to_string())))?;
         after.read_exact(right).map_err(|error| InspectError::Edited(unreadable(error.to_string())))?;
-        budget.work(1 + units(chunk) / BYTES_PER_UNIT_INFLATED).map_err(InspectError::Edited)?;
         if left != right {
             return Ok(false);
         }

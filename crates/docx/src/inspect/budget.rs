@@ -4,11 +4,19 @@
 //! interned content, diff state) and is charged before it is allocated, so the limit is never
 //! passed first and refused after.
 
-/// Work is counted in units of roughly ten nanoseconds of this machine's time, so that
-/// `MAX_WORK` is a few seconds whatever the input: these say how many bytes of each kind of
-/// processing one unit pays for.
-/// Bytes inflated from the zip, or compared.
-pub(super) const BYTES_PER_UNIT_INFLATED: u64 = 8;
+/// Work is counted in units of roughly ten nanoseconds, so that `MAX_WORK` (400 M units) is a
+/// few seconds whatever the input: these say how many bytes of each kind of processing one unit
+/// pays for. Measured on an 11-core Apple silicon machine, the slowest kind of work runs at under 10.5 ns a
+/// unit idle (4.2 s for `MAX_WORK`) and 13.4 ns with every core busy (5.4 s): a host that allows
+/// 10 s keeps a margin of two over the idle rate.
+/// Inflating is the dearest step: a Huffman-coded stream of literals takes up to 48 ns for every
+/// 8 bytes it gives (measured), so each 8 bytes inflated is charged five units (50 ns), and
+/// inflating alone cannot run past the work budget's time.
+pub(super) fn inflated(bytes: u64) -> u64 {
+    bytes.saturating_mul(INFLATE_UNITS_PER_8_BYTES) / 8
+}
+/// Units charged for every 8 bytes inflated.
+pub(super) const INFLATE_UNITS_PER_8_BYTES: u64 = 5;
 /// Bytes of XML parsed.
 pub(super) const BYTES_PER_UNIT_PARSED: u64 = 8;
 /// Bytes run through SHA-256.
