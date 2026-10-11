@@ -17,7 +17,7 @@ use super::budget::{Budget, units};
 use super::diff::{Step, script};
 use super::digest::Hasher;
 use super::opc::finish;
-use super::story::{Context, EMPTY, FormatRev, Item, MARK_BASE, MarkKind, Tables, Wrap, WrapKind};
+use super::story::{Context, EMPTY, FormatRev, Item, MARK_BASE, MarkKind, Tables, Wrap, WrapKind, is_bidi_control};
 
 /// Fields nested deeper than this are refused: no document needs them, and each open field's code
 /// is followed character by character.
@@ -79,7 +79,7 @@ impl<'a> Projector<'a> {
                     if let Some(rev) = slot.rev.take() {
                         if self.is_new(rev.author, rev.date) {
                             slot.value = rev.old;
-                            if slot.name == "rPr" {
+                            if matches!(slot.name, "rPr" | "pPr.rPr") {
                                 format.hidden = rev.old_hidden;
                             }
                         } else {
@@ -100,7 +100,7 @@ impl<'a> Projector<'a> {
     pub(super) fn project(&mut self, tables: &mut Tables, items: &mut Vec<Item>, budget: &mut Budget) -> Result<(), String> {
         let mut out_of_work = false;
         items.retain_mut(|item| {
-            if out_of_work || !budget.spend(1) {
+            if out_of_work || !budget.spend(2) {
                 out_of_work = true;
                 return false;
             }
@@ -158,7 +158,7 @@ pub(super) fn assign_contexts(
     let mut frames: Vec<Frame> = Vec::new();
     let mut current = EMPTY;
     for item in items.iter() {
-        budget.work(1 + units(frames.len()))?;
+        budget.work(2 + units(frames.len()))?;
         fields.push(current);
         let kind = tables.mark_info(item.piece).map(|mark| mark.kind);
         match kind {
@@ -203,7 +203,7 @@ pub(super) fn assign_contexts(
         (value, rev.map(|rev: &FormatRev| rev.old))
     };
     for (item, field) in items.iter_mut().zip(fields).rev() {
-        budget.work(1)?;
+        budget.work(2)?;
         match tables.mark_info(item.piece).map(|mark| mark.kind) {
             Some(MarkKind::Paragraph) => {
                 let format = view(tables, item.format);
@@ -237,11 +237,6 @@ pub(super) struct Holds {
     pub objects: u32,
 }
 
-/// Directional formatting characters: they reorder what follows them.
-fn is_bidi_control(piece: u32) -> bool {
-    matches!(piece, 0x061C | 0x200E | 0x200F | 0x202A..=0x202E | 0x2066..=0x2069)
-}
-
 /// The author of the save's innermost insertion around a stack, and the save's move it is in.
 type StackFacts = (Option<u32>, Option<(bool, u32, u32)>);
 
@@ -258,7 +253,7 @@ pub(super) fn facts(
     let mut moves: BTreeMap<(u32, u32), (Hasher, Hasher)> = BTreeMap::new();
     let mut hidden_formats: HashMap<u32, Vec<u32>> = HashMap::new();
     for item in items {
-        budget.work(1)?;
+        budget.work(2)?;
         let (inserter, moved) = *stacks.entry(item.wraps).or_insert_with(|| {
             let wraps: Vec<Wrap> = tables.wraps_of(item.wraps);
             let new = |wrap: &&Wrap| new_pairs.contains(&(wrap.author, wrap.date));
@@ -279,6 +274,7 @@ pub(super) fn facts(
             Some(format) if format.hidden => format
                 .slots
                 .iter()
+                .filter(|slot| matches!(slot.name, "rPr" | "pPr.rPr"))
                 .filter_map(|slot| slot.rev)
                 .filter(|rev| new_pairs.contains(&(rev.author, rev.date)) && !rev.old_hidden)
                 .map(|rev| rev.author)
@@ -304,9 +300,15 @@ pub(super) fn facts(
         if item.piece < MARK_BASE && is_bidi_control(item.piece) {
             entry.bidi_controls = entry.bidi_controls.saturating_add(1);
         }
-        if matches!(mark, Some(MarkKind::Object)) {
+        // Opaque content (a text box, a picture, anything compared whole) is reported as an
+        // object, and what it holds is counted with the rest.
+        let held = tables.mark_info(item.piece).map(|mark| mark.holds).unwrap_or_default();
+        if matches!(mark, Some(MarkKind::Object)) || held.content {
             entry.objects = entry.objects.saturating_add(1);
         }
+        entry.hidden = entry.hidden.saturating_add(held.hidden);
+        entry.field_codes = entry.field_codes.saturating_add(held.field_codes);
+        entry.bidi_controls = entry.bidi_controls.saturating_add(held.bidi_controls);
     }
     let mut differing = 0u32;
     for (_, (from, to)) in moves {
@@ -315,6 +317,85 @@ pub(super) fn facts(
         }
     }
     Ok(differing)
+}
+
+/// A field of the base open at the current position, and what the save did inside it.
+struct OpenField {
+    /// Its start was there before the save (not inserted by it).
+    base: bool,
+    /// Tracked changes of the save inside it, per author.
+    touched: BTreeMap<u32, u32>,
+    /// Every item of it, start to end, is in a deletion of the save.
+    all_deleted: bool,
+}
+
+/// How a stack relates to the save: the author of its innermost change by the save, whether a
+/// change of the save inserts it, whether one deletes it.
+type StackRole = (Option<u32>, bool, bool);
+
+/// A base field is its start, code, separator, result and end together. The save may delete it
+/// whole; any other tracked change inside it (code narrowed, a separator deleted, a character
+/// inserted) changes what the field shows once accepted or updated, so each such field is one
+/// untracked change. Every tracked change of the save touching a base field counts in its
+/// author's `field_codes`.
+pub(super) fn field_structure(
+    items: &[Item],
+    tables: &Tables,
+    new_pairs: &Pairs,
+    holds: &mut BTreeMap<u32, Holds>,
+    budget: &mut Budget,
+) -> Result<u32, String> {
+    let mut roles: HashMap<u32, StackRole> = HashMap::new();
+    let mut open: Vec<OpenField> = Vec::new();
+    let mut changed = 0u32;
+    let close = |field: OpenField, holds: &mut BTreeMap<u32, Holds>, changed: &mut u32| {
+        if field.base && !field.touched.is_empty() {
+            if !field.all_deleted {
+                *changed = changed.saturating_add(1);
+            }
+            for (author, count) in field.touched {
+                let entry = holds.entry(author).or_default();
+                entry.field_codes = entry.field_codes.saturating_add(count);
+            }
+        }
+    };
+    for item in items {
+        budget.work(3 + units(open.len()))?;
+        let (author, inserted, deleted) = *roles.entry(item.wraps).or_insert_with(|| {
+            let wraps = tables.wraps_of(item.wraps);
+            let new: Vec<&Wrap> = wraps.iter().filter(|wrap| new_pairs.contains(&(wrap.author, wrap.date))).collect();
+            let inserted = new.iter().any(|wrap| wrap.kind.inserts());
+            let deleted = !inserted && new.iter().any(|wrap| matches!(wrap.kind, WrapKind::Del | WrapKind::MoveFrom));
+            (new.last().map(|wrap| wrap.author), inserted, deleted)
+        });
+        // A formatting change of the save inside a field also touches it.
+        let formatted = tables.format_of(item.format).and_then(|format| {
+            format.slots.iter().filter_map(|slot| slot.rev).find(|rev| new_pairs.contains(&(rev.author, rev.date))).map(|rev| rev.author)
+        });
+        let kind = tables.mark_info(item.piece).map(|mark| mark.kind);
+        if matches!(kind, Some(MarkKind::FieldBegin | MarkKind::SimpleField(_))) {
+            if open.len() >= MAX_FIELD_DEPTH {
+                return Err("fields nested deeper than an inspection reads".into());
+            }
+            open.push(OpenField { base: !inserted, touched: BTreeMap::new(), all_deleted: true });
+        }
+        for field in open.iter_mut().filter(|field| field.base) {
+            if let Some(author) = author.or(formatted) {
+                let count = field.touched.entry(author).or_default();
+                *count = count.saturating_add(1);
+            }
+            field.all_deleted &= deleted;
+        }
+        if matches!(kind, Some(MarkKind::FieldEnd | MarkKind::SimpleFieldEnd))
+            && let Some(field) = open.pop()
+        {
+            close(field, holds, &mut changed);
+        }
+    }
+    while let Some(field) = open.pop() {
+        close(field, holds, &mut changed);
+    }
+    Ok(changed)
 }
 
 // ---- The comparison ---------------------------------------------------------------------------
@@ -533,7 +614,7 @@ fn tokens(items: &[Item], hasher: &RandomState, budget: &mut Budget) -> Option<V
         true
     };
     for (index, item) in items.iter().enumerate() {
-        if !budget.spend(1) {
+        if !budget.spend(2) {
             return None;
         }
         if index > start

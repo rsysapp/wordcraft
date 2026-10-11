@@ -23,15 +23,17 @@ pub(super) const MARK_BASE: u32 = 0x0011_0000;
 /// context: id 0 in each table.
 pub(super) const EMPTY: u32 = 0;
 
-/// The memory of one item (its vector's spare capacity is charged too, as it grows).
-pub(super) const ITEM_BYTES: u64 = 16;
+/// The memory of one item, with an eighth over its 16 bytes for what the allocator keeps beside it
+/// (its vector's spare capacity is charged too, as it grows).
+pub(super) const ITEM_BYTES: u64 = 18;
 
 /// The memory `items` holds: its whole capacity.
 pub(super) fn items_held(items: &Vec<Item>) -> u64 {
     units(items.capacity()).saturating_mul(ITEM_BYTES)
 }
-/// Memory charged for each entry a table interns, besides any text it keeps.
-const ENTRY_BYTES: u64 = 96;
+/// Memory charged for each entry a table interns, besides any text it keeps: the entry, kept in a
+/// vector and as a map key (formats and contexts in both), with each one's share of spare room.
+const ENTRY_BYTES: u64 = 192;
 
 /// A character or mark, with its tracked-change wrappers, formatting and context (ids in
 /// [`Tables`]).
@@ -144,6 +146,55 @@ pub(super) struct MarkInfo {
     /// is for. An anchor holding anything is no anchor but content.
     pub comment: Option<String>,
     pub kind: MarkKind,
+    /// What an opaque element holds that a reader can show: for the facts about insertions.
+    pub holds: Holds,
+}
+
+/// What an opaque element holds: content at all (text, or any child), hidden runs, field
+/// characters and code, directional controls.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(super) struct Holds {
+    pub content: bool,
+    pub hidden: u32,
+    pub field_codes: u32,
+    pub bidi_controls: u32,
+}
+
+/// Directional formatting characters: they reorder what follows them.
+pub(super) fn is_bidi_control(character: u32) -> bool {
+    matches!(character, 0x061C | 0x200E | 0x200F | 0x202A..=0x202E | 0x2066..=0x2069)
+}
+
+/// What an element holds below itself, read through once (charged as work).
+fn scan(el: &XEl, budget: &mut Budget) -> Result<Holds, String> {
+    fn children(el: &XEl, holds: &mut Holds, budget: &mut Budget) -> Result<(), String> {
+        for node in &el.kids {
+            match node {
+                XNode::El(child) => {
+                    budget.work(1)?;
+                    holds.content = true;
+                    match &*child.name {
+                        "w:fldChar" | "w:fldSimple" | "w:instrText" | "w:delInstrText" => holds.field_codes = holds.field_codes.saturating_add(1),
+                        "w:rPr" if hides(Some(child)) => holds.hidden = holds.hidden.saturating_add(1),
+                        _ => {}
+                    }
+                    children(child, holds, budget)?;
+                }
+                XNode::Text(text) => {
+                    budget.work(1 + units(text.len()) / 16)?;
+                    if !is_space(text) {
+                        holds.content = true;
+                    }
+                    let controls = text.chars().filter(|c| is_bidi_control(u32::from(*c))).count();
+                    holds.bidi_controls = holds.bidi_controls.saturating_add(u32::try_from(controls).unwrap_or(u32::MAX));
+                }
+            }
+        }
+        Ok(())
+    }
+    let mut holds = Holds::default();
+    children(el, &mut holds, budget)?;
+    Ok(holds)
 }
 
 /// Where a reader shows an item: inside which fields (and in their code or their result), in a
@@ -311,7 +362,8 @@ impl Tables {
             return *id;
         }
         let id = self.next(self.formats.len());
-        self.pending = self.pending.saturating_add(units(format.slots.len()).saturating_mul(48));
+        // Each slot, in the vector's copy and the map key's.
+        self.pending = self.pending.saturating_add(units(format.slots.len()).saturating_mul(2 * 48));
         self.formats.push(format.clone());
         self.format_ids.insert(format, id);
         id
@@ -376,14 +428,21 @@ pub(super) struct Revisions {
     pub by_pair: BTreeMap<(u32, u32), Counts>,
 }
 
+/// Memory charged for each author and date kept: the entry and its share of the tree's nodes.
+const PAIR_BYTES: u64 = 64;
+
 impl Revisions {
-    fn note(&mut self, author: u32, date: u32, kind: RevisionKind) {
+    fn note(&mut self, author: u32, date: u32, kind: RevisionKind, budget: &mut Budget) -> Result<(), String> {
+        if !self.by_pair.contains_key(&(author, date)) {
+            budget.hold(PAIR_BYTES)?;
+        }
         let entry = self.by_pair.entry((author, date)).or_default();
         match kind {
             RevisionKind::Insertion => entry.insertions = entry.insertions.saturating_add(1),
             RevisionKind::Deletion => entry.deletions = entry.deletions.saturating_add(1),
             RevisionKind::Format => entry.format_changes = entry.format_changes.saturating_add(1),
         }
+        Ok(())
     }
 }
 
@@ -433,9 +492,17 @@ pub(super) fn walk(
     match result {
         Ok(()) => {
             // Keep only what is used: a story's spare capacity would be held for the whole inspection.
+            // The vector moves to its new room, both held while it moves.
             let mut items = walker.items;
-            items.shrink_to_fit();
-            walker.budget.release(held.saturating_sub(items_held(&items)));
+            let used = units(items.len()).saturating_mul(ITEM_BYTES);
+            if used < held {
+                if let Err(error) = walker.budget.hold(used) {
+                    walker.budget.release(held);
+                    return Err(error);
+                }
+                items.shrink_to_fit();
+                walker.budget.release(held.saturating_add(used).saturating_sub(items_held(&items)));
+            }
             Ok(items)
         }
         Err(error) => {
@@ -485,7 +552,7 @@ impl Walker<'_, '_> {
 
     fn push(&mut self, piece: u32, format: u32) -> Result<(), String> {
         *self.items_left = self.items_left.checked_sub(1).ok_or("more text than an inspection reads")?;
-        self.budget.work(1)?;
+        self.budget.work(3)?;
         if self.items.len() == self.items.capacity() {
             // Grow by doubling, the new room held before it is allocated, the old released after.
             let old = self.items.capacity();
@@ -531,7 +598,8 @@ impl Walker<'_, '_> {
         self.canon.element(el, &mut hasher);
         let digest = finish(hasher, self.budget)?;
         let element = el.name.clone();
-        self.mark(digest, || MarkInfo { element, comment, kind }, format)
+        let holds = scan(el, self.budget)?;
+        self.mark(digest, || MarkInfo { element, comment, kind, holds }, format)
     }
 
     /// Text where only elements belong: white space is layout, anything else is kept as a mark.
@@ -542,7 +610,7 @@ impl Walker<'_, '_> {
         let mut hasher = Hasher::default();
         hasher.field(b'#', text.as_bytes());
         let digest = finish(hasher, self.budget)?;
-        self.mark(digest, || MarkInfo { element: Rc::from("#text"), comment: None, kind: MarkKind::Plain }, EMPTY)
+        self.mark(digest, || MarkInfo { element: Rc::from("#text"), comment: None, kind: MarkKind::Plain, holds: Holds::default() }, EMPTY)
     }
 
     /// A container's start: its start tag and its property elements.
@@ -558,7 +626,7 @@ impl Walker<'_, '_> {
         }
         let digest = finish(hasher, self.budget)?;
         let element = el.name.clone();
-        self.mark(digest, || MarkInfo { element, comment: None, kind }, format)
+        self.mark(digest, || MarkInfo { element, comment: None, kind, holds: Holds::default() }, format)
     }
 
     fn end(&mut self, el: &XEl, kind: MarkKind) -> Result<(), String> {
@@ -566,13 +634,13 @@ impl Walker<'_, '_> {
         hasher.field(b'E', el.name.as_bytes());
         let digest = finish(hasher, self.budget)?;
         let element = el.name.clone();
-        self.mark(digest, || MarkInfo { element, comment: None, kind }, EMPTY)
+        self.mark(digest, || MarkInfo { element, comment: None, kind, holds: Holds::default() }, EMPTY)
     }
 
     fn note(&mut self, el: &XEl, kind: RevisionKind) -> Result<(u32, u32, u32), String> {
         let author = self.tables.text(el.attr("w:author").unwrap_or(""));
         let date = self.tables.text(el.attr("w:date").unwrap_or(""));
-        self.revisions.note(author, date, kind);
+        self.revisions.note(author, date, kind, self.budget)?;
         let digest = self.canon.start_digest(el, self.budget)?;
         Ok((author, date, self.tables.content(digest)))
     }
@@ -592,14 +660,15 @@ impl Walker<'_, '_> {
     }
 
     /// The value of a property element without the children `skip` accepts, as a content id;
-    /// properties with nothing compared in them read as none.
-    fn value(&mut self, property: Option<&XEl>, skip: &dyn Fn(&XEl) -> bool) -> Result<u32, String> {
+    /// properties with nothing compared in them read as none, unless `present_counts` (a section's
+    /// properties: whether a paragraph ends a section at all is what they say first).
+    fn value(&mut self, property: Option<&XEl>, skip: &dyn Fn(&XEl) -> bool, present_counts: bool) -> Result<u32, String> {
         let Some(property) = property else { return Ok(EMPTY) };
         let kept_children = property.kids.iter().any(|node| match node {
             XNode::El(child) => !skip(child),
             XNode::Text(text) => !is_space(text),
         });
-        if !kept_children && !self.canon.has_attributes(property) {
+        if !present_counts && !kept_children && !self.canon.has_attributes(property) {
             return Ok(EMPTY);
         }
         let digest = self.canon.digest(property, &|child| !skip(child), self.budget)?;
@@ -607,7 +676,8 @@ impl Walker<'_, '_> {
     }
 
     /// A property slot: `property` without its tracked change (`change_name`, whose `inner` child
-    /// holds the properties before it) and without the `skip` children.
+    /// holds the properties before it) and without the `skip` children. A change that records no
+    /// properties before it explains nothing: its old value is one no base can have.
     fn slot(
         &mut self,
         name: &'static str,
@@ -616,12 +686,20 @@ impl Walker<'_, '_> {
         inner: &str,
         skip: &dyn Fn(&XEl) -> bool,
     ) -> Result<Option<Slot>, String> {
+        let present_counts = matches!(name, "sectPr" | "pPr.sectPr");
         let change = property.and_then(|property| first(property, change_name));
-        let value = self.value(property, &|child| is(child, change) || skip(child))?;
+        let value = self.value(property, &|child| is(child, change) || skip(child), present_counts)?;
         let rev = match change {
             Some(change) => {
                 let old_properties = first(change, inner);
-                let old = self.value(old_properties, &|_| false)?;
+                let old = match old_properties {
+                    Some(_) => self.value(old_properties, &|_| false, present_counts)?,
+                    None => {
+                        let mut hasher = Hasher::default();
+                        hasher.field(b'!', b"no properties recorded");
+                        self.tables.content(finish(hasher, self.budget)?)
+                    }
+                };
                 let digest = self.canon.digest(change, &|child| !is(child, old_properties), self.budget)?;
                 let extra = self.tables.content(digest);
                 let (author, date, _) = self.note(change, RevisionKind::Format)?;
@@ -692,7 +770,7 @@ impl Walker<'_, '_> {
     }
 
     fn block(&mut self, el: &XEl) -> Result<(), String> {
-        self.budget.work(1)?;
+        self.budget.work(4)?;
         match &*el.name {
             "w:p" => self.paragraph(el),
             "w:tbl" => self.table(el),
@@ -704,7 +782,11 @@ impl Walker<'_, '_> {
                 let mut hasher = Hasher::default();
                 hasher.field(b'Z', &[]);
                 let digest = finish(hasher, self.budget)?;
-                self.mark(digest, || MarkInfo { element: Rc::from("w:sectPr"), comment: None, kind: MarkKind::Section }, format)
+                self.mark(
+                    digest,
+                    || MarkInfo { element: Rc::from("w:sectPr"), comment: None, kind: MarkKind::Section, holds: Holds::default() },
+                    format,
+                )
             }
             _ if empty_marker(el) => Ok(()),
             _ => self.opaque(el, EMPTY),
@@ -712,7 +794,7 @@ impl Walker<'_, '_> {
     }
 
     fn inline(&mut self, el: &XEl) -> Result<(), String> {
-        self.budget.work(1)?;
+        self.budget.work(4)?;
         match &*el.name {
             "w:r" => self.run(el),
             "w:ins" | "w:del" | "w:moveFrom" | "w:moveTo" => self.wrap(el),
@@ -780,7 +862,7 @@ impl Walker<'_, '_> {
         }
         let digest = finish(hasher, self.budget)?;
         let element = el.name.clone();
-        self.mark(digest, || MarkInfo { element, comment: None, kind: MarkKind::Plain }, EMPTY)?;
+        self.mark(digest, || MarkInfo { element, comment: None, kind: MarkKind::Plain, holds: Holds::default() }, EMPTY)?;
         for node in &el.kids {
             match node {
                 XNode::El(child) if is(child, properties) || is(child, end_properties) => {}
@@ -812,13 +894,14 @@ impl Walker<'_, '_> {
         slots.extend(self.slot("pPr", properties, "w:pPrChange", "w:pPr", &|child| is(child, mark_properties) || is(child, section))?);
         slots.extend(self.slot("pPr.rPr", mark_properties, "w:rPrChange", "w:rPr", &is_wrap)?);
         slots.extend(self.slot("pPr.sectPr", section, "w:sectPrChange", "w:sectPr", &|_| false)?);
-        let format = self.format(slots, false, false);
+        // A hidden mark hides the paragraph's end: its paragraph runs into the next.
+        let format = self.format(slots, hides(mark_properties), false);
         let mut hasher = Hasher::default();
         hasher.field(b'P', &[]);
         self.canon.start_tag(p, &mut hasher);
         let digest = finish(hasher, self.budget)?;
         let element = p.name.clone();
-        self.mark(digest, || MarkInfo { element, comment: None, kind: MarkKind::Paragraph }, format)?;
+        self.mark(digest, || MarkInfo { element, comment: None, kind: MarkKind::Paragraph, holds: Holds::default() }, format)?;
         self.leave_to(depth);
         Ok(())
     }

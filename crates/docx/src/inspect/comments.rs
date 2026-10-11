@@ -4,7 +4,11 @@
 
 use std::collections::{BTreeMap, HashMap};
 
-use super::budget::Budget;
+use super::budget::{Budget, units};
+
+/// Memory charged for each comment kept, besides its strings and identities; and for each entry of
+/// the paragraph map used while reading.
+const COMMENT_BYTES: u64 = 320;
 use super::digest::{Digest, Hasher};
 use super::opc::{Canon, finish};
 use super::xml::{XEl, XNode, is_space};
@@ -45,6 +49,7 @@ pub(super) fn read(comments: &XEl, extended: Option<&XEl>, canon: &Canon<'_>, bu
         let id = el.attr("w:id").ok_or("a comment without an id")?.to_string();
         let without_id =
             XEl { name: el.name.clone(), attrs: el.attrs.iter().filter(|(key, _)| &**key != "w:id").cloned().collect(), kids: Vec::new() };
+        budget.work(200)?;
         let meta = canon.start_digest(&without_id, budget)?;
         let mut content = Hasher::default();
         for node in &el.kids {
@@ -55,8 +60,11 @@ pub(super) fn read(comments: &XEl, extended: Option<&XEl>, canon: &Canon<'_>, bu
             }
         }
         let content = finish(content, budget)?;
-        budget.hold(256)?;
+        // Kept for the whole inspection: the record, its strings and identities, its map entry.
+        let strings = id.len().saturating_add(el.attr("w:author").map_or(0, str::len)).saturating_mul(2);
+        budget.hold(COMMENT_BYTES.saturating_add(units(strings)).saturating_add(meta.held()).saturating_add(content.held()))?;
         if let Some(paragraph) = el.els().filter(|child| &*child.name == "w:p").last().and_then(|p| p.attr("w14:paraId")) {
+            budget.hold(COMMENT_BYTES.saturating_add(units(paragraph.len().saturating_add(id.len()))))?;
             by_paragraph.entry(paragraph.to_string()).and_modify(|entry| *entry = None).or_insert_with(|| Some(id.clone()));
         }
         let comment = Comment { author: el.attr("w:author").unwrap_or("").to_string(), meta, content, done: false, parent: None };

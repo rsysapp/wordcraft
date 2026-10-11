@@ -8,14 +8,14 @@
 //! prefixes as [`crate::xml`]), `{uri}local` for any other namespace, and the bare local name for
 //! none, so a producer's own prefixes never matter.
 
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
 
 use quick_xml::events::{BytesStart, Event};
 use quick_xml::name::{QName, ResolveResult};
 use quick_xml::reader::NsReader;
 
-use super::budget::Budget;
+use super::budget::{Budget, units};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(super) enum XNode {
@@ -64,18 +64,51 @@ impl XEl {
     }
 }
 
-/// Element and attribute names, shared by every part of both packages.
+/// Element and attribute names, shared by every part of both packages. A name in a namespace this
+/// module does not know is written `{n}local`, `n` being the namespace's number here, so a long
+/// namespace is kept once, never spelled out in each name. Everything kept is charged.
 #[derive(Default)]
-pub(super) struct Names(HashMap<String, Rc<str>>);
+pub(super) struct Names {
+    names: HashSet<Rc<str>>,
+    namespaces: HashMap<Box<[u8]>, usize>,
+}
+
+/// The most distinct names one inspection keeps; no WordprocessingML package has a fraction of
+/// them.
+const MAX_NAMES: usize = 100_000;
+/// Memory charged for each name or namespace kept, besides its bytes: the shared string and its
+/// table entry.
+const NAME_BYTES: u64 = 96;
 
 impl Names {
-    fn get(&mut self, name: String) -> Rc<str> {
-        if let Some(found) = self.0.get(&name) {
-            return found.clone();
+    fn get(&mut self, name: &str, budget: &mut Budget) -> Result<Rc<str>, String> {
+        // A lookup hashes and compares the name.
+        budget.work(16 + units(name.len()) / 4)?;
+        if let Some(found) = self.names.get(name) {
+            return Ok(found.clone());
         }
-        let shared: Rc<str> = Rc::from(name.as_str());
-        self.0.insert(name, shared.clone());
-        shared
+        if self.names.len() >= MAX_NAMES {
+            return Err("more distinct XML names than an inspection keeps".into());
+        }
+        budget.hold(NAME_BYTES.saturating_add(units(name.len())))?;
+        let shared: Rc<str> = Rc::from(name);
+        self.names.insert(shared.clone());
+        Ok(shared)
+    }
+
+    /// The number of a namespace this module has no prefix for.
+    fn namespace(&mut self, uri: &[u8], budget: &mut Budget) -> Result<usize, String> {
+        budget.work(4 + units(uri.len()) / 4)?;
+        if let Some(number) = self.namespaces.get(uri) {
+            return Ok(*number);
+        }
+        if self.namespaces.len() >= MAX_NAMES {
+            return Err("more distinct XML namespaces than an inspection keeps".into());
+        }
+        budget.hold(NAME_BYTES.saturating_add(units(uri.len())))?;
+        let number = self.namespaces.len();
+        self.namespaces.insert(uri.into(), number);
+        Ok(number)
     }
 }
 
@@ -85,12 +118,13 @@ pub(super) struct Limits {
     pub max_depth: usize,
 }
 
-/// Memory charged for each element of a parsed tree: its node in its parent's children, twice (a
-/// growing vector holds up to twice its length, and both copies while it moves; vectors are shrunk
-/// to fit as elements close), and the allocator's share.
-const ELEMENT_BYTES: u64 = 2 * std::mem::size_of::<XNode>() as u64 + 16;
-/// Memory charged for each attribute, besides its value.
-const ATTRIBUTE_BYTES: u64 = std::mem::size_of::<(Rc<str>, String)>() as u64 + 16;
+/// Memory charged for each element of a parsed tree: its node in its parent's children, three times
+/// (a growing vector holds up to twice its length, and its old room too while it moves; vectors are
+/// shrunk to fit as elements close), and the allocator's share.
+const ELEMENT_BYTES: u64 = 3 * std::mem::size_of::<XNode>() as u64 + 16;
+/// Memory charged for each attribute, besides its value: its entry (three times, as for elements),
+/// the reader's record of its key, and the duplicate check's.
+const ATTRIBUTE_BYTES: u64 = 3 * std::mem::size_of::<(Rc<str>, String)>() as u64 + 64;
 /// The longest element, attribute or namespace name read; a longer one is no WordprocessingML.
 const MAX_NAME: usize = 4_096;
 
@@ -106,23 +140,30 @@ const OTHER_NAMESPACES: &[(&str, &str)] = &[
     ("ep", "http://schemas.openxmlformats.org/officeDocument/2006/extended-properties"),
 ];
 
-fn qualified(namespace: &[u8], local: &str) -> Result<String, String> {
+fn qualified(namespace: &[u8], local: &str, names: &mut Names, budget: &mut Budget) -> Result<String, String> {
     for (prefix, uri) in crate::xml::NAMESPACES.iter().chain(OTHER_NAMESPACES) {
         if uri.as_bytes() == namespace {
             return Ok(format!("{prefix}:{local}"));
         }
     }
-    let uri = std::str::from_utf8(namespace).map_err(|_| "a namespace that is not UTF-8".to_string())?;
-    Ok(format!("{{{}}}{local}", escape(uri)))
+    std::str::from_utf8(namespace).map_err(|_| "a namespace that is not UTF-8".to_string())?;
+    Ok(format!("{{{}}}{local}", names.namespace(namespace, budget)?))
 }
 
-fn resolved(result: ResolveResult<'_>, local: &[u8]) -> Result<String, String> {
+fn resolved(result: ResolveResult<'_>, local: &[u8], names: &mut Names, budget: &mut Budget) -> Result<String, String> {
     let local = std::str::from_utf8(local).map_err(|_| "a name that is not UTF-8".to_string())?;
     if local.len() > MAX_NAME || matches!(&result, ResolveResult::Bound(namespace) if namespace.as_ref().len() > MAX_NAME) {
         return Err("a name longer than any WordprocessingML name".into());
     }
+    // Braces and colons are no name characters; refusing them keeps `{n}local` and `prefix:local`
+    // apart from any local name.
+    if local.is_empty() || local.contains(['{', '}', ':']) {
+        return Err(format!("an element or attribute named {local:?}"));
+    }
+    // Resolving a prefix walks the bindings in scope and compares the namespace with the known ones.
+    budget.work(8 + units(local.len()) / 4)?;
     match result {
-        ResolveResult::Bound(namespace) => qualified(namespace.as_ref(), local),
+        ResolveResult::Bound(namespace) => qualified(namespace.as_ref(), local, names, budget),
         ResolveResult::Unbound => Ok(local.to_string()),
         ResolveResult::Unknown(prefix) => Err(format!("an undeclared prefix {:?}", String::from_utf8_lossy(&prefix))),
     }
@@ -224,7 +265,7 @@ fn item_bound(stack: &[XEl], length: usize) -> u64 {
 
 fn charge(budget: &mut Budget, held: &mut u64, bytes: u64) -> Result<(), String> {
     budget.hold(bytes)?;
-    budget.work(1 + bytes / 64)?;
+    budget.work(1 + bytes / super::budget::BYTES_PER_UNIT_PARSED)?;
     *held = held.saturating_add(bytes);
     Ok(())
 }
@@ -260,11 +301,9 @@ fn parse_into(
                     return Err("content after the root element".into());
                 }
                 limits.elements_left = limits.elements_left.checked_sub(1).ok_or(super::TOO_MANY_ELEMENTS)?;
-                let name = resolved(result, start.local_name().as_ref())?;
-                let element = element(&reader, name, start, names)?;
-                let values: usize = element.attrs.iter().map(|(_, value)| value.len()).sum();
-                let attributes = super::budget::units(element.attrs.len()).saturating_mul(ATTRIBUTE_BYTES);
-                charge(budget, held, ELEMENT_BYTES.saturating_add(attributes).saturating_add(super::budget::units(values)))?;
+                let name = resolved(result, start.local_name().as_ref(), names, budget)?;
+                charge(budget, held, ELEMENT_BYTES)?;
+                let element = element(&reader, name, start, names, budget, held)?;
                 *most_items = most_items.saturating_add(2);
                 if matches!(event, Event::Start(_)) {
                     if stack.len() >= limits.max_depth {
@@ -318,27 +357,48 @@ fn parse_into(
     root.ok_or_else(|| "no root element".to_string())
 }
 
-fn element(reader: &NsReader<&[u8]>, name: String, start: &BytesStart<'_>, names: &mut Names) -> Result<XEl, String> {
+/// The most attributes one element may carry; real ones carry a few dozen.
+const MAX_ATTRIBUTES: usize = 512;
+
+fn element(
+    reader: &NsReader<&[u8]>,
+    name: String,
+    start: &BytesStart<'_>,
+    names: &mut Names,
+    budget: &mut Budget,
+    held: &mut u64,
+) -> Result<XEl, String> {
     let mut attrs: Vec<(Rc<str>, String)> = Vec::new();
-    let mut seen = BTreeSet::new();
+    // Names are interned, so one name is one pointer.
+    let mut seen: HashSet<*const u8> = HashSet::new();
+    let mut declared = 0usize;
     for attribute in start.attributes().with_checks(true) {
         let attribute = attribute.map_err(|error| format!("a malformed attribute: {error}"))?;
+        if attrs.len().saturating_add(declared) >= MAX_ATTRIBUTES {
+            return Err("an element with more attributes than any real one".into());
+        }
+        // Held as it is read: its entry, its value, the records the checks keep.
+        charge(budget, held, ATTRIBUTE_BYTES.saturating_add(units(attribute.value.len())))?;
         let key = attribute.key.as_ref();
         if key == b"xmlns" || key.starts_with(b"xmlns:") {
+            // The reader keeps each declaration while its element is open.
+            declared = declared.saturating_add(1);
+            budget.work(4 + units(attribute.value.len()) / 4)?;
             continue;
         }
         let (namespace, local) = reader.resolve_attribute(attribute.key);
-        let key = resolved(namespace, local.as_ref())?;
+        let key = resolved(namespace, local.as_ref(), names, budget)?;
         let mut value = attribute_value(&attribute.value)?;
         if holds_prefixes(&name, &key) {
             value = qualified_list(reader, &key, &value)?;
         }
-        if !seen.insert(key.clone()) {
+        let key = names.get(&key, budget)?;
+        if !seen.insert(Rc::as_ptr(&key).cast::<u8>()) {
             return Err(format!("the attribute {key} twice"));
         }
-        attrs.push((names.get(key), value));
+        attrs.push((key, value));
     }
-    Ok(XEl { name: names.get(name), attrs, kids: Vec::new() })
+    Ok(XEl { name: names.get(&name, budget)?, attrs, kids: Vec::new() })
 }
 
 /// `p1 p2:local` with each prefix replaced by its namespace in scope (an unprefixed `xsi:type`
@@ -392,23 +452,6 @@ fn close(stack: &mut [XEl], root: &mut Option<XEl>, mut element: XEl) {
         Some(parent) => parent.kids.push(XNode::El(element)),
         None => *root = Some(element),
     }
-}
-
-/// Escape for the canonical form, so distinct trees never print the same.
-pub(super) fn escape(text: &str) -> String {
-    let mut out = String::with_capacity(text.len());
-    for c in text.chars() {
-        match c {
-            '&' => out.push_str("&amp;"),
-            '<' => out.push_str("&lt;"),
-            '>' => out.push_str("&gt;"),
-            '"' => out.push_str("&quot;"),
-            '{' => out.push_str("&#123;"),
-            '}' => out.push_str("&#125;"),
-            c => out.push(c),
-        }
-    }
-    out
 }
 
 pub(super) fn is_space(text: &str) -> bool {

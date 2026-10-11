@@ -4,6 +4,18 @@
 //! interned content, diff state) and is charged before it is allocated, so the limit is never
 //! passed first and refused after.
 
+/// Work is counted in units of roughly ten nanoseconds of this machine's time, so that
+/// `MAX_WORK` is a few seconds whatever the input: these say how many bytes of each kind of
+/// processing one unit pays for.
+/// Bytes inflated from the zip, or compared.
+pub(super) const BYTES_PER_UNIT_INFLATED: u64 = 8;
+/// Bytes of XML parsed.
+pub(super) const BYTES_PER_UNIT_PARSED: u64 = 8;
+/// Bytes run through SHA-256.
+pub(super) const BYTES_PER_UNIT_HASHED: u64 = 4;
+/// Bytes kept as an exact identity (copied and later hashed for a table).
+pub(super) const BYTES_PER_UNIT_KEPT: u64 = 16;
+
 /// Why work ran out.
 pub(super) const TOO_MUCH_WORK: &str = "more work than an inspection does";
 /// Why memory ran out.
@@ -13,7 +25,6 @@ pub(super) struct Budget {
     work_left: u64,
     held: u64,
     limit: u64,
-    #[cfg_attr(not(test), allow(dead_code))]
     peak: u64,
     /// A charge was refused inside a comparison that can only answer "stopped"; the inspection
     /// is then refused as a whole.
@@ -65,7 +76,6 @@ impl Budget {
     }
 
     /// The most held at once, for measurements.
-    #[cfg_attr(not(test), allow(dead_code))]
     pub(super) fn peak(&self) -> u64 {
         self.peak
     }

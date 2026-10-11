@@ -12,7 +12,7 @@ use std::io::{Cursor, Read};
 use zip::ZipArchive;
 
 use super::InspectError;
-use super::budget::{Budget, units};
+use super::budget::{BYTES_PER_UNIT_INFLATED, Budget, units};
 use crate::package::{MAX_ENTRIES, ReadLimits};
 
 /// A package whose every entry was read once, in full, within the limits.
@@ -35,6 +35,8 @@ const DESCRIBED_AFTER: u16 = 0x0008;
 /// Extra-field ids: ZIP64 sizes, and Info-ZIP's second spelling of the name.
 const ZIP64_EXTRA: u16 = 0x0001;
 const UNICODE_PATH: u16 = 0x7075;
+/// Work charged for opening one entry's stream (its decompressor and buffers).
+const ENTRY_WORK: u64 = 2_000;
 /// Memory charged for each entry indexed.
 const ENTRY_BYTES: u64 = 192;
 
@@ -290,7 +292,7 @@ impl<'a> StrictPackage<'a> {
             // Read to the end, so the zip crate checks the CRC, without keeping the bytes yet.
             let read = std::io::copy(&mut (&mut entry).take(room.saturating_add(1)), &mut std::io::sink())
                 .map_err(|error| format!("zip entry {name} unreadable: {error}"))?;
-            budget.work(1 + read / 64)?;
+            budget.work(ENTRY_WORK.saturating_add(read / BYTES_PER_UNIT_INFLATED))?;
             if read > room {
                 return Err(format!("part {name} decompresses past the size limit"));
             }
@@ -331,7 +333,7 @@ impl<'a> StrictPackage<'a> {
             if units(bytes.len()) != size {
                 return Err(format!("part {name} decompresses to another size than it declares"));
             }
-            budget.work(1 + size / 64)?;
+            budget.work(ENTRY_WORK.saturating_add(size / BYTES_PER_UNIT_INFLATED))?;
             Ok(bytes)
         })();
         if read.is_err() {
@@ -355,6 +357,7 @@ pub(super) fn same_bytes(
     if base_size != edited_size {
         return Ok(false);
     }
+    budget.work(2 * ENTRY_WORK).map_err(InspectError::Edited)?;
     let unreadable = |error: String| format!("zip entry {name} unreadable: {error}");
     let mut before = base.archive.by_index(base_position).map_err(|error| InspectError::Base(unreadable(error.to_string())))?;
     let mut after = edited.archive.by_index(edited_position).map_err(|error| InspectError::Edited(unreadable(error.to_string())))?;
@@ -367,7 +370,7 @@ pub(super) fn same_bytes(
         let (Some(left), Some(right)) = (left.get_mut(..chunk), right.get_mut(..chunk)) else { return Ok(false) };
         before.read_exact(left).map_err(|error| InspectError::Base(unreadable(error.to_string())))?;
         after.read_exact(right).map_err(|error| InspectError::Edited(unreadable(error.to_string())))?;
-        budget.work(1 + units(chunk) / 64).map_err(InspectError::Edited)?;
+        budget.work(1 + units(chunk) / BYTES_PER_UNIT_INFLATED).map_err(InspectError::Edited)?;
         if left != right {
             return Ok(false);
         }

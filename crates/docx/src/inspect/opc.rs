@@ -3,7 +3,11 @@
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 
-use super::budget::Budget;
+use super::budget::{Budget, units};
+
+/// Memory charged for each relationship or content type kept, besides its strings: the strings'
+/// own headers and the table entry with its share of the table's spare room.
+const REL_BYTES: u64 = 256;
 use super::digest::{Digest, Hasher};
 use super::xml::{XEl, XNode, is_space};
 
@@ -23,7 +27,7 @@ pub(super) struct Rels {
 }
 
 impl Rels {
-    pub(super) fn parse(root: &XEl) -> Result<Rels, String> {
+    pub(super) fn parse(root: &XEl, budget: &mut Budget) -> Result<Rels, String> {
         if &*root.name != "rel:Relationships" {
             return Err("a relationship part without Relationships".into());
         }
@@ -50,6 +54,10 @@ impl Rels {
                         Some("External") => true,
                         Some(other) => return Err(format!("a relationship TargetMode {other:?}")),
                     };
+                    // Kept for the whole inspection: the strings, and the entry with its share of the
+                    // table's room.
+                    budget.hold(REL_BYTES.saturating_add(units(id.len().saturating_add(kind.len()).saturating_add(target.len()))))?;
+                    budget.work(40 + units(id.len()) / 4)?;
                     if by_id.insert(id.to_string(), Rel { kind: kind.to_string(), target: target.to_string(), external }).is_some() {
                         return Err(format!("two relationships with Id {id}"));
                     }
@@ -60,8 +68,8 @@ impl Rels {
         Ok(Rels { by_id })
     }
 
-    pub(super) fn set(&self) -> BTreeSet<Rel> {
-        self.by_id.values().cloned().collect()
+    pub(super) fn set(&self) -> BTreeSet<&Rel> {
+        self.by_id.values().collect()
     }
 
     pub(super) fn of_type<'a>(&'a self, kind: &'a str) -> impl Iterator<Item = &'a Rel> + 'a {
@@ -102,7 +110,7 @@ pub(super) struct ContentTypes {
 }
 
 impl ContentTypes {
-    pub(super) fn parse(root: &XEl) -> Result<ContentTypes, String> {
+    pub(super) fn parse(root: &XEl, budget: &mut Budget) -> Result<ContentTypes, String> {
         if &*root.name != "ct:Types" {
             return Err("[Content_Types].xml without Types".into());
         }
@@ -126,6 +134,8 @@ impl ContentTypes {
                         return Err("a content type entry without its attributes".into());
                     };
                     let key = key.strip_prefix('/').unwrap_or(key).to_lowercase();
+                    budget.hold(REL_BYTES.saturating_add(units(key.len().saturating_add(kind.len()))))?;
+                    budget.work(40 + units(key.len()) / 4)?;
                     if map.insert(key.clone(), kind.to_string()).is_some() {
                         return Err(format!("two content types for {key}"));
                     }
@@ -322,6 +332,7 @@ impl Canon<'_> {
 
 /// A finished digest, its bytes charged as work (one unit per 64 bytes hashed, at least one).
 pub(super) fn finish(hasher: Hasher, budget: &mut Budget) -> Result<Digest, String> {
-    budget.work(1 + hasher.length() / 64)?;
+    let per_unit = if hasher.is_long() { super::budget::BYTES_PER_UNIT_HASHED } else { super::budget::BYTES_PER_UNIT_KEPT };
+    budget.work(1 + hasher.length() / per_unit)?;
     Ok(hasher.finish())
 }

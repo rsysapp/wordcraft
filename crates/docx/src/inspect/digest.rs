@@ -33,6 +33,11 @@ pub(super) struct Hasher {
 }
 
 impl Hasher {
+    /// Whether the content went to SHA-256 (it is longer than an exact identity keeps).
+    pub(super) fn is_long(&self) -> bool {
+        self.long.is_some()
+    }
+
     /// Bytes fed so far, for charging the work they cost.
     pub(super) fn length(&self) -> u64 {
         self.length

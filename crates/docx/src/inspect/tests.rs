@@ -1388,3 +1388,202 @@ fn parsing_spends_the_work_budget() {
         matches!(inspect_budgeted(&base, &base, &INSPECT_LIMITS, MAX_CHANGES, &mut budget), Err(InspectError::Base(message)) if message.contains("work"))
     );
 }
+
+// ---- Tracked property changes, base fields, hidden marks, opaque content in insertions --------
+
+/// A section break added to a base paragraph mark under a section change whose old properties are
+/// empty, or hold only a revision id: Word shows no revision and a new section. Whether a mark ends a
+/// section is part of what it is.
+#[test]
+fn reports_a_section_break_added_under_an_empty_section_change() {
+    let base = package(&format!("{}{}", para(&text("Clause one.")), para(&text("Clause two."))), &[]);
+    let added = |old: &str| {
+        package(
+            &format!(
+                r#"<w:p><w:pPr><w:sectPr><w:pgSz w:w="16838" w:h="11906"/><w:sectPrChange w:id="3" w:author="{}" w:date="{}">{old}</w:sectPrChange></w:sectPr></w:pPr>{}</w:p>{}"#,
+                SARI.0,
+                SARI.1,
+                text("Clause one."),
+                para(&text("Clause two."))
+            ),
+            &[],
+        )
+    };
+    for old in [r#"<w:sectPr/>"#, r#"<w:sectPr w:rsidR="00A1B2C3"/>"#, ""] {
+        let inspection = inspect(&base, &added(old)).unwrap();
+        assert!(inspection.untracked_changes > 0, "{old}: {inspection:#?}");
+    }
+}
+
+/// A tracked formatting change accepted only when its recorded old properties are the base's: with
+/// no old properties recorded at all, it explains nothing.
+#[test]
+fn reports_a_formatting_change_that_records_no_old_properties() {
+    let base = package(&para(&text("Rent.")), &[]);
+    let edited =
+        package(&para(&format!(r#"<w:r><w:rPr><w:b/><w:rPrChange w:author="{}" w:date="{}"/></w:rPr><w:t>Rent.</w:t></w:r>"#, SARI.0, SARI.1)), &[]);
+    assert_eq!(inspect(&base, &edited).unwrap().untracked_changes, 5);
+}
+
+fn quoted_field(code: &str, result: &str) -> String {
+    format!("{}{}{}{}{}", field_char("begin"), instruction(code), field_char("separate"), text(result), field_char("end"))
+}
+
+fn deleted((author, date): (&str, &str), runs: &str) -> String {
+    format!(r#"<w:del w:id="7" w:author="{author}" w:date="{date}">{runs}</w:del>"#)
+}
+
+fn deleted_field_char(kind: &str) -> String {
+    format!(r#"<w:r><w:fldChar w:fldCharType="{kind}"/></w:r>"#)
+}
+
+/// A base field's separator deleted with tracking: once accepted, the result is gone. A base
+/// field's code narrowed with tracking: once updated, the field shows other text. Each changes
+/// the field otherwise than deleting it whole.
+#[test]
+fn reports_a_base_field_changed_by_tracked_deletions() {
+    let base = package(&para(&format!("{}{}{}", text("Rent is due "), quoted_field(r#" QUOTE "not monthly" "#, "not monthly"), text("."))), &[]);
+    let separator_gone = format!(
+        "{}{}{}{}{}{}{}",
+        text("Rent is due "),
+        field_char("begin"),
+        instruction(r#" QUOTE "not monthly" "#),
+        deleted(SARI, &deleted_field_char("separate")),
+        text("not monthly"),
+        field_char("end"),
+        text(".")
+    );
+    let inspection = inspect(&base, &package(&para(&separator_gone), &[])).unwrap();
+    assert_eq!(inspection.untracked_changes, 1, "{inspection:#?}");
+    assert_eq!(inspection.new_revisions[0].field_codes, 1);
+    let narrowed = format!(
+        r#"{}{}<w:r><w:instrText xml:space="preserve"> QUOTE "</w:instrText></w:r>{}<w:r><w:instrText xml:space="preserve">monthly" </w:instrText></w:r>{}{}{}{}"#,
+        text("Rent is due "),
+        field_char("begin"),
+        deleted(SARI, r#"<w:r><w:delInstrText xml:space="preserve">not </w:delInstrText></w:r>"#),
+        field_char("separate"),
+        text("not monthly"),
+        field_char("end"),
+        text(".")
+    );
+    let inspection = inspect(&base, &package(&para(&narrowed), &[])).unwrap();
+    assert_eq!(inspection.untracked_changes, 1, "{inspection:#?}");
+    assert_eq!(inspection.new_revisions[0].field_codes, 4);
+    // Its start deleted with tracking changes it too.
+    let start_gone = format!(
+        "{}{}{}",
+        text("Rent is due "),
+        deleted(SARI, &deleted_field_char("begin")),
+        &quoted_field(r#" QUOTE "not monthly" "#, "not monthly").replacen(&field_char("begin"), "", 1)
+    );
+    assert_eq!(inspect(&base, &package(&para(&format!("{start_gone}{}", text("."))), &[])).unwrap().untracked_changes, 1);
+}
+
+/// The whole base field deleted with tracking is a tracked deletion, and nothing else.
+#[test]
+fn accepts_a_base_field_deleted_whole() {
+    let field = |result: &str| quoted_field(r#" QUOTE "not monthly" "#, result);
+    let base = package(&para(&format!("{}{}{}", text("Rent is due "), field("not monthly"), text("."))), &[]);
+    let whole = format!(
+        "{}{}{}",
+        text("Rent is due "),
+        deleted(
+            SARI,
+            &format!(
+                r#"{}<w:r><w:delInstrText xml:space="preserve"> QUOTE "not monthly" </w:delInstrText></w:r>{}<w:r><w:delText>not monthly</w:delText></w:r>{}"#,
+                field_char("begin"),
+                field_char("separate"),
+                field_char("end")
+            )
+        ),
+        text(".")
+    );
+    let inspection = inspect(&base, &package(&para(&whole), &[])).unwrap();
+    assert!(clean(&inspection), "{inspection:#?}");
+    assert_eq!(counts(&inspection), vec![(SARI.0.into(), 0, 1, 0)]);
+    assert!(inspection.new_revisions[0].field_codes > 0);
+}
+
+/// A hidden paragraph mark, inserted or hidden by a tracked change, is hidden text.
+#[test]
+fn counts_hidden_paragraph_marks() {
+    let base = package(&format!("{}{}", para(&text("One.")), para(&text("Two."))), &[]);
+    let hidden_by_change = package(
+        &format!(
+            r#"<w:p><w:pPr><w:rPr><w:vanish/><w:rPrChange w:author="{}" w:date="{}"><w:rPr/></w:rPrChange></w:rPr></w:pPr>{}</w:p>{}"#,
+            SARI.0,
+            SARI.1,
+            text("One."),
+            para(&text("Two."))
+        ),
+        &[],
+    );
+    assert_eq!(inspect(&base, &hidden_by_change).unwrap().new_revisions[0].hidden_text, 1);
+    let inserted_hidden = package(
+        &format!(
+            r#"<w:p><w:pPr><w:rPr><w:ins w:author="{}" w:date="{}"/><w:vanish/></w:rPr></w:pPr>{}</w:p>{}"#,
+            SARI.0,
+            SARI.1,
+            text("One."),
+            para(&text("Two."))
+        ),
+        &[],
+    );
+    let inspection = inspect(&base, &inserted_hidden).unwrap();
+    assert_eq!(inspection.new_revisions[0].hidden_text, 1, "{inspection:#?}");
+}
+
+/// Opaque content inside an insertion is an object, and what it holds is counted.
+#[test]
+fn counts_what_opaque_content_in_an_insertion_holds() {
+    let base = package(&para(&text("Rent.")), &[]);
+    let boxed = format!(
+        r#"<w:r><w:pict><w:txbxContent><w:p><w:r><w:rPr><w:vanish/></w:rPr><w:t>hidden</w:t></w:r><w:r><w:fldChar w:fldCharType="begin"/></w:r><w:r><w:t>{}</w:t></w:r></w:p></w:txbxContent></w:pict></w:r>"#,
+        "\u{202E}x"
+    );
+    let inspection = inspect(&base, &package(&para(&format!("{}{}", text("Rent."), inserted(SARI, &boxed))), &[])).unwrap();
+    let sari = &inspection.new_revisions[0];
+    assert_eq!((sari.objects, sari.hidden_text, sari.field_codes, sari.bidi_controls), (1, 1, 1, 1));
+    let reference = r#"<w:r><w:commentReference w:id="9"><w:t>Rent is waived.</w:t></w:commentReference></w:r>"#;
+    let inspection = inspect(&base, &package(&para(&format!("{}{}", text("Rent."), inserted(SARI, reference))), &[])).unwrap();
+    assert_eq!(inspection.new_revisions[0].objects, 1);
+}
+
+// ---- Names, namespaces and attributes are charged ----------------------------------------------
+
+fn custom(part: String) -> Vec<u8> {
+    package(&para(&text("Rent.")), &[("customXml/item1.xml", &part)])
+}
+
+/// Distinct long names are kept once each, and charged: a small upload of many of them is refused
+/// at the memory budget, never held uncharged.
+#[test]
+fn charges_the_names_it_keeps() {
+    let elements: String = (0..2_000).map(|n| format!("<p:{}{n}/>", "n".repeat(4_000))).collect();
+    let names = custom(format!(r#"<data xmlns:p="urn:x">{elements}</data>"#));
+    // The part's 8 MB of bytes are held while it is parsed; its 8 MB of names on top pass 12 MB.
+    let mut budget = budget::Budget::new(u64::MAX, 12 << 20);
+    assert!(
+        matches!(inspect_budgeted(&names, &names, &INSPECT_LIMITS, MAX_CHANGES, &mut budget), Err(InspectError::Base(message)) if message.contains("memory"))
+    );
+}
+
+/// A long namespace is looked up for every element in it, and that is work: a short element
+/// repeated under one cannot run past the work budget's time.
+#[test]
+fn charges_namespace_lookups_as_work() {
+    let flood = custom(format!(r#"<data xmlns:p="{}">{}</data>"#, "{".repeat(4_096), "<p:a/>".repeat(20_000)));
+    let mut budget = budget::Budget::new(5_000_000, u64::MAX);
+    assert!(
+        matches!(inspect_budgeted(&flood, &flood, &INSPECT_LIMITS, MAX_CHANGES, &mut budget), Err(InspectError::Base(message)) if message.contains("work"))
+    );
+}
+
+/// An element with more attributes than any real one is refused.
+#[test]
+fn refuses_an_element_with_too_many_attributes() {
+    let attributes: String = (0..600).map(|n| format!(r#" p:a{n}="1""#)).collect();
+    let many = custom(format!(r#"<data xmlns:p="urn:x"><e{attributes}/></data>"#));
+    let base = package(&para(&text("Rent.")), &[]);
+    assert!(matches!(inspect(&base, &many), Err(InspectError::Edited(message)) if message.contains("attributes")));
+}

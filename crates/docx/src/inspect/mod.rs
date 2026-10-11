@@ -63,7 +63,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use crate::package::{ReadLimits, rt};
 use budget::Budget;
-use compare::{CommentIds, Holds, Pairs, Projector, Tally, assign_contexts, compare_story, facts};
+use compare::{CommentIds, Holds, Pairs, Projector, Tally, assign_contexts, compare_story, facts, field_structure};
 use digest::{Digest, Hasher};
 use opc::{Bookmarks, Canon, ContentTypes, Rel, Rels};
 use package::StrictPackage;
@@ -96,6 +96,15 @@ pub const MAX_MEMORY: u64 = 512 << 20;
 pub const MEMORY_PER_UPLOADED_BYTE: u64 = 8;
 /// …but never less than this, so an ordinary agreement, whose text compresses well, is read.
 pub const MEMORY_FLOOR: u64 = 384 << 20;
+
+/// Work charged for each part, besides its bytes: classifying it, its map entries, its tree's setup.
+const PART_WORK: u64 = 2_000;
+
+/// Memory every inspection holds whatever it reads.
+const FIXED_BYTES: u64 = 1 << 20;
+
+/// Memory charged for each part's entries in what a side keeps of it, besides its name.
+const PART_BYTES: u64 = 384;
 
 /// Why a package over its element budget is unreadable.
 const TOO_MANY_ELEMENTS: &str = "more XML elements than an inspection reads";
@@ -297,7 +306,19 @@ pub fn inspect_within(base: &[u8], edited: &[u8], limits: &ReadLimits, max_chang
     inspect_budgeted(base, edited, limits, max_changes, &mut budget)
 }
 
+/// [`inspect`], also answering the most memory the inspection charged to its budget. For tests that
+/// check, with a counting allocator, that the inspection never holds more than it charged.
+#[doc(hidden)]
+pub fn inspect_measured(base: &[u8], edited: &[u8]) -> (Result<Inspection, InspectError>, u64) {
+    let mut budget = Budget::new(MAX_WORK, memory_limit(base.len(), edited.len()));
+    let result = inspect_budgeted(base, edited, &INSPECT_LIMITS, MAX_CHANGES, &mut budget);
+    (result, budget.peak())
+}
+
 fn inspect_budgeted(base: &[u8], edited: &[u8], limits: &ReadLimits, max_changes: usize, budget: &mut Budget) -> Result<Inspection, InspectError> {
+    // What any inspection holds besides what it charges piece by piece: decompressor windows, the
+    // reader's state, small tables.
+    budget.hold(FIXED_BYTES).map_err(InspectError::Edited)?;
     let mut names = Names::default();
     let mut tables = Tables::new();
     let base = Side::read(base, limits, &mut names, &mut tables, budget).map_err(InspectError::Base)?;
@@ -384,14 +405,14 @@ impl<'a> Side<'a> {
         let all: Vec<String> = package.names().map(str::to_string).collect();
 
         let parsed = parse_part(&mut package, "[Content_Types].xml", names, &mut limits, budget)?;
-        let types = ContentTypes::parse(&parsed.root);
+        let types = ContentTypes::parse(&parsed.root, budget);
         budget.release(parsed.held);
         let types = types?;
         let mut rels = BTreeMap::new();
         for name in &all {
             if let Some(source) = opc::rels_source(name) {
                 let parsed = parse_part(&mut package, name, names, &mut limits, budget)?;
-                let part = Rels::parse(&parsed.root).map_err(|error| format!("{name}: {error}"));
+                let part = Rels::parse(&parsed.root, budget).map_err(|error| format!("{name}: {error}"));
                 budget.release(parsed.held);
                 rels.insert(source, part?);
             }
@@ -433,6 +454,9 @@ impl<'a> Side<'a> {
             if name == "[Content_Types].xml" || opc::rels_source(name).is_some() || comment_parts.contains(name) {
                 continue;
             }
+            // Its entries in the kinds, stories and canonical maps, and the names they keep.
+            budget.hold(PART_BYTES.saturating_add(budget::units(name.len()).saturating_mul(3)))?;
+            budget.work(PART_WORK)?;
             let content_type = types.of(name);
             let part_rels = rels.get(name.as_str()).unwrap_or(&empty);
             if content_type.is_some_and(opc::is_story_type) {
@@ -495,7 +519,7 @@ impl<'a> Side<'a> {
 
     /// The relationships compared for `source`: the main part's links to its comments parts are
     /// left out, since the comments are compared by meaning.
-    fn relationship_set(&self, source: &str) -> BTreeSet<Rel> {
+    fn relationship_set(&self, source: &str) -> BTreeSet<&Rel> {
         let Some(rels) = self.rels.get(source) else { return BTreeSet::new() };
         let mut set = rels.set();
         if source == self.main {
@@ -624,7 +648,8 @@ fn compare(
             assign_contexts(&mut before, tables, &mut |_, format| format, budget)?;
             assign_contexts(&mut after, tables, &mut |tables, format| projector.format(tables, format), budget)?;
             let moves = facts(&after, tables, &new_pairs, &mut holds, budget)?;
-            tally.untracked = tally.untracked.saturating_add(moves);
+            let fields = field_structure(&after, tables, &new_pairs, &mut holds, budget)?;
+            tally.untracked = tally.untracked.saturating_add(moves).saturating_add(fields);
             projector.project(tables, &mut after, budget)?;
             Ok(compare_story(name, &before, &after, tables, &ids, max_changes, budget, &mut tally))
         })();
