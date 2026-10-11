@@ -132,6 +132,21 @@ impl Package {
         self.limit_reached.get()
     }
 
+    /// embed: a part's position among the package's part names (sorted), for paragraph origins:
+    /// the exact name first, then one differing only in case, as [`Package::get`] finds parts.
+    pub fn part_index(&self, name: &str) -> Option<u32> {
+        let name = name.trim_start_matches('/');
+        let position = self.files.keys().position(|key| key == name).or_else(|| self.files.keys().position(|key| key.eq_ignore_ascii_case(name)))?;
+        u32::try_from(position).ok()
+    }
+
+    /// embed: the part name at `index` (see [`Package::part_index`]).
+    // embed: read by the preserving writer, which keeps the source package's parts.
+    #[allow(dead_code)]
+    pub fn part_name(&self, index: u32) -> Option<&str> {
+        self.files.keys().nth(usize::try_from(index).ok()?).map(String::as_str)
+    }
+
     /// Part bytes by name (leading `/` ignored; case-insensitive fallback).
     pub fn get(&self, name: &str) -> Option<&[u8]> {
         let n = name.trim_start_matches('/');
@@ -242,6 +257,27 @@ pub fn zip_entries(entries: &[(String, Vec<u8>)]) -> Result<Vec<u8>, DocxError> 
     Ok(c.into_inner())
 }
 
+/// embed: the archive's file names in the order they are stored (folders left out, each name
+/// once), so a writer that keeps the package keeps its order too.
+// embed: read by the preserving writer, which keeps the source package's parts.
+#[allow(dead_code)]
+pub fn entry_order(bytes: &[u8]) -> Result<Vec<String>, DocxError> {
+    let zip = zip::ZipArchive::new(Cursor::new(bytes)).map_err(|e| DocxError::Zip(e.to_string()))?;
+    let mut seen = std::collections::HashSet::new();
+    let mut names = Vec::new();
+    for index in 0..zip.len().min(MAX_ENTRIES) {
+        let Some(name) = zip.name_for_index(index) else { continue };
+        if name.ends_with('/') {
+            continue;
+        }
+        let name = name.trim_start_matches('/').to_string();
+        if seen.insert(name.clone()) {
+            names.push(name);
+        }
+    }
+    Ok(names)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -277,6 +313,22 @@ mod tests {
             Err(_) => {}
             Ok(p) => assert!(p.get("a.xml").is_none_or(|b| b.len() < 1024)),
         }
+    }
+
+    // embed: parts are numbered by their sorted names; the archive's own order is kept apart.
+    #[test]
+    fn numbers_parts_by_sorted_name_and_lists_entries_in_stored_order() {
+        let z = zip_of(&[("word/document.xml", b"<a/>".to_vec()), ("[Content_Types].xml", b"<b/>".to_vec()), ("Word/Header1.xml", b"<c/>".to_vec())]);
+        let package = Package::open(&z).unwrap();
+        // Byte order: upper case before `[`, `[` before lower case.
+        assert_eq!(package.part_index("[Content_Types].xml"), Some(1));
+        assert_eq!(package.part_index("/word/document.xml"), Some(2));
+        // A name differing only in case finds the part, as `get` does.
+        assert_eq!(package.part_index("word/header1.xml"), Some(0));
+        assert_eq!(package.part_index("word/missing.xml"), None);
+        assert_eq!(package.part_name(0), Some("Word/Header1.xml"));
+        assert_eq!(package.part_name(3), None);
+        assert_eq!(entry_order(&z).unwrap(), ["word/document.xml", "[Content_Types].xml", "Word/Header1.xml"]);
     }
 
     #[test]

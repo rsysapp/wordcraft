@@ -211,6 +211,8 @@ impl Reader<'_> {
     fn read_para(&mut self, sc: &mut StoryCtx, e: &El, rels: &Rels, depth: usize) -> Paragraph {
         let mut pb = PB::default();
         let mut para = Paragraph::new();
+        // embed: where the paragraph came from (Reader::begin_part).
+        para.origin = self.origin_of(e);
         for o in std::mem::take(&mut sc.pending) {
             pb.push_obj(o, &CharProps::default());
         }

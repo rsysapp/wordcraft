@@ -8,6 +8,8 @@
 #![deny(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unimplemented, clippy::todo, clippy::unreachable)]
 
 mod package;
+// embed: the writer that keeps the source package.
+mod preserve;
 mod read;
 mod units;
 mod write;
@@ -20,6 +22,8 @@ pub mod inspect;
 pub use package::ReadLimits;
 pub use read::{read, read_with_limits};
 pub use write::write;
+// embed: where a document read from a package keeps it.
+pub use preserve::SOURCE_PACKAGE;
 
 /// Errors from reading or writing a DOCX package.
 #[derive(Debug, thiserror::Error, Clone, PartialEq)]
@@ -39,4 +43,8 @@ pub enum DocxError {
     /// The package is readable but isn't a WordprocessingML document.
     #[error("not a Word document: {0}")]
     NotWord(String),
+    /// embed: a save the preserving writer cannot write without changing something outside the
+    /// tracked changes; the message says what, in words a person can act on.
+    #[error("{0}")]
+    Preserve(String),
 }

@@ -10,7 +10,8 @@ use wordcraft_doc::numbering::{AbstractNum, Level, LevelSuffix, Num};
 use wordcraft_doc::props::Rgb;
 use wordcraft_doc::section::NumFormat;
 use wordcraft_doc::styles::{Style, StyleKind, StyleSheet, TableStyleParts};
-use wordcraft_doc::{Blocks, Comment, Document, PartKind, Revision, RevisionKind};
+// embed: Origin, stamped on each paragraph read.
+use wordcraft_doc::{Blocks, Comment, Document, Origin, PartKind, Revision, RevisionKind};
 
 use crate::DocxError;
 // embed: ReadLimits for `read_with_limits`.
@@ -35,6 +36,22 @@ pub(crate) struct Reader<'p> {
     pub comment_map: HashMap<String, u32>,
     pub comments_ended: HashSet<u32>,
     pub bookmarks: HashMap<String, String>,
+    /// embed: the origins of the `w:p` elements of each story part being read, innermost last (a
+    /// header is read while the main part is). See `begin_part`.
+    origins: Vec<Option<PartOrigins>>,
+}
+
+/// embed: where each `w:p` element of one story part's tree sits: the part's index (see
+/// `Package::part_index`) and, by the element's address, its position among the part's `w:p`
+/// elements in document order. An address means something only while that tree is alive, so the
+/// entry lives exactly as long as the part's reading (`begin_part` to `end_part`), and a lookup
+/// asks only the part being read: an element of one part can never take another part's origin,
+/// nor one a dropped tree left at the same address.
+struct PartOrigins {
+    part: u32,
+    /// (element address, position), sorted by address. 16 bytes a `w:p`, reserved exactly; every
+    /// `w:p` is an element the package's element budget already counted.
+    by_address: Vec<(usize, u32)>,
 }
 
 /// Read a `.docx` package.
@@ -44,6 +61,12 @@ pub fn read(bytes: &[u8]) -> Result<Document, DocxError> {
 
 /// embed: [`read`] within `limits`; a package past any of them is refused with [`DocxError::Limit`].
 pub fn read_with_limits(bytes: &[u8], limits: &ReadLimits) -> Result<Document, DocxError> {
+    // embed: the document keeps the archive's bytes (SOURCE_PACKAGE), one copy shared by every clone
+    // of it, so the archive is held to the most a read may hold of the package.
+    let archive = u64::try_from(bytes.len()).unwrap_or(u64::MAX);
+    if archive > limits.max_total_bytes {
+        return Err(DocxError::Limit(format!("the package is {archive} bytes, past the {} a read may keep", limits.max_total_bytes)));
+    }
     let pkg = Package::open_with(bytes, limits)?;
     let root_rels = pkg.rels("");
     let main = root_rels.by_type(rt::OFFICE_DOC).filter(|r| !r.external).map(|r| r.target.clone()).unwrap_or_else(|| "word/document.xml".to_string());
@@ -68,7 +91,12 @@ pub fn read_with_limits(bytes: &[u8], limits: &ReadLimits) -> Result<Document, D
         comment_map: HashMap::new(),
         comments_ended: HashSet::new(),
         bookmarks: HashMap::new(),
+        // embed: paragraph origins, filled part by part.
+        origins: Vec::new(),
     };
+    // embed: the main part's paragraphs, and the text boxes inside it, know where they came from.
+    // Its tree lives for the whole read, so it stays the outermost part read.
+    r.begin_part(&root, &main);
     r.pc.major_font = r.doc.settings.major_font.clone();
     r.pc.minor_font = r.doc.settings.minor_font.clone();
     let part = |t: &str| rels.by_type(t).filter(|x| !x.external).map(|x| x.target.clone());
@@ -127,6 +155,8 @@ pub fn read_with_limits(bytes: &[u8], limits: &ReadLimits) -> Result<Document, D
     if pkg.limit_reached() {
         return Err(DocxError::Limit("a part is past the read limits (elements or nesting)".into()));
     }
+    // embed: the source package, for a writer that keeps whatever the model does not hold.
+    r.doc.passthrough.insert(crate::preserve::SOURCE_PACKAGE.into(), Arc::new(bytes.to_vec()));
     let mut doc = r.doc;
     doc.ensure_nonempty();
     Ok(doc)
@@ -174,6 +204,32 @@ pub(crate) fn ui_style_name(n: &str) -> String {
 impl Reader<'_> {
     fn xml(&self, path: &str) -> Result<Option<El>, DocxError> {
         self.pkg.xml(path)
+    }
+
+    /// embed: start reading the story part `path`, whose tree is `root`: number its `w:p` elements
+    /// in document order, so each paragraph read from it records its origin (`origin_of`). Every
+    /// call is paired with `end_part` once the part's paragraphs are read, while `root` is alive.
+    fn begin_part(&mut self, root: &El, path: &str) {
+        let stamped = self.pkg.part_index(path).map(|part| {
+            let mut by_address = Vec::with_capacity(count_paragraphs(root, 0));
+            number_paragraphs(root, &mut 0, &mut by_address, 0);
+            by_address.sort_unstable_by_key(|(address, _)| *address);
+            PartOrigins { part, by_address }
+        });
+        self.origins.push(stamped);
+    }
+
+    /// embed: the part `begin_part` started is read; its addresses mean nothing once its tree goes.
+    fn end_part(&mut self) {
+        self.origins.pop();
+    }
+
+    /// embed: where the `w:p` element `e` of the part being read sits in the package.
+    pub(crate) fn origin_of(&self, e: &El) -> Option<Origin> {
+        let reading = self.origins.last()?.as_ref()?;
+        let address = e as *const El as usize;
+        let found = reading.by_address.binary_search_by_key(&address, |(address, _)| *address).ok()?;
+        reading.by_address.get(found).map(|(_, index)| Origin { part: reading.part, index: *index })
     }
 
     pub fn revision(&mut self, kind: RevisionKind, e: &El) -> u32 {
@@ -236,11 +292,15 @@ impl Reader<'_> {
             Ok(Some(r)) => r,
             _ => return Some(id),
         };
+        // embed: a header's paragraphs know where they came from.
+        self.begin_part(&root, path);
         let rels = self.pkg.rels(path);
         let mut sc = StoryCtx::default();
         let mut blocks = Blocks::new();
         self.read_blocks(&mut sc, &root, &rels, &mut blocks, 0);
         self.flush_pending(&mut sc, &mut blocks);
+        // embed: this part's paragraphs are read.
+        self.end_part();
         if let Some(p) = self.doc.parts.get_mut(&id)
             && !blocks.is_empty()
         {
@@ -498,6 +558,8 @@ impl Reader<'_> {
 
     fn read_notes(&mut self, path: &str, foot: bool) -> Result<(), DocxError> {
         let Some(root) = self.xml(path)? else { return Ok(()) };
+        // embed: a note's paragraphs know where they came from.
+        self.begin_part(&root, path);
         let rels = self.pkg.rels(path);
         let tag = if foot { "w:footnote" } else { "w:endnote" };
         for n in root.children(tag) {
@@ -519,11 +581,15 @@ impl Reader<'_> {
                 self.endnotes.insert(fid, id);
             }
         }
+        // embed: this part's paragraphs are read.
+        self.end_part();
         Ok(())
     }
 
     fn read_comments(&mut self, path: &str, ext: Option<&str>) -> Result<(), DocxError> {
         let Some(root) = self.xml(path)? else { return Ok(()) };
+        // embed: a comment's paragraphs know where they came from.
+        self.begin_part(&root, path);
         let rels = self.pkg.rels(path);
         let mut by_para: HashMap<String, u32> = HashMap::new();
         let mut next_id = 0u32;
@@ -566,6 +632,8 @@ impl Reader<'_> {
             );
             self.comment_map.insert(file_id, id);
         }
+        // embed: this part's paragraphs are read.
+        self.end_part();
         if let Some(ext) = ext
             && let Ok(Some(x)) = self.xml(ext)
         {
@@ -607,4 +675,28 @@ impl Reader<'_> {
 
 fn default_level(i: usize) -> Level {
     Level { indent: 36.0 * (i as f32 + 1.0), text: String::new(), ..Level::default() }
+}
+
+/// embed: how many `w:p` elements `el` holds, so `begin_part` reserves its list exactly.
+fn count_paragraphs(el: &El, depth: usize) -> usize {
+    if depth > crate::xml::MAX_DEPTH {
+        return 0;
+    }
+    el.els().fold(0usize, |count, child| count.saturating_add(usize::from(child.name == "w:p")).saturating_add(count_paragraphs(child, depth + 1)))
+}
+
+/// embed: `begin_part`'s walk, pre-order: a paragraph before the paragraphs of text boxes inside it,
+/// every alternative-content branch included, so the numbering does not depend on which branch the
+/// reader takes.
+fn number_paragraphs(el: &El, next: &mut u32, by_address: &mut Vec<(usize, u32)>, depth: usize) {
+    if depth > crate::xml::MAX_DEPTH {
+        return;
+    }
+    for child in el.els() {
+        if child.name == "w:p" {
+            by_address.push((child as *const El as usize, *next));
+            *next = next.saturating_add(1);
+        }
+        number_paragraphs(child, next, by_address, depth + 1);
+    }
 }
