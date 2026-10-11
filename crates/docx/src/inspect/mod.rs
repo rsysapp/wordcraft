@@ -24,7 +24,8 @@
 //!   inside XML reads as what it points at, so renumbering is not a change and retargeting is.
 //! - **Content types** are compared by the type each part gets.
 //! - **Other XML parts** are compared by the SHA-256 of a canonical form, produced as it is hashed
-//!   (nothing printed or kept); binaries byte for byte, read side by side.
+//!   (nothing printed or kept); binaries by the SHA-256 of their bytes, hashed as they are
+//!   inflated (once a side, nothing kept).
 //!
 //! Every step is bounded: elements, depth and part sizes by [`INSPECT_LIMITS`], story text by
 //! [`MAX_STORY_ITEMS`], every diff by `max_changes`, all reading, hashing, walking and comparing by
@@ -378,10 +379,12 @@ enum Part {
     Story(Vec<Item>),
     /// Its compared form, as a digest.
     Xml(Digest),
-    Binary,
+    /// The SHA-256 of its bytes.
+    Binary(Digest),
 }
 
-/// What a side keeps of its parts: how each is compared, and its items or compared form.
+/// What a side keeps of its parts: how each is compared, and its items or the digest it is
+/// compared by (its canonical form's for XML, its bytes' for anything else).
 #[derive(Default)]
 struct Kept {
     kinds: BTreeMap<String, Kind>,
@@ -402,7 +405,10 @@ impl Kept {
                 self.canonical.insert(name.to_string(), digest);
                 Kind::Xml
             }
-            Part::Binary => Kind::Binary,
+            Part::Binary(digest) => {
+                self.canonical.insert(name.to_string(), digest);
+                Kind::Binary
+            }
         };
         self.kinds.insert(name.to_string(), kind);
         Ok(())
@@ -554,7 +560,8 @@ impl<'a> Side<'a> {
                 budget.release(parsed.held);
                 kept.keep(name, Part::Xml(digest?), budget)?;
             } else {
-                kept.keep(name, Part::Binary, budget)?;
+                let digest = package.digest(name, budget)?;
+                kept.keep(name, Part::Binary(digest), budget)?;
             }
         }
         let comments = match &comments_part {
@@ -576,6 +583,7 @@ impl<'a> Side<'a> {
         tables.charge(budget)?;
         drop(all);
         budget.release(all_held);
+        package.finish(budget)?;
         Ok(Side { package, types, rels, main, comment_parts, comments, kept, revisions })
     }
 
@@ -716,6 +724,10 @@ fn compare_parts(
         |strings: &[Option<&str>]| strings.iter().flatten().fold(RECORD_BYTES, |held, string| held.saturating_add(budget::units(string.len())));
     let mut story_parts = Vec::new();
     for name in union(&base.kept.kinds, &edited.kept.kinds) {
+        // The name lowered to look up its content types (which can grow by half, and its room
+        // double), held while the part is compared.
+        let lowered = budget::units(name.len()).saturating_mul(3);
+        charge(budget, lowered)?;
         let mut altered = false;
         match (base.kept.kinds.get(name).copied(), edited.kept.kinds.get(name).copied()) {
             (None, Some(_)) => {
@@ -731,8 +743,9 @@ fn compare_parts(
                 charge(budget, STORY_PART_BYTES.saturating_add(budget::units(name.len())))?;
                 story_parts.push(name.clone());
             }
-            (Some(Kind::Xml), Some(Kind::Xml)) => altered = base.kept.canonical.get(name) != edited.kept.canonical.get(name),
-            (Some(Kind::Binary), Some(Kind::Binary)) => altered = !package::same_bytes(&mut base.package, &mut edited.package, name, budget)?,
+            (Some(Kind::Xml), Some(Kind::Xml)) | (Some(Kind::Binary), Some(Kind::Binary)) => {
+                altered = base.kept.canonical.get(name) != edited.kept.canonical.get(name);
+            }
             (Some(_), Some(_)) => altered = true,
             (None, None) => {}
         }
@@ -751,6 +764,7 @@ fn compare_parts(
                 });
             }
         }
+        budget.release(lowered);
     }
     Ok(story_parts)
 }

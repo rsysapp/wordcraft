@@ -17,10 +17,37 @@ pub(super) fn inflated(bytes: u64) -> u64 {
 }
 /// Units charged for every 8 bytes inflated.
 pub(super) const INFLATE_UNITS_PER_8_BYTES: u64 = 5;
+/// The compressed bytes a Huffman-coded stream consumes cost work of their own, whatever it gives:
+/// a stream of empty blocks, each declaring its own code tables (15-bit codes, so sub-tables too),
+/// takes 38.8 ns for every compressed byte and gives nothing (measured). So each compressed byte
+/// of such a stream is charged four units (40 ns), besides what it gives.
+pub(super) fn consumed(bytes: u64) -> u64 {
+    bytes.saturating_mul(INFLATE_INPUT_UNITS_PER_BYTE)
+}
+/// Units charged for every compressed byte of a Huffman-coded stream.
+pub(super) const INFLATE_INPUT_UNITS_PER_BYTE: u64 = 4;
+/// Stored data (a stored entry, or a deflate stream of stored blocks only) is copied and checked
+/// against its CRC: about 0.5 ns a byte (measured), charged at 1.25 ns.
+pub(super) fn copied(bytes: u64) -> u64 {
+    bytes / BYTES_PER_UNIT_COPIED
+}
+/// Bytes of stored data copied.
+pub(super) const BYTES_PER_UNIT_COPIED: u64 = 8;
+/// Each stored block's header, read by the deflate stream: 7.3 ns a block (measured, empty blocks),
+/// charged at one unit.
+pub(super) const UNITS_PER_STORED_BLOCK: u64 = 1;
+/// Compressed bytes looked through to tell a stream of stored blocks only: a step for each block
+/// header, at most one in five bytes.
+pub(super) const BYTES_PER_UNIT_WALKED: u64 = 32;
 /// Bytes of XML parsed.
 pub(super) const BYTES_PER_UNIT_PARSED: u64 = 8;
-/// Bytes run through SHA-256.
-pub(super) const BYTES_PER_UNIT_HASHED: u64 = 4;
+/// Bytes run through SHA-256: 5.05 ns a byte (measured), so two a unit.
+pub(super) const BYTES_PER_UNIT_HASHED: u64 = 2;
+
+/// Work charged for hashing `bytes` with SHA-256.
+pub(super) fn hashed(bytes: u64) -> u64 {
+    bytes / BYTES_PER_UNIT_HASHED
+}
 /// Bytes kept as an exact identity (copied and later hashed for a table).
 pub(super) const BYTES_PER_UNIT_KEPT: u64 = 16;
 

@@ -23,6 +23,22 @@ fn zip(entries: &[(String, Vec<u8>)], compression: zip::CompressionMethod) -> Ve
     writer.finish().unwrap().into_inner()
 }
 
+/// `zip` with the UTF-8 flag cleared on every entry, in its local header and its directory record:
+/// names the zip reader then decodes as CP437.
+fn without_utf8_flags(mut zip: Vec<u8>) -> Vec<u8> {
+    let u16_at = |zip: &[u8], at: usize| usize::from(u16::from_le_bytes([zip[at], zip[at + 1]]));
+    let u32_at = |zip: &[u8], at: usize| u32::from_le_bytes([zip[at], zip[at + 1], zip[at + 2], zip[at + 3]]) as usize;
+    let end = zip.len() - 22;
+    let (count, mut at) = (u16_at(&zip, end + 10), u32_at(&zip, end + 16));
+    for _ in 0..count {
+        zip[at + 9] &= !0x08;
+        let local = u32_at(&zip, at + 42);
+        zip[local + 7] &= !0x08;
+        at += 46 + u16_at(&zip, at + 28) + u16_at(&zip, at + 30) + u16_at(&zip, at + 32);
+    }
+    zip
+}
+
 fn story(body: &str) -> Vec<u8> {
     format!(r#"<w:document {W}><w:body>{body}</w:body></w:document>"#).into_bytes()
 }
@@ -194,7 +210,7 @@ fn shapes() -> Vec<(&'static str, Probe)> {
     ));
     let small = zip(&[("small.bin".to_string(), vec![b'x'; 16])], zip::CompressionMethod::Deflated);
     shapes.push(("part read: the stream", Box::new(move |mark| probe::read_part(&small, "small.bin", mark))));
-    shapes.push(("part compared", Box::new(move |mark| probe::compare_part(&big, &big, "big.bin", mark))));
+    shapes.push(("part hashed", Box::new(move |mark| probe::digest_part(&big, "big.bin", mark))));
     shapes
 }
 
@@ -307,6 +323,21 @@ fn growth_points() -> Vec<(&'static str, Probe)> {
     let entries: Vec<(String, Vec<u8>)> = (0..1_000).map(|n| (format!("p/{}{n}.bin", "n".repeat(30_000)), vec![b'x'; 1])).collect();
     let long = zip(&entries, zip::CompressionMethod::Stored);
     shapes.push(("package directory: long names", Box::new(move |mark| probe::package(&long, mark))));
+    // Names past ASCII without the UTF-8 flag, which the zip reader would decode at three times
+    // their length: refused before it decodes them.
+    let entries: Vec<(String, Vec<u8>)> = (0..1_000).map(|n| (format!("p/{}{n}.bin", "\u{e9}".repeat(15_000)), vec![b'x'; 1])).collect();
+    let unflagged = without_utf8_flags(zip(&entries, zip::CompressionMethod::Stored));
+    shapes.push((
+        "package directory: names without the UTF-8 flag",
+        Box::new(move |mark| {
+            let measured = probe::package(&unflagged, mark)?;
+            let refusal = probe::refusal(&measured).ok_or("names without the UTF-8 flag read")?;
+            if !refusal.contains("encoding") {
+                return Err(refusal.to_string());
+            }
+            Ok(measured)
+        }),
+    ));
     shapes
 }
 
@@ -460,7 +491,12 @@ fn each_structure_holds_no_more_than_its_charge() {
         let measured = probe(&mut || baseline = reset_peak()).unwrap_or_else(|error| panic!("{name}: {error}"));
         let held = peak().saturating_sub(baseline) as u64;
         let ratio = held as f64 / measured.charged.max(1) as f64;
-        eprintln!("{name:<36} held {:>9.3} MB  charged {:>9.3} MB  ratio {ratio:.4}", held as f64 / 1e6, measured.charged as f64 / 1e6);
+        eprintln!(
+            "{name:<36} held {:>9.3} MB  charged {:>9.3} MB  ratio {ratio:.4} ({held} B, {} B)",
+            held as f64 / 1e6,
+            measured.charged as f64 / 1e6,
+            measured.charged
+        );
         if ratio > worst.0 {
             worst = (ratio, name);
         }

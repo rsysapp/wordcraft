@@ -12,7 +12,7 @@ use super::comments;
 use super::compare::{CommentIds, Pairs, Projector, Tally, assign_contexts, compare_story, facts, field_structure};
 use super::digest::Hasher;
 use super::opc::{Canon, ContentTypes, Rels};
-use super::package::{StrictPackage, same_bytes};
+use super::package::StrictPackage;
 use super::story::{self, Context, Format, Holds, MarkInfo, MarkKind, RevisionKind, Revisions, Slot, StyleHiding, Tables, Wrap, WrapKind};
 use super::xml::{self, Limits, Names};
 use super::{INSPECT_LIMITS, MAX_CHANGES, inspect_budgeted};
@@ -37,7 +37,10 @@ fn measure(budget: &mut Budget, mark: &mut dyn FnMut(), build: impl FnOnce(&mut 
     budget.reset_peak();
     mark();
     let keep = build(budget)?;
-    Ok(Measured { charged: budget.peak().saturating_sub(before), _keep: keep })
+    // The box the probe keeps its structure in is the probe's, not the structure's: counted as
+    // charged.
+    let boxed = u64::try_from(std::mem::size_of_val(&*keep)).unwrap_or(u64::MAX);
+    Ok(Measured { charged: budget.peak().saturating_sub(before).saturating_add(boxed), _keep: keep })
 }
 
 /// A parsed tree: elements, attributes, text, names, namespaces, prefix lists.
@@ -279,15 +282,24 @@ pub fn comparison(base: &[u8], edited: &[u8], mark: &mut dyn FnMut()) -> Result<
     })
 }
 
-/// A zip package opened strictly (its directory, layout and index).
+/// A zip package opened strictly (its directory, layout and index). A package refused is measured
+/// too, up to its refusal: the answer keeps the refusal.
 pub fn package(zip: &[u8], mark: &mut dyn FnMut()) -> Result<Measured, String> {
     measure(&mut unlimited(), mark, |budget| {
-        let package = StrictPackage::open(zip, &INSPECT_LIMITS, budget)?;
         // The package borrows the bytes; keep what it holds by its index only.
-        let names: Vec<String> = package.names().map(str::to_string).collect();
-        drop(package);
+        let names: Result<Vec<String>, String> =
+            StrictPackage::open(zip, &INSPECT_LIMITS, budget).map(|package| package.names().map(str::to_string).collect());
+        // A refusal's words are the probe's answer, not the package's: counted as charged.
+        if let Err(refusal) = &names {
+            budget.hold(u64::try_from(refusal.capacity()).unwrap_or(u64::MAX))?;
+        }
         Ok(Box::new(names))
     })
+}
+
+/// Whether a package opened by [`package`] was refused, and why.
+pub fn refusal(measured: &Measured) -> Option<&str> {
+    measured._keep.downcast_ref::<Result<Vec<String>, String>>().and_then(|names| names.as_ref().err().map(String::as_str))
 }
 
 /// One part read from a package.
@@ -297,12 +309,23 @@ pub fn read_part(zip: &[u8], name: &str, mark: &mut dyn FnMut()) -> Result<Measu
     measure(&mut budget, mark, |budget| Ok(Box::new(package.read(name, budget)?)))
 }
 
-/// One part compared between two packages, read side by side.
-pub fn compare_part(base: &[u8], edited: &[u8], name: &str, mark: &mut dyn FnMut()) -> Result<Measured, String> {
+/// One part hashed as it is inflated.
+pub fn digest_part(zip: &[u8], name: &str, mark: &mut dyn FnMut()) -> Result<Measured, String> {
     let mut budget = unlimited();
-    let mut first = StrictPackage::open(base, &INSPECT_LIMITS, &mut budget)?;
-    let mut second = StrictPackage::open(edited, &INSPECT_LIMITS, &mut budget)?;
-    measure(&mut budget, mark, |budget| Ok(Box::new(same_bytes(&mut first, &mut second, name, budget).map_err(|error| format!("{error:?}"))?)))
+    let mut package = StrictPackage::open(zip, &INSPECT_LIMITS, &mut budget)?;
+    measure(&mut budget, mark, |budget| Ok(Box::new(package.digest(name, budget)?)))
+}
+
+/// The work charged for reading a part (XML) and for hashing it (anything else).
+pub fn part_work(zip: &[u8], name: &str) -> Result<(u64, u64), String> {
+    let mut package = StrictPackage::open(zip, &INSPECT_LIMITS, &mut unlimited())?;
+    let mut budget = unlimited();
+    package.read(name, &mut budget)?;
+    let read = u64::MAX - budget.work_left();
+    let mut package = StrictPackage::open(zip, &INSPECT_LIMITS, &mut unlimited())?;
+    let mut budget = unlimited();
+    package.digest(name, &mut budget)?;
+    Ok((read, u64::MAX - budget.work_left()))
 }
 
 /// A whole inspection.

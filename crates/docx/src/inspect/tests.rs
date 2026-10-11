@@ -1745,9 +1745,8 @@ fn reports_tracked_table_property_changes_as_untracked() {
 }
 
 /// Inflating is charged at its measured cost (five units of about 10 ns for every 8 bytes), before
-/// it runs: a binary part is inflated as each package is opened and again when the two are compared,
-/// on both sides. So inflating alone cannot run past the work budget's time: three parts of 64 MiB a
-/// side are refused for work, not read.
+/// it runs: a binary part is inflated once a side, and hashed as it is. So inflating alone cannot
+/// run past the work budget's time: three parts of 64 MiB a side are refused for work, not read.
 #[test]
 fn charges_inflation_at_its_cost() {
     let part = vec![0u8; 8 << 20];
@@ -1767,7 +1766,7 @@ fn charges_inflation_at_its_cost() {
     let (base, edited) = (package_with(0), package_with(1));
     let (result, _, work) = inspect_measured(&base, &edited);
     assert_eq!(result.unwrap().losses.len(), 1);
-    let inflated = 4 * budget::inflated(8 << 20);
+    let inflated = 2 * (budget::inflated(8 << 20) + budget::hashed(8 << 20));
     assert!(work >= inflated, "work {work}, inflating alone {inflated}");
     // At the size cap, inflating alone passes the work budget: refused before it runs.
     let mut entries = vec![
@@ -1822,4 +1821,173 @@ fn keeps_prefix_lists_small_and_bounded() {
         vec![format!("p:{}", "a".repeat(80)); 1_000].join(" ")
     ));
     assert!(matches!(inspect(&lists, &wide), Err(InspectError::Edited(message)) if message.contains("list")));
+}
+
+// ---- Fix round 5 (Rulings W1-23, W1-24, W1-25) ---------------------------------------------------
+
+/// The CRC-32 a zip entry carries (ISO 3309), for packages built here byte by byte.
+fn crc32(bytes: &[u8]) -> u32 {
+    let mut crc = !0u32;
+    for byte in bytes {
+        crc ^= u32::from(*byte);
+        for _ in 0..8 {
+            crc = if crc & 1 == 1 { (crc >> 1) ^ 0xEDB8_8320 } else { crc >> 1 };
+        }
+    }
+    !crc
+}
+
+/// One entry of a package built byte by byte: its name, general-purpose flags, method (0 stored,
+/// 8 deflated), its data as stored and the bytes it inflates to.
+struct RawEntry {
+    name: Vec<u8>,
+    flags: u16,
+    method: u16,
+    data: Vec<u8>,
+    inflated: Vec<u8>,
+}
+
+impl RawEntry {
+    fn stored(name: &str, bytes: &[u8]) -> RawEntry {
+        RawEntry { name: name.as_bytes().to_vec(), flags: 0, method: 0, data: bytes.to_vec(), inflated: bytes.to_vec() }
+    }
+}
+
+/// A zip written field by field, so a test can carry what no zip writer makes.
+fn raw_zip(entries: &[RawEntry]) -> Vec<u8> {
+    let mut out = Vec::new();
+    let mut directory = Vec::new();
+    for entry in entries {
+        let offset = u32::try_from(out.len()).unwrap();
+        let fields = |out: &mut Vec<u8>| {
+            out.extend_from_slice(&entry.flags.to_le_bytes());
+            out.extend_from_slice(&entry.method.to_le_bytes());
+            out.extend_from_slice(&[0, 0, 0x21, 0]);
+            out.extend_from_slice(&crc32(&entry.inflated).to_le_bytes());
+            out.extend_from_slice(&u32::try_from(entry.data.len()).unwrap().to_le_bytes());
+            out.extend_from_slice(&u32::try_from(entry.inflated.len()).unwrap().to_le_bytes());
+            out.extend_from_slice(&u16::try_from(entry.name.len()).unwrap().to_le_bytes());
+            out.extend_from_slice(&0u16.to_le_bytes());
+        };
+        out.extend_from_slice(&[0x50, 0x4B, 0x03, 0x04, 20, 0]);
+        fields(&mut out);
+        out.extend_from_slice(&entry.name);
+        out.extend_from_slice(&entry.data);
+        directory.extend_from_slice(&[0x50, 0x4B, 0x01, 0x02, 20, 0, 20, 0]);
+        fields(&mut directory);
+        directory.extend_from_slice(&[0; 6]);
+        directory.extend_from_slice(&0u32.to_le_bytes());
+        directory.extend_from_slice(&offset.to_le_bytes());
+        directory.extend_from_slice(&entry.name);
+    }
+    let start = u32::try_from(out.len()).unwrap();
+    let count = u16::try_from(entries.len()).unwrap();
+    out.extend_from_slice(&directory);
+    out.extend_from_slice(&[0x50, 0x4B, 0x05, 0x06, 0, 0, 0, 0]);
+    out.extend_from_slice(&count.to_le_bytes());
+    out.extend_from_slice(&count.to_le_bytes());
+    out.extend_from_slice(&u32::try_from(directory.len()).unwrap().to_le_bytes());
+    out.extend_from_slice(&start.to_le_bytes());
+    out.extend_from_slice(&0u16.to_le_bytes());
+    out
+}
+
+/// A plain package of stored entries, with `extra` entries after its own.
+fn raw_package(extra: Vec<RawEntry>) -> Vec<u8> {
+    let mut entries = vec![
+        RawEntry::stored("[Content_Types].xml", CONTENT_TYPES.as_bytes()),
+        RawEntry::stored("_rels/.rels", ROOT_RELS.as_bytes()),
+        RawEntry::stored("word/document.xml", document(&para(&text("Rent."))).as_bytes()),
+    ];
+    entries.extend(extra);
+    raw_zip(&entries)
+}
+
+/// The package built byte by byte reads as the same package written by the zip writer.
+#[test]
+fn reads_a_package_built_byte_by_byte() {
+    let raw = raw_package(Vec::new());
+    assert_eq!(inspect(&raw, &package(&para(&text("Rent.")), &[])).unwrap(), Inspection::default());
+}
+
+/// W1-23: what a deflate stream consumes is charged as well as what it gives. A stream of empty
+/// Huffman-coded blocks gives nothing and costs its every byte; a stream of empty stored blocks
+/// costs each block. Both are charged before they are inflated.
+#[test]
+fn charges_the_compressed_data_a_stream_consumes() {
+    // Empty fixed-Huffman blocks, four in five bytes, then a final one.
+    let mut fixed = [0x02, 0x08, 0x20, 0x80, 0x00].repeat(200_000);
+    fixed.extend_from_slice(&[0x03, 0x00]);
+    let empty = RawEntry { name: b"parts/fixed.bin".to_vec(), flags: 0, method: 8, data: fixed.clone(), inflated: Vec::new() };
+    let package = raw_package(vec![empty]);
+    let (result, _, work) = inspect_measured(&package, &package);
+    assert_eq!(result.unwrap(), Inspection::default());
+    let consumed = 2 * budget::consumed(budget::units(fixed.len()));
+    assert!(work >= consumed, "work {work}, the compressed data alone {consumed}");
+    // Empty stored blocks, then a final one: each block is a step.
+    let mut stored = [0x00, 0x00, 0x00, 0xFF, 0xFF].repeat(200_000);
+    stored.extend_from_slice(&[0x01, 0x00, 0x00, 0xFF, 0xFF]);
+    let empty = RawEntry { name: b"parts/stored.bin".to_vec(), flags: 0, method: 8, data: stored, inflated: Vec::new() };
+    let package = raw_package(vec![empty]);
+    let (result, _, work) = inspect_measured(&package, &package);
+    assert_eq!(result.unwrap(), Inspection::default());
+    assert!(work >= 2 * 200_001, "work {work}");
+}
+
+/// W1-25: a binary part is inflated once a side and hashed as it streams; the comparison uses the
+/// digests. Stored data (a stored entry, or deflate's stored blocks) is charged as a copy.
+#[test]
+fn inflates_a_binary_part_once_a_side() {
+    let mut state = 0x9E37_79B9_7F4A_7C15u64;
+    let random: Vec<u8> = (0..(4 << 20))
+        .map(|_| {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state.to_le_bytes()[0]
+        })
+        .collect();
+    let with = |bytes: &[u8]| {
+        let entries = vec![
+            ("[Content_Types].xml".to_string(), CONTENT_TYPES.as_bytes().to_vec()),
+            ("_rels/.rels".to_string(), ROOT_RELS.as_bytes().to_vec()),
+            ("word/document.xml".to_string(), document(&para(&text("Rent."))).into_bytes()),
+            ("parts/scan.bin".to_string(), bytes.to_vec()),
+        ];
+        zip_entries(&entries).unwrap()
+    };
+    let base = with(&random);
+    let (result, _, work) = inspect_measured(&base, &base);
+    assert_eq!(result.unwrap(), Inspection::default());
+    // Random bytes deflate to stored blocks: copied and hashed once a side.
+    let size = budget::units(random.len());
+    let once = 2 * (budget::copied(size) + budget::hashed(size));
+    assert!(work >= once && work < once + once / 4, "work {work}, inflated and hashed once a side {once}");
+    // One byte changed is a part altered, found by its digest.
+    let mut changed = random.clone();
+    changed[1_000] ^= 1;
+    let inspection = inspect(&base, &with(&changed)).unwrap();
+    assert_eq!(inspection.losses, vec![Loss { part: "parts/scan.bin".into(), kind: LossKind::PartAltered, element: None, count: 1 }]);
+    // A stored entry whose data does not match its CRC is refused, though no step reads it as XML.
+    let mut entries = vec![RawEntry::stored("parts/scan.bin", &random[..4_096])];
+    entries[0].inflated[0] ^= 1;
+    let damaged = raw_package(entries);
+    assert!(matches!(inspect(&base, &damaged), Err(InspectError::Edited(message)) if message.contains("parts/scan.bin")));
+}
+
+/// W1-23 (H3): the zip reader decodes a name without the UTF-8 flag as CP437, where each byte past
+/// ASCII takes up to three, and another reader would take such a name otherwise than its bytes say.
+/// So it is refused before the zip reader decodes it; flagged UTF-8 and plain ASCII names read.
+#[test]
+fn refuses_a_name_the_zip_reader_would_decode_otherwise() {
+    let entry = |flags: u16| RawEntry { flags, ..RawEntry::stored("parts/m\u{e9}dia.bin", b"x") };
+    assert!(inspect(&raw_package(Vec::new()), &raw_package(vec![entry(0x0800)])).is_ok());
+    let unflagged = raw_package(vec![entry(0)]);
+    assert!(matches!(inspect(&raw_package(Vec::new()), &unflagged), Err(InspectError::Edited(message)) if message.contains("encoding")));
+    // Flagged, but not UTF-8: the reader would spell it with replacement characters.
+    let mut bad = entry(0x0800);
+    bad.name = b"parts/m\xE9dia.bin".to_vec();
+    assert!(matches!(inspect(&raw_package(Vec::new()), &raw_package(vec![bad])), Err(InspectError::Edited(message)) if message.contains("encoding")));
+    // An ASCII name needs no flag.
+    assert!(inspect(&raw_package(Vec::new()), &raw_package(vec![RawEntry::stored("parts/media.bin", b"x")])).is_ok());
 }
