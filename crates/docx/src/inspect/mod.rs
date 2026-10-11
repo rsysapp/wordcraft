@@ -28,6 +28,15 @@
 //! and `w:trackRevisions` elements; in `docProps/core.xml` the last author, modified and printed
 //! dates and revision number; in `docProps/app.xml` everything but `HyperlinkBase` (the rest are
 //! statistics a writer recomputes).
+//!
+//! What the facts promise. When the edited package, with the save's own tracked changes undone,
+//! equals the base in every compared respect, every field is at its default except
+//! `new_revisions`, `comments.added` and `comments.replies`; when it differs, at least one other
+//! field is not. Which field carries a difference, and how many it counts, comes from one alignment
+//! of the two streams and can shift when the alignment is ambiguous: a moved comment anchor may
+//! also count untracked characters, and white space at the edge of a resolved change may read as
+//! accepted or as rejected. A character changed without tracking is never counted only as a
+//! comment or a resolution. A host judges every field; none is advisory.
 
 mod comments;
 mod compare;
@@ -125,7 +134,11 @@ pub struct AuthorRevisions {
 /// Base tracked changes resolved, counted once per kind, author, date and attributes.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct Resolved {
+    /// Insertions kept as plain content, deletions whose content is gone, formatting changes whose
+    /// new formatting stayed.
     pub accepted: u32,
+    /// Insertions whose content is gone, deletions kept as plain content, formatting changes whose
+    /// old formatting came back.
     pub rejected: u32,
 }
 
@@ -158,9 +171,12 @@ pub struct AddedPart {
     pub content_type: Option<String>,
 }
 
+/// Which side has a relationship the other lacks.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Change {
+    /// The save has it; the base does not.
     Added,
+    /// The base has it; the save does not.
     Removed,
 }
 
@@ -201,16 +217,21 @@ pub struct CommentChanges {
     pub altered: u32,
 }
 
+/// How many comments one author added.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct AuthorCount {
+    /// `w:author` as written; an empty string when the comment names none.
     pub author: String,
     pub count: u32,
 }
 
-/// Which file could not be read, and why.
+/// Which file could not be read for certain, and why (in words for a log, not for a reader). A
+/// host refuses the save on either.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum InspectError {
+    /// The stored version the save was edited from.
     Base(String),
+    /// The save.
     Edited(String),
 }
 
