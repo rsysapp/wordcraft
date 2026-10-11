@@ -1167,20 +1167,27 @@ fn accepts_a_whole_tracked_field_and_reports_it() {
 /// indent that puts it off the page) without a tracked formatting change.
 #[test]
 fn reports_base_text_governed_by_a_new_mark_s_properties() {
-    let mark = |properties: &str| format!(r#"<w:pPr>{properties}<w:rPr><w:ins w:id="5" w:author="{}" w:date="{}"/></w:rPr></w:pPr>"#, SARI.0, SARI.1);
+    // Properties in their schema place: the paragraph's own, its mark's run properties, then a
+    // section and a tracked change of the paragraph's properties.
+    let marked = |properties: &str, after: &str| {
+        format!(r#"<w:pPr>{properties}<w:rPr><w:ins w:id="5" w:author="{}" w:date="{}"/></w:rPr>{after}</w:pPr>"#, SARI.0, SARI.1)
+    };
+    let mark = |properties: &str| marked(properties, "");
     let base = package(&para(&text("Rent is due.")), &[]);
     let indented = package(&format!(r#"<w:p>{}{}</w:p><w:p/>"#, mark(r#"<w:ind w:left="-20000"/>"#), text("Rent is due.")), &[]);
     // The twelve characters, and the document and body starts before the first paragraph.
     assert_eq!(inspect(&base, &indented).unwrap().untracked_changes, 14);
     // the new mark ends a section, so the base text gets its own section.
-    let section =
-        package(&format!(r#"<w:p>{}{}</w:p><w:p/>"#, mark(r#"<w:sectPr><w:pgSz w:w="16838" w:h="11906"/></w:sectPr>"#), text("Rent is due.")), &[]);
+    let section = package(
+        &format!(r#"<w:p>{}{}</w:p><w:p/>"#, marked("", r#"<w:sectPr><w:pgSz w:w="16838" w:h="11906"/></w:sectPr>"#), text("Rent is due.")),
+        &[],
+    );
     assert!(inspect(&base, &section).unwrap().untracked_changes >= 12);
     // Splitting with the base's own properties, or tracking the change of them, is no change.
     let split = package(&format!(r#"<w:p>{}{}</w:p><w:p/>"#, mark(""), text("Rent is due.")), &[]);
     assert!(clean(&inspect(&base, &split).unwrap()));
-    let tracked = format!(r#"<w:ind w:left="720"/><w:pPrChange w:id="6" w:author="{}" w:date="{}"><w:pPr/></w:pPrChange>"#, SARI.0, SARI.1);
-    let formatted = package(&format!(r#"<w:p>{}{}</w:p><w:p/>"#, mark(&tracked), text("Rent is due.")), &[]);
+    let tracked = format!(r#"<w:pPrChange w:id="6" w:author="{}" w:date="{}"><w:pPr/></w:pPrChange>"#, SARI.0, SARI.1);
+    let formatted = package(&format!(r#"<w:p>{}{}</w:p><w:p/>"#, marked(r#"<w:ind w:left="720"/>"#, &tracked), text("Rent is due.")), &[]);
     let inspection = inspect(&base, &formatted).unwrap();
     assert!(clean(&inspection), "{inspection:#?}");
     assert_eq!(counts(&inspection), vec![(SARI.0.into(), 1, 0, 1)]);
@@ -2144,4 +2151,178 @@ fn charges_what_the_reader_passes_over() {
     floor(&format!("<r>{}</r>", "<![CDATA[]]>".repeat(megabyte / 12)), (megabyte / 12) as u64 * 2);
     floor(&format!("<r>{}</r>", "x&lt;".repeat(megabyte / 5)), (megabyte / 5) as u64 * 4);
     floor(&format!(r#"<r a="{}"/>"#, "&lt;".repeat(megabyte / 4)), (megabyte / 4) as u64);
+}
+
+// ---- Conformance: constructs Word could read otherwise than the inspection ----------------------
+
+/// The base's single paragraph, and the save's, inspected.
+fn inspect_paragraphs(base: &str, edited: &str) -> Result<Inspection, InspectError> {
+    inspect(&package(base, &[]), &package(edited, &[]))
+}
+
+fn untracked(base: &str, edited: &str) -> u32 {
+    inspect_paragraphs(base, edited).unwrap().untracked_changes
+}
+
+fn tracked(content: &str) -> String {
+    format!(r#"<w:ins w:id="9" w:author="{}" w:date="{}">{content}</w:ins>"#, SARI.0, SARI.1)
+}
+
+const MC: &str = r#"xmlns:mc="http://schemas.openxmlformats.org/markup-compatibility/2006""#;
+
+/// `mc:AlternateContent`: Word shows the first choice it understands, else the fallback. The
+/// inspection picks none: the whole element is compared, so a change in any branch is a change, and
+/// what an inserted one holds is counted from every branch.
+#[test]
+fn compares_alternate_content_whole() {
+    let alternate = |choice: &str, fallback: &str| {
+        format!(
+            r#"<w:r><mc:AlternateContent {MC}><mc:Choice Requires="w14"><w:r><w:t>{choice}</w:t></w:r></mc:Choice><mc:Fallback><w:r><w:t>{fallback}</w:t></w:r></mc:Fallback></mc:AlternateContent></w:r>"#
+        )
+    };
+    let base = para(&format!("{}{}", text("Rent."), alternate("Due", "Due")));
+    assert!(untracked(&base, &para(&format!("{}{}", text("Rent."), alternate("Waived", "Due")))) >= 1);
+    assert!(untracked(&base, &para(&format!("{}{}", text("Rent."), alternate("Due", "Waived")))) >= 1);
+    assert!(untracked(&para(&text("Rent.")), &para(&format!("{}{}", text("Rent."), alternate("Waived", "Due")))) >= 1);
+    // Inserted with tracking: an object, its hidden text counted whichever branch holds it.
+    let hidden = format!(
+        r#"<w:r><mc:AlternateContent {MC}><mc:Choice Requires="w14"><w:r><w:rPr><w:vanish/></w:rPr><w:t>secret</w:t></w:r></mc:Choice><mc:Fallback/></mc:AlternateContent></w:r>"#
+    );
+    let inspection = inspect_paragraphs(&para(&text("Rent.")), &para(&format!("{}{}", text("Rent."), tracked(&hidden)))).unwrap();
+    let sari = &inspection.new_revisions[0];
+    assert!(sari.objects >= 1 && sari.hidden_text >= 1, "{inspection:#?}");
+}
+
+/// A content control showing its placeholder shows its content; whether it shows the placeholder,
+/// and the content, are both compared.
+#[test]
+fn compares_a_content_control_s_placeholder_state_and_content() {
+    let control = |placeholder: bool, shown: &str| {
+        format!(
+            r#"<w:p><w:sdt><w:sdtPr>{}</w:sdtPr><w:sdtContent>{}</w:sdtContent></w:sdt></w:p>"#,
+            if placeholder { "<w:showingPlcHdr/>" } else { "" },
+            text(shown)
+        )
+    };
+    let base = control(true, "Enter the rent.");
+    assert!(untracked(&base, &control(false, "Enter the rent.")) >= 1);
+    assert!(untracked(&base, &control(true, "Rent is waived.")) >= 1);
+    assert_eq!(untracked(&base, &base), 0);
+}
+
+/// Smart tags and custom XML around base text are new marks: untracked.
+#[test]
+fn reports_base_text_newly_wrapped_in_a_smart_tag_or_custom_xml() {
+    let base = para(&text("Rent is due."));
+    let smart = format!(r#"<w:p><w:smartTag w:uri="urn:x" w:element="place">{}</w:smartTag></w:p>"#, text("Rent is due."));
+    assert!(untracked(&base, &smart) >= 1);
+    let custom = format!(r#"<w:p><w:customXml w:uri="urn:x" w:element="rent">{}</w:customXml></w:p>"#, text("Rent is due."));
+    assert!(untracked(&base, &custom) >= 1);
+}
+
+/// A simple field and the complex field with the same code are different marks.
+#[test]
+fn tells_a_simple_field_from_a_complex_one() {
+    let simple = r#"<w:p><w:fldSimple w:instr="PAGE"><w:r><w:t>1</w:t></w:r></w:fldSimple></w:p>"#;
+    let complex = r#"<w:p><w:r><w:fldChar w:fldCharType="begin"/></w:r><w:r><w:instrText>PAGE</w:instrText></w:r><w:r><w:fldChar w:fldCharType="separate"/></w:r><w:r><w:t>1</w:t></w:r><w:r><w:fldChar w:fldCharType="end"/></w:r></w:p>"#;
+    assert!(untracked(simple, complex) >= 1);
+    assert!(untracked(complex, simple) >= 1);
+}
+
+/// A deletion inside an insertion: the save's own both undone, nothing left; base text wrapped in
+/// the save's insertion and deletion is gone from the base, untracked.
+#[test]
+fn reads_a_deletion_inside_an_insertion() {
+    let base = para(&text("Rent."));
+    let deleted_insertion =
+        tracked(&format!(r#"<w:del w:id="8" w:author="{}" w:date="{}"><w:r><w:delText>more</w:delText></w:r></w:del>"#, SARI.0, SARI.1));
+    let inspection = inspect_paragraphs(&base, &para(&format!("{}{deleted_insertion}", text("Rent.")))).unwrap();
+    assert!(clean(&inspection), "{inspection:#?}");
+    let base_text = tracked(&format!(r#"<w:del w:id="8" w:author="{}" w:date="{}"><w:r><w:delText>Rent.</w:delText></w:r></w:del>"#, SARI.0, SARI.1));
+    assert!(untracked(&base, &para(&base_text)) >= 1);
+}
+
+/// A move whose two ends name different ranges, and carry different text, is no move: what arrives
+/// is untracked.
+#[test]
+fn reports_a_move_whose_ends_disagree() {
+    let base = para(&format!("{}{}", text("Rent is due. "), text("Pay now.")));
+    let edited = para(&format!(
+        r#"{}<w:moveFromRangeStart w:id="1" w:name="m1"/><w:moveFrom w:id="2" w:author="{a}" w:date="{d}"><w:r><w:delText>Pay now.</w:delText></w:r></w:moveFrom><w:moveFromRangeEnd w:id="1"/><w:moveToRangeStart w:id="3" w:name="m2"/><w:moveTo w:id="4" w:author="{a}" w:date="{d}"><w:r><w:t>Pay never.</w:t></w:r></w:moveTo><w:moveToRangeEnd w:id="3"/>"#,
+        text("Rent is due. "),
+        a = SARI.0,
+        d = SARI.1
+    ));
+    assert!(untracked(&base, &edited) >= 1);
+}
+
+/// Hyphens, symbols and tabs written as elements are characters of their own: one replacing a
+/// base character is untracked; a symbol naming a directional control counts as one.
+#[test]
+fn reads_special_characters_as_characters() {
+    let base = para(r#"<w:r><w:t>a-b</w:t></w:r>"#);
+    for special in [
+        r#"<w:noBreakHyphen/>"#,
+        r#"<w:softHyphen/>"#,
+        r#"<w:sym w:font="Symbol" w:char="F02D"/>"#,
+        r#"<w:ptab w:relativeTo="margin" w:alignment="center" w:leader="none"/>"#,
+    ] {
+        let edited = para(&format!(r#"<w:r><w:t>a</w:t>{special}<w:t>b</w:t></w:r>"#));
+        assert!(untracked(&base, &edited) >= 1, "{special}");
+    }
+    for code in ["202E", "200F", "2067"] {
+        let symbol = tracked(&format!(r#"<w:r><w:sym w:font="Symbol" w:char="{code}"/></w:r>"#));
+        let inspection = inspect_paragraphs(&para(&text("Rent.")), &para(&format!("{}{symbol}", text("Rent.")))).unwrap();
+        assert_eq!(inspection.new_revisions[0].bidi_controls, 1, "{code}");
+    }
+}
+
+/// White space that Word may trim or collapse when `xml:space` is not `preserve`: the attribute is
+/// compared with the text it governs.
+#[test]
+fn compares_how_text_keeps_its_white_space() {
+    let base = para(r#"<w:r><w:t xml:space="preserve"> Rent</w:t></w:r>"#);
+    assert!(untracked(&base, &para(r#"<w:r><w:t> Rent</w:t></w:r>"#)) >= 1);
+    assert!(untracked(&para(r#"<w:r><w:t>a b</w:t></w:r>"#), &para(r#"<w:r><w:t>a  b</w:t></w:r>"#)) >= 1);
+}
+
+/// An element a run holds that the inspection does not know is compared whole; properties written
+/// twice, or after what they format, are refused.
+#[test]
+fn refuses_properties_out_of_their_place_and_compares_unknown_run_content() {
+    let base = para(&text("Rent."));
+    assert!(untracked(&base, &para(r#"<w:r><w:t xml:space="preserve">Rent.</w:t><x:hide xmlns:x="urn:x"/></w:r>"#)) >= 1);
+    for refused in [
+        r#"<w:p><w:r><w:rPr/><w:rPr><w:vanish/></w:rPr><w:t>Rent.</w:t></w:r></w:p>"#,
+        r#"<w:p><w:r><w:t>Rent.</w:t><w:rPr><w:vanish/></w:rPr></w:r></w:p>"#,
+        r#"<w:p><w:pPr/><w:pPr><w:pStyle w:val="Hide"/></w:pPr><w:r><w:t>Rent.</w:t></w:r></w:p>"#,
+        r#"<w:p><w:r><w:t>Rent.</w:t></w:r><w:pPr><w:pStyle w:val="Hide"/></w:pPr></w:p>"#,
+        r#"<w:p><w:r><w:rPr><w:rPrChange w:author="A" w:date="D"><w:rPr/></w:rPrChange><w:b/></w:rPr><w:t>Rent.</w:t></w:r></w:p>"#,
+        r#"<w:p><w:pPr><w:pPrChange w:author="A" w:date="D"><w:pPr/></w:pPrChange><w:rPr/></w:pPr><w:r><w:t>Rent.</w:t></w:r></w:p>"#,
+        r#"<w:tbl><w:tblGrid/><w:tblPr/><w:tr><w:tc><w:p/></w:tc></w:tr></w:tbl>"#,
+        r#"<w:tbl><w:tr><w:tc><w:p/><w:tcPr/></w:tc></w:tr></w:tbl>"#,
+        r#"<w:p><w:sdt><w:sdtContent>{}</w:sdtContent><w:sdtPr/></w:sdt></w:p>"#,
+    ] {
+        let result = inspect_paragraphs(&base, refused);
+        assert!(
+            matches!(&result, Err(InspectError::Edited(message)) if message.contains("twice") || message.contains("place")),
+            "{refused}: {result:?}"
+        );
+    }
+}
+
+/// Inside content compared whole, run properties beside the ones a run or paragraph mark is read
+/// by (a second set, written where Word may read it) still count when they hide, as they did
+/// before hidden text there followed the styles.
+#[test]
+fn counts_every_hiding_run_property_set_inside_content_compared_whole() {
+    let boxed = |inside: &str| tracked(&format!(r#"<w:r><w:pict><w:txbxContent>{inside}</w:txbxContent></w:pict></w:r>"#));
+    for inside in [
+        r#"<w:p><w:r><w:rPr/><w:rPr><w:vanish/></w:rPr><w:t>secret</w:t></w:r></w:p>"#,
+        r#"<w:p><w:pPr/><w:pPr><w:rPr><w:vanish/></w:rPr></w:pPr><w:r><w:t>secret</w:t></w:r></w:p>"#,
+        r#"<w:p><w:r><w:t>secret</w:t><w:rPr><w:vanish/></w:rPr></w:r></w:p>"#,
+    ] {
+        let inspection = inspect_paragraphs(&para(&text("Rent.")), &para(&format!("{}{}", text("Rent."), boxed(inside)))).unwrap();
+        assert!(inspection.new_revisions[0].hidden_text >= 1, "{inside}: {inspection:#?}");
+    }
 }

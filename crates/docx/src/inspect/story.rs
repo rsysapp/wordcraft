@@ -200,6 +200,13 @@ pub(super) fn is_bidi_control(character: u32) -> bool {
     matches!(character, 0x061C | 0x200E | 0x200F | 0x202A..=0x202E | 0x2066..=0x2069)
 }
 
+/// A symbol character (`w:sym`) naming a directional control: whether a reader draws it or obeys
+/// it is not settled, so it counts as one.
+fn is_bidi_symbol(el: &XEl) -> bool {
+    &*el.name == "w:sym"
+        && el.attr("w:char").filter(|code| code.len() <= 8).and_then(|code| u32::from_str_radix(code, 16).ok()).is_some_and(is_bidi_control)
+}
+
 /// Where opaque content stands: the style of the paragraph around it and whether a table around it
 /// has a style that may hide.
 #[derive(Clone, Copy)]
@@ -207,6 +214,8 @@ struct Around<'s> {
     hiding: &'s StyleHiding,
     paragraph_style: Option<&'s str>,
     in_hiding_table: bool,
+    /// The run properties a run or paragraph mark above was counted by: not counted again.
+    counted: Option<&'s XEl>,
 }
 
 /// What an element holds below itself, read through once (charged as work). Hidden text is counted
@@ -215,7 +224,7 @@ struct Around<'s> {
 /// as a text box's, or the one around the element), a table's style, the document defaults), each
 /// paragraph mark the same way, and any other run properties that hide by themselves.
 fn scan(el: &XEl, around: Around<'_>, budget: &mut Budget) -> Result<Holds, String> {
-    fn children(el: &XEl, around: Around<'_>, holds: &mut Holds, budget: &mut Budget) -> Result<(), String> {
+    fn children<'s>(el: &'s XEl, around: Around<'s>, holds: &mut Holds, budget: &mut Budget) -> Result<(), String> {
         for node in &el.kids {
             match node {
                 XNode::El(child) => {
@@ -224,9 +233,11 @@ fn scan(el: &XEl, around: Around<'_>, budget: &mut Budget) -> Result<Holds, Stri
                     let mut inner = around;
                     match &*child.name {
                         "w:fldChar" | "w:fldSimple" | "w:instrText" | "w:delInstrText" => holds.field_codes = holds.field_codes.saturating_add(1),
+                        "w:sym" if is_bidi_symbol(child) => holds.bidi_controls = holds.bidi_controls.saturating_add(1),
                         "w:r" => {
                             budget.work(4)?;
-                            if around.hiding.effective(child.child("w:rPr"), around.paragraph_style, around.in_hiding_table, budget)? {
+                            inner.counted = child.child("w:rPr");
+                            if around.hiding.effective(inner.counted, around.paragraph_style, around.in_hiding_table, budget)? {
                                 holds.hidden = holds.hidden.saturating_add(1);
                             }
                         }
@@ -237,6 +248,7 @@ fn scan(el: &XEl, around: Around<'_>, budget: &mut Budget) -> Result<Holds, Stri
                                 properties.and_then(|properties| properties.child("w:pStyle")).and_then(|style| style.attr("w:val"));
                             // Its mark, hidden through its own run properties or its styles.
                             let mark = properties.and_then(|properties| properties.child("w:rPr"));
+                            inner.counted = mark;
                             if around.hiding.effective(mark, inner.paragraph_style, around.in_hiding_table, budget)? {
                                 holds.hidden = holds.hidden.saturating_add(1);
                             }
@@ -247,8 +259,9 @@ fn scan(el: &XEl, around: Around<'_>, budget: &mut Budget) -> Result<Holds, Stri
                                 child.child("w:tblPr").and_then(|properties| properties.child("w:tblStyle")).and_then(|style| style.attr("w:val"));
                             inner.in_hiding_table |= around.hiding.table(style, budget)?;
                         }
-                        // Run properties a run or a paragraph mark were counted by.
-                        "w:rPr" if matches!(&*el.name, "w:r" | "w:pPr") => {}
+                        // Run properties a run or a paragraph mark were counted by; any others (a
+                        // second set, ones in a recorded change) hide by themselves.
+                        "w:rPr" if is(child, around.counted) => {}
                         "w:rPr" if hides(Some(child)) => holds.hidden = holds.hidden.saturating_add(1),
                         _ => {}
                     }
@@ -630,9 +643,36 @@ struct Walker<'a, 'c> {
     hiding_tables: u32,
 }
 
-/// The first child of this name, by identity, so a second one is never mistaken for it.
-fn first<'e>(el: &'e XEl, name: &str) -> Option<&'e XEl> {
-    el.child(name)
+/// A property child of `el` named `name`, once at most, and where the schema puts it: every element
+/// before it named in `before`. Word reads properties in their place; one written twice, or after
+/// what it formats, is read some way the inspection cannot know, so it is refused.
+fn leading<'e>(el: &'e XEl, name: &str, before: &[&str]) -> Result<Option<&'e XEl>, String> {
+    property(el, name, |preceding, _| preceding.iter().all(|other| before.contains(other)))
+}
+
+/// A property child of `el` named `name`, once at most, with every element after it named in `after`
+/// (a tracked change of properties stands last in them).
+fn trailing<'e>(el: &'e XEl, name: &str, after: &[&str]) -> Result<Option<&'e XEl>, String> {
+    property(el, name, |_, following| following.iter().all(|other| after.contains(other)))
+}
+
+fn property<'e>(el: &'e XEl, name: &str, placed: impl Fn(&[&str], &[&str]) -> bool) -> Result<Option<&'e XEl>, String> {
+    let names: Vec<&str> = el.els().map(|child| &*child.name).collect();
+    let mut found = None;
+    for (index, child) in el.els().enumerate() {
+        if &*child.name != name {
+            continue;
+        }
+        if found.is_some() {
+            return Err(format!("{name} twice in {}", el.name));
+        }
+        let (preceding, following) = (names.get(..index).unwrap_or(&[]), names.get(index + 1..).unwrap_or(&[]));
+        if !placed(preceding, following) {
+            return Err(format!("{name} out of its place in {}", el.name));
+        }
+        found = Some(child);
+    }
+    Ok(found)
 }
 
 fn is(child: &XEl, other: Option<&XEl>) -> bool {
@@ -877,8 +917,16 @@ impl Walker<'_, '_> {
             (name, _) if OBJECTS.contains(&name) => MarkKind::Object,
             _ => MarkKind::Plain,
         };
-        let around = Around { hiding: self.hiding, paragraph_style: self.paragraph_style.now.as_deref(), in_hiding_table: self.hiding_tables > 0 };
-        let holds = scan(el, around, self.budget)?;
+        let around = Around {
+            hiding: self.hiding,
+            paragraph_style: self.paragraph_style.now.as_deref(),
+            in_hiding_table: self.hiding_tables > 0,
+            counted: None,
+        };
+        let mut holds = scan(el, around, self.budget)?;
+        if is_bidi_symbol(el) {
+            holds.bidi_controls = holds.bidi_controls.saturating_add(1);
+        }
         let mut hasher = Hasher::default();
         hasher.field(b'O', &[]);
         self.canon.element(el, &mut hasher);
@@ -983,11 +1031,11 @@ impl Walker<'_, '_> {
         skip: &dyn Fn(&XEl) -> bool,
     ) -> Result<Option<Slot>, String> {
         let present_counts = matches!(name, "sectPr" | "pPr.sectPr");
-        let change = property.and_then(|property| first(property, change_name));
+        let change = property.map(|property| trailing(property, change_name, &[])).transpose()?.flatten();
         let value = self.value(property, &|child| is(child, change) || skip(child), present_counts)?;
         let rev = match change {
             Some(change) => {
-                let old_properties = first(change, inner);
+                let old_properties = leading(change, inner, &[])?;
                 let old = match old_properties {
                     Some(_) => self.value(old_properties, &|_| false, present_counts)?,
                     None => {
@@ -1158,16 +1206,16 @@ impl Walker<'_, '_> {
     }
 
     fn container(&mut self, el: &XEl, property_name: Option<&str>, place: Place, kind: MarkKind) -> Result<(), String> {
-        let property = property_name.and_then(|name| first(el, name));
+        let property = property_name.map(|name| leading(el, name, &[])).transpose()?.flatten();
         self.start(el, &[property], kind, EMPTY)?;
         self.children(el, place, &[property])?;
         self.end(el, MarkKind::Plain)
     }
 
     fn sdt(&mut self, el: &XEl, place: Place) -> Result<(), String> {
-        let properties = first(el, "w:sdtPr");
-        let end_properties = first(el, "w:sdtEndPr");
-        let content = first(el, "w:sdtContent");
+        let properties = leading(el, "w:sdtPr", &[])?;
+        let end_properties = leading(el, "w:sdtEndPr", &["w:sdtPr"])?;
+        let content = leading(el, "w:sdtContent", &["w:sdtPr", "w:sdtEndPr"])?;
         let mut hasher = Hasher::default();
         hasher.field(b'S', &[]);
         self.canon.start_tag(el, &mut hasher);
@@ -1196,25 +1244,25 @@ impl Walker<'_, '_> {
     }
 
     fn paragraph(&mut self, p: &XEl) -> Result<(), String> {
-        let properties = first(p, "w:pPr");
+        let properties = leading(p, "w:pPr", &[])?;
         // The style's name is copied for the paragraph's runs: no longer than a kept value.
         let style_of = |properties: Option<&XEl>| -> Result<Option<String>, String> {
             let style = properties.and_then(|properties| properties.child("w:pStyle")).and_then(|style| style.attr("w:val"));
             style.map(|style| kept_value("a paragraph style's name", style).map(str::to_string)).transpose()
         };
-        let change = properties.and_then(|properties| first(properties, "w:pPrChange"));
+        let change = properties.map(|properties| trailing(properties, "w:pPrChange", &[])).transpose()?.flatten();
         let recorded = match change {
             Some(change) => {
                 let (author, date) = self.author_date(change)?;
-                Some((author, date, style_of(first(change, "w:pPr"))?))
+                Some((author, date, style_of(leading(change, "w:pPr", &[])?)?))
             }
             None => None,
         };
         self.paragraph_style = ParagraphStyle { now: style_of(properties)?, change: recorded };
         self.children(p, Place::Inline, &[properties])?;
         // The paragraph mark: its own tracked changes sit in `w:pPr/w:rPr`.
-        let mark_properties = properties.and_then(|properties| first(properties, "w:rPr"));
-        let section = properties.and_then(|properties| first(properties, "w:sectPr"));
+        let mark_properties = properties.map(|properties| trailing(properties, "w:rPr", &["w:sectPr", "w:pPrChange"])).transpose()?.flatten();
+        let section = properties.map(|properties| trailing(properties, "w:sectPr", &["w:pPrChange"])).transpose()?.flatten();
         let depth = self.stack.len();
         if let Some(mark_properties) = mark_properties {
             for child in mark_properties.els() {
@@ -1244,7 +1292,7 @@ impl Walker<'_, '_> {
     }
 
     fn run(&mut self, r: &XEl) -> Result<(), String> {
-        let properties = first(r, "w:rPr");
+        let properties = leading(r, "w:rPr", &[])?;
         let mut slots: Vec<Slot> = Vec::new();
         if self.canon.has_attributes(r) {
             let digest = self.canon.start_digest(r, self.budget)?;
@@ -1320,8 +1368,8 @@ impl Walker<'_, '_> {
     }
 
     fn table(&mut self, table: &XEl) -> Result<(), String> {
-        let properties = first(table, "w:tblPr");
-        let grid = first(table, "w:tblGrid");
+        let properties = leading(table, "w:tblPr", RANGE_MARKERS)?;
+        let grid = leading(table, "w:tblGrid", &[RANGE_MARKERS, &["w:tblPr"]].concat())?;
         // A table whose every row is one tracked insertion or deletion goes with it: its own
         // start and end carry that change too. Each row's changes are compared with the first
         // row's, one row at a time.
@@ -1329,7 +1377,7 @@ impl Walker<'_, '_> {
         let mut all_alike = true;
         for row in table.els().filter(|row| &*row.name == "w:tr") {
             let mut wraps = Vec::new();
-            for (kind, el) in row_changes(row) {
+            for (kind, el) in row_changes(row)? {
                 wraps.push(self.silent_wrap(el, kind)?);
             }
             match &shared {
@@ -1374,10 +1422,10 @@ impl Walker<'_, '_> {
     }
 
     fn row(&mut self, row: &XEl, shared: bool) -> Result<(), String> {
-        let properties = first(row, "w:trPr");
-        let exceptions = first(row, "w:tblPrEx");
+        let properties = leading(row, "w:trPr", &["w:tblPrEx"])?;
+        let exceptions = leading(row, "w:tblPrEx", &[])?;
         let depth = self.stack.len();
-        for (kind, el) in row_changes(row) {
+        for (kind, el) in row_changes(row)? {
             let wrap = self.wrap_of(el, kind)?;
             // A change the whole table carries is already on the stack.
             if !shared {
@@ -1404,7 +1452,7 @@ impl Walker<'_, '_> {
     }
 
     fn cell(&mut self, cell: &XEl) -> Result<(), String> {
-        let properties = first(cell, "w:tcPr");
+        let properties = leading(cell, "w:tcPr", &[])?;
         let depth = self.stack.len();
         if let Some(properties) = properties {
             for child in properties.els() {
@@ -1429,14 +1477,14 @@ impl Walker<'_, '_> {
 }
 
 /// A row's own tracked insertion or deletion (`w:trPr/w:ins`, `w:trPr/w:del`).
-fn row_changes(row: &XEl) -> Vec<(WrapKind, &XEl)> {
-    let Some(properties) = first(row, "w:trPr") else { return Vec::new() };
-    properties
+fn row_changes(row: &XEl) -> Result<Vec<(WrapKind, &XEl)>, String> {
+    let Some(properties) = leading(row, "w:trPr", &["w:tblPrEx"])? else { return Ok(Vec::new()) };
+    Ok(properties
         .els()
         .filter_map(|child| match &*child.name {
             "w:ins" => Some((WrapKind::RowIns, child)),
             "w:del" => Some((WrapKind::RowDel, child)),
             _ => None,
         })
-        .collect()
+        .collect())
 }
