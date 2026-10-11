@@ -285,6 +285,11 @@ mod saves {
             case("review.nextChange", vec![], json!({}), Nothing),
             case("review.previousChange", vec![], json!({}), Nothing),
             case("review.changes", vec![], json!({}), Nothing),
+            // Into the file's own header and footer, typed into, and back (W3-3).
+            case("insert.editHeader", vec![], json!({}), Nothing),
+            case("insert.editFooter", vec![], json!({}), Nothing),
+            case("insert.closeHeader", vec![("caret.set", in_part(&file, PartKind::Header, 5))], json!({}), Nothing),
+            case("text.insert", vec![("insert.editHeader", json!({}))], json!({"text": " draft"}), Tracked),
             case("review.accept", at("always"), json!({}), Decided),
             case("review.reject", selecting("always"), json!({}), Decided),
             case("review.acceptAll", vec![], json!({}), Decided),
@@ -465,6 +470,88 @@ mod saves {
         s.end_edit();
         assert_eq!((s.edit_rules(), s.revision_date()), (None, None));
         assert!(s.run("review.trackChanges", &json!({ "value": false })).is_ok(), "after the session the full application runs again");
+    }
+
+    // W3-3: an existing header or footer is entered and left; a new one is never made.
+    #[test]
+    fn enters_an_existing_header_but_never_makes_one() {
+        let base = agreement();
+        let mut s = opened(&base);
+        start_editing(&mut s, false);
+        let version = s.content_version();
+        s.run("insert.editHeader", &json!({})).unwrap();
+        assert!(matches!(s.sel.focus.story, StoryRef::Part(_)));
+        assert_eq!(s.content_version(), version, "entering is no change");
+        s.run("insert.closeHeader", &json!({})).unwrap();
+        assert_eq!(s.sel.focus.story, StoryRef::Body);
+
+        let mut bare = Session::new(Document::from_text("Rent is due."));
+        start_editing(&mut bare, false);
+        let parts = bare.doc.parts.len();
+        let refused = bare.run("insert.editHeader", &json!({}));
+        assert_eq!(refused.as_ref().map_err(CmdError::edit_refusal), Err(Some(Refusal::CommandNotAllowed)));
+        assert_eq!(bare.doc.parts.len(), parts, "no header was made");
+        assert_eq!(bare.sel.focus.story, StoryRef::Body);
+    }
+
+    // W3-1: a search or a move that finds nothing is no refused edit.
+    #[test]
+    fn navigation_that_finds_nothing_is_no_refusal() {
+        let mut s = Session::new(Document::from_text("Rent is due."));
+        start_editing(&mut s, false);
+        for (id, params) in [
+            ("edit.findNext", json!({"text": "absent"})),
+            ("edit.findPrevious", json!({"text": "absent"})),
+            ("edit.find", json!({"text": "absent"})),
+            ("edit.goto", json!({"bookmark": "absent"})),
+            ("review.nextChange", json!({})),
+            ("review.previousChange", json!({})),
+        ] {
+            let result = s.run(id, &params);
+            assert_eq!(result.as_ref().err().and_then(CmdError::edit_refusal), None, "{id}: {result:?}");
+            assert_eq!(s.refusal, None, "{id}");
+        }
+    }
+
+    // W3-3: a refused tab names the Tab key's command.
+    #[test]
+    fn a_refused_tab_names_the_tab() {
+        let base = agreement();
+        let mut s = opened(&base);
+        start_editing(&mut s, false);
+        s.run("caret.set", &in_part(&s, PartKind::Comment, 0)).unwrap();
+        let refused = s.run("text.tab", &json!({})).unwrap_err().to_string();
+        assert!(refused.starts_with("text.tab: "), "{refused}");
+        assert_eq!(s.refusal, Some(Refusal::OutsideEditableStory));
+    }
+
+    // W3-3: the content version tells an unchanged document from a changed one, whatever the undo
+    // depth: past the undo limit, undoing all that is left does not bring back the opened version.
+    #[test]
+    fn the_content_version_follows_undo_and_survives_the_undo_limit() {
+        let mut s = Session::new(Document::from_text("Rent is due."));
+        start_editing(&mut s, false);
+        let opened = s.content_version();
+        s.run("text.insert", &json!({"text": "x"})).unwrap();
+        assert_ne!(s.content_version(), opened);
+        s.run("edit.undo", &json!({})).unwrap();
+        assert_eq!(s.content_version(), opened);
+        s.run("edit.redo", &json!({})).unwrap();
+        assert_ne!(s.content_version(), opened);
+        s.run("edit.undo", &json!({})).unwrap();
+        for _ in 0..520 {
+            s.run("text.insert", &json!({"text": "x"})).unwrap();
+            s.run("caret.left", &json!({})).unwrap();
+        }
+        while s.can_undo() {
+            s.run("edit.undo", &json!({})).unwrap();
+        }
+        assert!(s.doc.plain_text(StoryRef::Body).contains('x'));
+        assert_ne!(s.content_version(), opened);
+        // A failed command leaves the version as it was.
+        let version = s.content_version();
+        assert!(s.run("text.insert", &json!({"text": "a\rb"})).is_err());
+        assert_eq!(s.content_version(), version);
     }
 
     #[test]

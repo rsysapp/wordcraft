@@ -102,6 +102,8 @@ struct Undo {
     /// embed: the step accepts or rejects tracked changes; an edit session redoes it only while it
     /// may decide them.
     decision: bool,
+    /// embed: the content version of `doc` (`Session::content_version`).
+    version: u64,
 }
 
 /// An editing session.
@@ -167,6 +169,10 @@ pub struct Session {
     pub(crate) edit_floor: usize,
     /// embed: why the last command was refused by an edit session (`None` when it was not).
     pub refusal: Option<crate::edit_mode::Refusal>,
+    /// embed: which state of the document's content this is (`content_version`), and the last one
+    /// made.
+    version: u64,
+    versions_made: u64,
     /// embed: the author `begin_edit` was given. `author` is put back to it before every command of
     /// the session, so nothing but `begin_edit` names the author of the session's changes.
     edit_author: String,
@@ -218,6 +224,8 @@ impl Session {
             edit_floor: 0,
             refusal: None,
             edit_author: String::new(),
+            version: 0,
+            versions_made: 0,
         }
     }
 
@@ -228,6 +236,21 @@ impl Session {
     pub fn touch(&mut self) {
         self.rev = self.rev.wrapping_add(1);
         self.dirty = true;
+        // embed: every change is a new state of the content; undo and redo put an earlier one back.
+        self.versions_made = self.versions_made.wrapping_add(1);
+        self.version = self.versions_made;
+    }
+
+    /// embed: which state of the document's content this is. A change makes a new one; undo and redo
+    /// put back the one they restore, however deep the history (or how much of it was dropped), so a
+    /// host compares it with the version it opened to tell whether the document differs.
+    pub fn content_version(&self) -> u64 {
+        self.version
+    }
+
+    /// embed: a new layout for the same content (the caret went into a header or out of it).
+    fn redraw(&mut self) {
+        self.rev = self.rev.wrapping_add(1);
     }
 
     /// The current layout (recomputed when the document or view changed).
@@ -264,7 +287,7 @@ impl Session {
             return;
         }
         self.typing_open = label == "Typing";
-        self.history.push(Undo { label: label.to_string(), doc: self.doc.clone(), sel: self.sel.clone(), decision: false });
+        self.history.push(Undo { label: label.to_string(), doc: self.doc.clone(), sel: self.sel.clone(), decision: false, version: self.version });
         if self.history.len() > MAX_UNDO {
             self.history.remove(0);
         }
@@ -301,9 +324,11 @@ impl Session {
             doc: std::mem::replace(&mut self.doc, u.doc),
             sel: std::mem::replace(&mut self.sel, u.sel),
             decision: u.decision,
+            version: self.version,
         };
         self.redo.push(cur);
         self.touch();
+        self.version = u.version;
         true
     }
     pub fn redo(&mut self) -> bool {
@@ -318,9 +343,11 @@ impl Session {
             doc: std::mem::replace(&mut self.doc, u.doc),
             sel: std::mem::replace(&mut self.sel, u.sel),
             decision: u.decision,
+            version: self.version,
         };
         self.history.push(cur);
         self.touch();
+        self.version = u.version;
         true
     }
     /// Drop history (after open / new).
@@ -412,6 +439,10 @@ impl Session {
     /// it was; a panic inside a command becomes an error.
     pub fn run(&mut self, id: &str, params: &Value) -> Result<Value, CmdError> {
         let result = self.run_command(id, params);
+        // embed: a search or a move that finds nothing refuses no edit.
+        if crate::edit_mode::NAVIGATION.contains(&id) {
+            return result;
+        }
         // embed: in an edit session every error is a refusal with a stable code, for the host to map
         // to its own message: an unknown command, bad parameters and a command that does not apply
         // here (nothing selected, nothing to undo) included.
@@ -452,7 +483,22 @@ impl Session {
                 self.author.clone_from(&self.edit_author);
             }
             if id == TAB {
-                return self.run("text.insert", &tab_params());
+                // A refused tab is the Tab key's, not typing's.
+                return match self.run("text.insert", &tab_params()) {
+                    Err(CmdError::Editing(refused)) => Err(self.refused(TAB, refused.refusal, refused.detail)),
+                    other => other,
+                };
+            }
+            // A header or footer the document has is entered as a story to edit; making a new one is
+            // not a tracked change, so is refused.
+            if let Some(header) = crate::edit_mode::entering_header(id) {
+                let Some(part) = crate::edit_mode::existing_header_footer(&self.doc, &self.sel.focus, header) else {
+                    return Err(self.refused(id, Refusal::CommandNotAllowed, None));
+                };
+                self.close_typing();
+                self.sel = Selection::caret(self.doc.end_of(StoryRef::Part(part)));
+                self.redraw();
+                return Ok(serde_json::json!({ "story": part }));
             }
             if !allows(id, rules) {
                 return Err(self.refused(id, refusal_for(id, rules), None));
@@ -496,7 +542,8 @@ impl Session {
         if spec.mutates && !matches!(id, "edit.undo" | "edit.redo" | "edit.repeat") {
             self.last_command = Some((id.to_string(), params.clone()));
         }
-        let before_doc = if spec.mutates { Some((self.doc.clone(), self.sel.clone(), self.history.len(), self.typing_open)) } else { None };
+        let before_doc =
+            if spec.mutates { Some((self.doc.clone(), self.sel.clone(), self.history.len(), self.typing_open, self.version)) } else { None };
         if spec.mutates && spec.id != "text.insert" {
             self.typing_open = false;
         }
@@ -532,11 +579,12 @@ impl Session {
                 self.clamp_selection();
             }
             Err(e) => {
-                if let Some((d, s, h, t)) = before_doc {
+                if let Some((d, s, h, t, v)) = before_doc {
                     self.doc = d;
                     self.sel = s;
                     self.history.truncate(h);
                     self.typing_open = t;
+                    self.version = v;
                 }
                 self.status = e.to_string();
                 self.refusal = e.edit_refusal();

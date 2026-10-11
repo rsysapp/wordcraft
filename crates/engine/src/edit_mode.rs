@@ -32,7 +32,36 @@ pub const COMMANDS: &[&str] = &[
     "review.nextChange",
     "review.previousChange",
     "review.changes",
+    // Into an existing header or footer and back to the text (`Session::run` refuses making one).
+    "insert.editHeader",
+    "insert.editFooter",
+    "insert.closeHeader",
 ];
+
+/// Searching and moving through the document. One that finds nothing refuses no edit: its error is
+/// never an edit session's refusal, so a host shows no notice for it.
+pub const NAVIGATION: &[&str] = &["edit.find", "edit.findNext", "edit.findPrevious", "edit.goto", "review.nextChange", "review.previousChange"];
+
+/// Whether `id` enters a header (`Some(true)`) or a footer (`Some(false)`).
+pub fn entering_header(id: &str) -> Option<bool> {
+    match id {
+        "insert.editHeader" => Some(true),
+        "insert.editFooter" => Some(false),
+        _ => None,
+    }
+}
+
+/// The header (or footer) the document already has for the section the caret is in, if any.
+pub fn existing_header_footer(doc: &Document, at: &wordcraft_doc::Pos, header: bool) -> Option<u32> {
+    let block = match at.story {
+        StoryRef::Body => at.path.0.first().copied().unwrap_or(0) as usize,
+        StoryRef::Part(_) => 0,
+    };
+    let sections = doc.sections();
+    let (_, section) = sections.iter().find(|(end, _)| block <= *end).or_else(|| sections.last())?;
+    let part = if header { section.headers.default } else { section.footers.default };
+    part.filter(|id| doc.parts.get(id).is_some_and(|part| matches!(part.kind, PartKind::Header | PartKind::Footer)))
+}
 
 /// Deciding tracked changes.
 pub const DECIDE: &[&str] = &["review.accept", "review.reject", "review.acceptAll", "review.rejectAll"];
