@@ -2072,3 +2072,58 @@ fn refuses_kept_values_past_a_kibibyte() {
     tables.text("a w:author", &"a".repeat(1_024), &mut budget).unwrap();
     assert!(budget.held() - before >= 1_024, "held {}", budget.held() - before);
 }
+
+/// W1-24: text a tracked insertion brings inside a text box (or other content compared whole) counts
+/// as hidden by the rule text outside follows: through its paragraph's style, its character style,
+/// a table's style inside it, the default paragraph style. Text Word would show does not count.
+#[test]
+fn counts_text_hidden_through_styles_inside_an_inserted_text_box() {
+    let boxed = |inside: &str| {
+        format!(
+            r#"<w:ins w:id="9" w:author="{}" w:date="{}"><w:r><w:pict><w:txbxContent>{inside}</w:txbxContent></w:pict></w:r></w:ins>"#,
+            SARI.0, SARI.1
+        )
+    };
+    let hidden_text = |styles: &str, inside: &str| {
+        let base = styled(styles, &para(&text("Rent.")));
+        let edited = styled(styles, &para(&format!("{}{}", text("Rent."), boxed(inside))));
+        let inspection = inspect(&base, &edited).unwrap();
+        let sari = &inspection.new_revisions[0];
+        assert_eq!(sari.objects, 1, "{inspection:#?}");
+        sari.hidden_text
+    };
+    let secret = r#"<w:r><w:t>secret</w:t></w:r>"#;
+    // A paragraph style that hides, directly and through the style it is based on.
+    assert!(hidden_text(HIDDEN_STYLES, &format!(r#"<w:p><w:pPr><w:pStyle w:val="Hide"/></w:pPr>{secret}</w:p>"#)) >= 1);
+    assert!(hidden_text(HIDDEN_STYLES, &format!(r#"<w:p><w:pPr><w:pStyle w:val="Gone"/></w:pPr>{secret}</w:p>"#)) >= 1);
+    // A character style.
+    assert!(hidden_text(HIDDEN_STYLES, r#"<w:p><w:r><w:rPr><w:rStyle w:val="Secret"/></w:rPr><w:t>secret</w:t></w:r></w:p>"#) >= 1);
+    // A table style, on a table inside the text box.
+    let table = format!(r#"<w:tbl><w:tblPr><w:tblStyle w:val="HideTable"/></w:tblPr><w:tr><w:tc><w:p>{secret}</w:p></w:tc></w:tr></w:tbl>"#);
+    assert!(hidden_text(TABLE_STYLES, &table) >= 1);
+    // The default paragraph style, for a paragraph naming none.
+    let default_paragraph = r#"<w:style w:type="paragraph" w:default="1" w:styleId="Normal"><w:rPr><w:vanish/></w:rPr></w:style>"#;
+    assert!(hidden_text(default_paragraph, &format!("<w:p>{secret}</w:p>")) >= 1);
+    // Shown text, and a style that hides only where it is not applied, count nothing.
+    assert_eq!(hidden_text(HIDDEN_STYLES, &format!("<w:p>{secret}</w:p>")), 0);
+    assert_eq!(
+        hidden_text(HIDDEN_STYLES, r#"<w:p><w:r><w:rPr><w:vanish w:val="0"/><w:rStyle w:val="Secret"/></w:rPr><w:t>shown</w:t></w:r></w:p>"#),
+        0
+    );
+}
+
+/// W1-24: what content compared whole hides depends on the styles around it, so the same content
+/// in a hiding table and outside one is not the same mark: a copy of a shown base text box,
+/// inserted into a table whose style hides, counts as hidden.
+#[test]
+fn tells_the_same_text_box_apart_by_what_hides_it() {
+    // The run around the text box says it is shown; the text inside it follows the table's style.
+    let text_box =
+        r#"<w:r><w:rPr><w:vanish w:val="0"/></w:rPr><w:pict><w:txbxContent><w:p><w:r><w:t>secret</w:t></w:r></w:p></w:txbxContent></w:pict></w:r>"#;
+    let inserted = format!(r#"<w:ins w:id="9" w:author="{}" w:date="{}">{text_box}</w:ins>"#, SARI.0, SARI.1);
+    let base = styled(TABLE_STYLES, &format!("{}{}", para(text_box), table(r#"<w:tblStyle w:val="HideTable"/>"#, &text("Rent."))));
+    let edited =
+        styled(TABLE_STYLES, &format!("{}{}", para(text_box), table(r#"<w:tblStyle w:val="HideTable"/>"#, &format!("{}{inserted}", text("Rent.")))));
+    let inspection = inspect(&base, &edited).unwrap();
+    assert!(inspection.new_revisions[0].hidden_text >= 1, "{inspection:#?}");
+}

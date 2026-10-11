@@ -200,20 +200,59 @@ pub(super) fn is_bidi_control(character: u32) -> bool {
     matches!(character, 0x061C | 0x200E | 0x200F | 0x202A..=0x202E | 0x2066..=0x2069)
 }
 
-/// What an element holds below itself, read through once (charged as work).
-fn scan(el: &XEl, budget: &mut Budget) -> Result<Holds, String> {
-    fn children(el: &XEl, holds: &mut Holds, budget: &mut Budget) -> Result<(), String> {
+/// Where opaque content stands: the style of the paragraph around it and whether a table around it
+/// has a style that may hide.
+#[derive(Clone, Copy)]
+struct Around<'s> {
+    hiding: &'s StyleHiding,
+    paragraph_style: Option<&'s str>,
+    in_hiding_table: bool,
+}
+
+/// What an element holds below itself, read through once (charged as work). Hidden text is counted
+/// by the rule runs outside follow: each run whose effective properties may hide (its direct
+/// properties, its character style, the style of the paragraph it is in (a paragraph inside, such
+/// as a text box's, or the one around the element), a table's style, the document defaults), each
+/// paragraph mark the same way, and any other run properties that hide by themselves.
+fn scan(el: &XEl, around: Around<'_>, budget: &mut Budget) -> Result<Holds, String> {
+    fn children(el: &XEl, around: Around<'_>, holds: &mut Holds, budget: &mut Budget) -> Result<(), String> {
         for node in &el.kids {
             match node {
                 XNode::El(child) => {
                     budget.work(1)?;
                     holds.content = true;
+                    let mut inner = around;
                     match &*child.name {
                         "w:fldChar" | "w:fldSimple" | "w:instrText" | "w:delInstrText" => holds.field_codes = holds.field_codes.saturating_add(1),
+                        "w:r" => {
+                            budget.work(4)?;
+                            if around.hiding.effective(child.child("w:rPr"), around.paragraph_style, around.in_hiding_table, budget)? {
+                                holds.hidden = holds.hidden.saturating_add(1);
+                            }
+                        }
+                        "w:p" => {
+                            budget.work(4)?;
+                            let properties = child.child("w:pPr");
+                            inner.paragraph_style =
+                                properties.and_then(|properties| properties.child("w:pStyle")).and_then(|style| style.attr("w:val"));
+                            // Its mark, hidden through its own run properties or its styles.
+                            let mark = properties.and_then(|properties| properties.child("w:rPr"));
+                            if around.hiding.effective(mark, inner.paragraph_style, around.in_hiding_table, budget)? {
+                                holds.hidden = holds.hidden.saturating_add(1);
+                            }
+                        }
+                        "w:tbl" => {
+                            budget.work(4)?;
+                            let style =
+                                child.child("w:tblPr").and_then(|properties| properties.child("w:tblStyle")).and_then(|style| style.attr("w:val"));
+                            inner.in_hiding_table |= around.hiding.table(style, budget)?;
+                        }
+                        // Run properties a run or a paragraph mark were counted by.
+                        "w:rPr" if matches!(&*el.name, "w:r" | "w:pPr") => {}
                         "w:rPr" if hides(Some(child)) => holds.hidden = holds.hidden.saturating_add(1),
                         _ => {}
                     }
-                    children(child, holds, budget)?;
+                    children(child, inner, holds, budget)?;
                 }
                 XNode::Text(text) => {
                     budget.work(1 + units(text.len()) / 16)?;
@@ -228,7 +267,7 @@ fn scan(el: &XEl, budget: &mut Budget) -> Result<Holds, String> {
         Ok(())
     }
     let mut holds = Holds::default();
-    children(el, &mut holds, budget)?;
+    children(el, around, &mut holds, budget)?;
     Ok(holds)
 }
 
@@ -746,33 +785,44 @@ impl StyleHiding {
 
     /// Whether a style, or the default style of its kind when none is named or the named one is
     /// missing, may hide.
-    fn style(&self, id: Option<&str>, default: bool) -> bool {
-        match id {
+    fn style(&self, id: Option<&str>, default: bool, budget: &mut Budget) -> Result<bool, String> {
+        Ok(match id {
             // A name longer than any kept value is no style a reader settles: it may hide.
             Some(id) if id.len() > MAX_KEPT_VALUE => true,
-            Some(id) => self.styles.get(id).map_or(default, |entry| entry.hides),
+            Some(id) => {
+                // The lookup hashes and compares the name.
+                budget.work(2 + units(id.len()) / 8)?;
+                self.styles.get(id).map_or(default, |entry| entry.hides)
+            }
             None => default,
-        }
+        })
     }
 
     /// Whether a table of this style (the default table style when it names none) may hide its
     /// cells' text.
-    pub(super) fn table(&self, style: Option<&str>) -> bool {
-        self.style(style, self.default_table)
+    pub(super) fn table(&self, style: Option<&str>, budget: &mut Budget) -> Result<bool, String> {
+        self.style(style, self.default_table, budget)
     }
 
     /// Whether a run with these direct properties, in a paragraph of this style, inside a table
     /// whose style may hide (`in_hiding_table`), is hidden. Direct formatting decides when it says;
     /// otherwise any level that may hide counts: the character style, the paragraph style, the
     /// table style, the document defaults.
-    pub(super) fn effective(&self, properties: Option<&XEl>, paragraph_style: Option<&str>, in_hiding_table: bool) -> bool {
+    pub(super) fn effective(
+        &self,
+        properties: Option<&XEl>,
+        paragraph_style: Option<&str>,
+        in_hiding_table: bool,
+        budget: &mut Budget,
+    ) -> Result<bool, String> {
+        if let Some(said) = vanish(properties) {
+            return Ok(said);
+        }
         let character_style = properties.and_then(|properties| properties.child("w:rStyle")).and_then(|style| style.attr("w:val"));
-        vanish(properties).unwrap_or_else(|| {
-            self.style(character_style, self.default_character)
-                || self.style(paragraph_style, self.default_paragraph)
-                || in_hiding_table
-                || self.defaults
-        })
+        Ok(self.style(character_style, self.default_character, budget)?
+            || self.style(paragraph_style, self.default_paragraph, budget)?
+            || in_hiding_table
+            || self.defaults)
     }
 }
 
@@ -827,12 +877,18 @@ impl Walker<'_, '_> {
             (name, _) if OBJECTS.contains(&name) => MarkKind::Object,
             _ => MarkKind::Plain,
         };
+        let around = Around { hiding: self.hiding, paragraph_style: self.paragraph_style.now.as_deref(), in_hiding_table: self.hiding_tables > 0 };
+        let holds = scan(el, around, self.budget)?;
         let mut hasher = Hasher::default();
         hasher.field(b'O', &[]);
         self.canon.element(el, &mut hasher);
+        // What it hides depends on the styles around it, which the two packages need not share:
+        // the same content hiding otherwise is another mark.
+        if holds.hidden > 0 {
+            hasher.field(b'h', &holds.hidden.to_le_bytes());
+        }
         let digest = finish(hasher, self.budget)?;
         let element = el.name.clone();
-        let holds = scan(el, self.budget)?;
         // The id is copied only for a mark the tables do not have yet, which charges it.
         self.mark(digest, || MarkInfo { element, comment: comment.map(str::to_string), kind, holds }, format)
     }
@@ -943,7 +999,7 @@ impl Walker<'_, '_> {
                 let digest = self.canon.digest(change, &|child| !is(child, old_properties), self.budget)?;
                 let extra = self.tables.content(digest);
                 let (author, date, _) = self.note(change, RevisionKind::Format)?;
-                let old_hidden = self.hiding.effective(old_properties, self.paragraph_style.now.as_deref(), self.hiding_tables > 0);
+                let old_hidden = self.hiding.effective(old_properties, self.paragraph_style.now.as_deref(), self.hiding_tables > 0, self.budget)?;
                 Some(FormatRev { author, date, extra, old, old_hidden })
             }
             None => None,
@@ -958,18 +1014,21 @@ impl Walker<'_, '_> {
 
     /// Whether run properties hide in this paragraph, and which tracked change hides them: the
     /// run's own (`rev`) or its paragraph's, if its recorded old properties would show the run.
-    fn hiding(&self, properties: Option<&XEl>, rev: Option<&FormatRev>) -> (bool, Option<(u32, u32)>) {
+    fn hiding(&mut self, properties: Option<&XEl>, rev: Option<&FormatRev>) -> Result<(bool, Option<(u32, u32)>), String> {
         let style = self.paragraph_style.now.as_deref();
         let tables = self.hiding_tables > 0;
-        let hidden = self.hiding.effective(properties, style, tables);
+        let hidden = self.hiding.effective(properties, style, tables, self.budget)?;
         if !hidden {
-            return (false, None);
+            return Ok((false, None));
         }
         if let Some(rev) = rev.filter(|rev| !rev.old_hidden) {
-            return (true, Some((rev.author, rev.date)));
+            return Ok((true, Some((rev.author, rev.date))));
         }
-        let by_paragraph = self.paragraph_style.change.as_ref().filter(|(_, _, old)| !self.hiding.effective(properties, old.as_deref(), tables));
-        (true, by_paragraph.map(|(author, date, _)| (*author, *date)))
+        let by_paragraph = match &self.paragraph_style.change {
+            Some((author, date, old)) if !self.hiding.effective(properties, old.as_deref(), tables, self.budget)? => Some((*author, *date)),
+            _ => None,
+        };
+        Ok((true, by_paragraph))
     }
 
     fn hidden_format(&mut self, mut slots: Vec<Slot>, hiding: (bool, Option<(u32, u32)>), instr: bool) -> u32 {
@@ -1172,7 +1231,7 @@ impl Walker<'_, '_> {
         slots.extend(self.slot("pPr.sectPr", section, "w:sectPrChange", "w:sectPr", &|_| false)?);
         // A hidden mark hides the paragraph's end: its paragraph runs into the next.
         let mark_rev = slots.iter().find(|slot| slot.name == "pPr.rPr").and_then(|slot| slot.rev);
-        let hiding = self.hiding(mark_properties, mark_rev.as_ref());
+        let hiding = self.hiding(mark_properties, mark_rev.as_ref())?;
         let format = self.hidden_format(slots, hiding, false);
         let mut hasher = Hasher::default();
         hasher.field(b'P', &[]);
@@ -1193,7 +1252,7 @@ impl Walker<'_, '_> {
         }
         slots.extend(self.slot("rPr", properties, "w:rPrChange", "w:rPr", &|_| false)?);
         let rev = slots.iter().find(|slot| slot.name == "rPr").and_then(|slot| slot.rev);
-        let hidden = self.hiding(properties, rev.as_ref());
+        let hidden = self.hiding(properties, rev.as_ref())?;
         let run_format = self.hidden_format(slots.clone(), hidden, false);
         let deleting = self.tables.wraps_of(self.current()).iter().any(|wrap| matches!(wrap.kind, WrapKind::Del | WrapKind::MoveFrom));
         for node in &r.kids {
@@ -1281,7 +1340,7 @@ impl Walker<'_, '_> {
         let shared: Vec<Wrap> = shared.filter(|first_row| all_alike && !first_row.is_empty()).unwrap_or_default();
         // Text in the table's cells is hidden when its style (or the default table style) may hide.
         let style = properties.and_then(|properties| properties.child("w:tblStyle")).and_then(|style| style.attr("w:val"));
-        let hides = self.hiding.table(style);
+        let hides = self.hiding.table(style, self.budget)?;
         let depth = self.stack.len();
         for wrap in &shared {
             self.enter(*wrap);
