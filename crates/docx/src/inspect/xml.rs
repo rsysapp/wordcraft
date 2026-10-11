@@ -128,8 +128,9 @@ const NODE_BYTES: u64 = vector_slot::<XNode>() + 16;
 /// Memory charged for each attribute, besides its value: its entry in a vector growing by doubling.
 const ATTRIBUTE_BYTES: u64 = vector_slot::<(Rc<str>, String)>();
 /// Memory held while a part is parsed, whatever it holds: one element's working records (its
-/// attributes' duplicate check, the reader's record of their keys, the open elements' first
-/// rooms, a name being written), each bounded by `MAX_ATTRIBUTES`, `MAX_NAME` and the depth.
+/// attributes' duplicate checks, by name and by key as written, the open elements' first rooms, a
+/// name being written), each bounded by `MAX_ATTRIBUTES`, `MAX_NAME`, `MAX_ATTRIBUTE_KEY` and the
+/// depth.
 const PARSE_BYTES: u64 = 256 * 1024;
 /// The longest element, attribute or namespace name read; a longer one is no WordprocessingML.
 const MAX_NAME: usize = 4_096;
@@ -166,7 +167,7 @@ fn resolved(result: ResolveResult<'_>, local: &[u8], names: &mut Names, budget: 
     if local.is_empty() || local.contains(['{', '}', ':']) {
         return Err(format!("an element or attribute named {local:?}"));
     }
-    // Resolving a prefix walks the bindings in scope and compares the namespace with the known ones.
+    // Comparing the namespace with the known ones (the walk to find it was charged before it ran).
     budget.work(8 + units(local.len()) / 4)?;
     match result {
         ResolveResult::Bound(namespace) => qualified(namespace.as_ref(), local, names, budget),
@@ -328,17 +329,38 @@ fn start_name_length(bytes: &[u8], at: usize) -> Option<usize> {
 }
 
 /// The namespace declarations of a start tag: their bytes (prefix and namespace) and how many.
-fn declarations(start: &BytesStart<'_>) -> (u64, u64) {
+/// Every attribute's key is measured first: none may pass `MAX_ATTRIBUTE_KEY`, so nothing that
+/// compares keys (the duplicate check, the resolver's declarations) works on longer ones.
+fn declarations(start: &BytesStart<'_>) -> Result<(u64, u64), String> {
     let mut bytes = 0u64;
     let mut count = 0u64;
     for attribute in start.attributes().with_checks(false).flatten() {
         let key = attribute.key.as_ref();
+        if key.len() > MAX_ATTRIBUTE_KEY {
+            return Err("an attribute name longer than any WordprocessingML name".into());
+        }
         if key == b"xmlns" || key.starts_with(b"xmlns:") {
             bytes = bytes.saturating_add(units(key.len().saturating_add(attribute.value.len())));
             count = count.saturating_add(1);
         }
     }
-    (bytes, count)
+    Ok((bytes, count))
+}
+
+/// The longest attribute name, prefix included; a longer one is no WordprocessingML.
+const MAX_ATTRIBUTE_KEY: usize = 256;
+
+/// The most namespace declarations in scope at once; a WordprocessingML part declares a few dozen.
+const MAX_BINDINGS_IN_SCOPE: u64 = 1_024;
+
+/// Declarations in scope a resolution walks for one unit of work: it compares each one's prefix,
+/// newest first, until one matches (0.5 to 0.9 ns each, measured).
+const BINDINGS_PER_UNIT: u64 = 8;
+
+/// The work of resolving a prefix (or an element's default namespace) with `in_scope` declarations
+/// in scope, charged before it runs: at worst it walks them all (and the reserved `xml` binding).
+fn walk(in_scope: u64, budget: &mut Budget) -> Result<(), String> {
+    budget.work(1 + in_scope.saturating_add(2) / BINDINGS_PER_UNIT)
 }
 
 /// The most bytes of an element's raw name: a prefix and a local name each no longer than
@@ -373,6 +395,8 @@ fn parse_into(
     let mut stack: Vec<XEl> = Vec::new();
     // What each open element holds in the reader's room: its name and declarations, and records.
     let mut open: Vec<(u64, u64)> = Vec::new();
+    // Namespace declarations in scope: what a resolution may walk.
+    let mut in_scope: u64 = 0;
     let mut root: Option<XEl> = None;
     loop {
         let at = usize::try_from(reader.buffer_position()).unwrap_or(usize::MAX);
@@ -395,14 +419,19 @@ fn parse_into(
                 if name_length.is_none() || start.name().as_ref().len() > MAX_RAW_NAME {
                     return Err("a start tag the reader saw otherwise".into());
                 }
-                let (declared, bindings) = declarations(start);
+                let (declared, bindings) = declarations(start)?;
+                in_scope = in_scope.saturating_add(bindings);
+                if in_scope > MAX_BINDINGS_IN_SCOPE {
+                    return Err("more namespace declarations in scope than an inspection reads".into());
+                }
                 let own = (raw_name.saturating_add(declared), bindings.saturating_add(1));
                 room.reserve(own.0, own.1, budget)?;
                 resolver.push(start).map_err(|error| format!("malformed XML: {error}"))?;
+                walk(in_scope, budget)?;
                 let (result, local) = resolver.resolve_element(start.name());
                 let name = resolved(result, local.as_ref(), names, budget)?;
                 charge(budget, held, NODE_BYTES)?;
-                let element = element(&resolver, name, start, names, budget, held)?;
+                let element = element(&resolver, in_scope, name, start, names, budget, held)?;
                 *most_items = most_items.saturating_add(2);
                 if matches!(event, Event::Start(_)) {
                     if stack.len() >= limits.max_depth {
@@ -414,6 +443,7 @@ fn parse_into(
                     open.push(own);
                 } else {
                     resolver.pop();
+                    in_scope = in_scope.saturating_sub(bindings);
                     close(&mut stack, &mut root, element);
                 }
             }
@@ -423,6 +453,8 @@ fn parse_into(
                 let (bytes, records) = open.pop().unwrap_or((0, 0));
                 room.bytes = room.bytes.saturating_sub(bytes);
                 room.records = room.records.saturating_sub(records);
+                // An element's records are its declarations and itself.
+                in_scope = in_scope.saturating_sub(records.saturating_sub(1));
                 close(&mut stack, &mut root, element);
             }
             Event::Text(text) => {
@@ -481,6 +513,7 @@ pub(super) const MAX_ATTRIBUTES: usize = 512;
 
 fn element(
     resolver: &NamespaceResolver,
+    in_scope: u64,
     name: String,
     start: &BytesStart<'_>,
     names: &mut Names,
@@ -490,14 +523,24 @@ fn element(
     let mut attrs: Vec<(Rc<str>, String)> = Vec::new();
     // Names are interned, so one name is one pointer.
     let mut seen: HashSet<*const u8> = HashSet::new();
+    // The keys as written, each at most `MAX_ATTRIBUTE_KEY` bytes: a key written twice is refused
+    // through a set, not by comparing every pair (the reader's own check).
+    let mut written: HashSet<&[u8]> = HashSet::new();
     let mut declared = 0usize;
     let mut list_bytes = 0usize;
-    for attribute in start.attributes().with_checks(true) {
+    for attribute in start.attributes().with_checks(false) {
         let attribute = attribute.map_err(|error| format!("a malformed attribute: {error}"))?;
         if attrs.len().saturating_add(declared) >= MAX_ATTRIBUTES {
             return Err("an element with more attributes than any real one".into());
         }
-        let key = attribute.key.as_ref();
+        let key = attribute.key.into_inner();
+        if key.len() > MAX_ATTRIBUTE_KEY {
+            return Err("an attribute name longer than any WordprocessingML name".into());
+        }
+        budget.work(1 + units(key.len()) / 8)?;
+        if !written.insert(key) {
+            return Err(format!("the attribute {} twice", String::from_utf8_lossy(key)));
+        }
         if key == b"xmlns" || key.starts_with(b"xmlns:") {
             // The resolver keeps each declaration while its element is open, charged to the
             // reader's room; the tree keeps none.
@@ -507,6 +550,10 @@ fn element(
         }
         // Held as it is read: its entry.
         charge(budget, held, ATTRIBUTE_BYTES)?;
+        // Only a prefixed attribute name walks the declarations; an unprefixed one has no namespace.
+        if key.contains(&b':') {
+            walk(in_scope, budget)?;
+        }
         let (namespace, local) = resolver.resolve_attribute(attribute.key);
         let key = resolved(namespace, local.as_ref(), names, budget)?;
         let value = if holds_prefixes(&name, &key) {
@@ -514,7 +561,8 @@ fn element(
             let raw_bytes = units(attribute.value.len());
             budget.hold(raw_bytes)?;
             let raw = attribute_value(&attribute.value);
-            let expanded = raw.and_then(|raw| qualified_list(resolver, &key, &raw, names, budget, held, &mut list_bytes));
+            let lists = Lists { resolver, in_scope, attribute: &key };
+            let expanded = raw.and_then(|raw| qualified_list(&lists, &raw, names, budget, held, &mut list_bytes));
             budget.release(raw_bytes);
             expanded?
         } else {
@@ -540,22 +588,30 @@ const MAX_LIST_BYTES: usize = 64 * 1024;
 /// takes the default namespace), written as element names are (`w:local`, `{n}local`), so a
 /// long namespace costs its number, not its length. Each token's expansion is charged, as memory
 /// and as work, before it is made; `spent` counts the element's expanded bytes so far.
+/// What a prefix list is read against: the declarations in scope (and how many), and the
+/// attribute it is the value of.
+struct Lists<'r, 'k> {
+    resolver: &'r NamespaceResolver,
+    in_scope: u64,
+    attribute: &'k str,
+}
+
 fn qualified_list(
-    resolver: &NamespaceResolver,
-    attribute: &str,
+    lists: &Lists<'_, '_>,
     value: &str,
     names: &mut Names,
     budget: &mut Budget,
     held: &mut u64,
     spent: &mut usize,
 ) -> Result<String, String> {
+    let attribute = lists.attribute;
     // First the length, so the expansion is charged and allocated once, at its size.
     let mut length = 0usize;
     for (count, token) in value.split_whitespace().enumerate() {
         if count >= MAX_LIST_NAMES {
             return Err(format!("a {attribute} list longer than any real one"));
         }
-        length = length.saturating_add(qualified_token(resolver, attribute, token, names, budget)?.len()).saturating_add(1);
+        length = length.saturating_add(qualified_token(lists, token, names, budget)?.len()).saturating_add(1);
         if spent.saturating_add(length) > MAX_LIST_BYTES {
             return Err(format!("a {attribute} list longer than any real one"));
         }
@@ -565,22 +621,23 @@ fn qualified_list(
     charge(budget, held, units(length))?;
     let mut out = String::with_capacity(length);
     for token in value.split_whitespace() {
-        out.push_str(&qualified_token(resolver, attribute, token, names, budget)?);
+        out.push_str(&qualified_token(lists, token, names, budget)?);
         out.push(' ');
     }
     Ok(out)
 }
 
 /// One token of a prefix list, its prefix resolved in scope; charged as work.
-fn qualified_token(resolver: &NamespaceResolver, attribute: &str, token: &str, names: &mut Names, budget: &mut Budget) -> Result<String, String> {
+fn qualified_token(lists: &Lists<'_, '_>, token: &str, names: &mut Names, budget: &mut Budget) -> Result<String, String> {
     let (prefix, local) = match token.split_once(':') {
         Some(parts) => parts,
-        None if attribute == "xsi:type" => ("", token),
+        None if lists.attribute == "xsi:type" => ("", token),
         None => (token, ""),
     };
     let probe = if prefix.is_empty() { "x".to_string() } else { format!("{prefix}:x") };
     budget.work(8 + units(token.len()) / 4)?;
-    let (namespace, _) = resolver.resolve(QName(probe.as_bytes()), true);
+    walk(lists.in_scope, budget)?;
+    let (namespace, _) = lists.resolver.resolve(QName(probe.as_bytes()), true);
     match namespace {
         ResolveResult::Bound(namespace) => {
             let namespace = namespace.as_ref().to_vec();

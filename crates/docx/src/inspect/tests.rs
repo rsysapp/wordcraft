@@ -1991,3 +1991,60 @@ fn refuses_a_name_the_zip_reader_would_decode_otherwise() {
     // An ASCII name needs no flag.
     assert!(inspect(&raw_package(Vec::new()), &raw_package(vec![RawEntry::stored("parts/media.bin", b"x")])).is_ok());
 }
+
+/// The work of parsing `xml` on its own.
+fn parse_work(xml: &str) -> Result<u64, String> {
+    let mut budget = budget::Budget::new(u64::MAX, u64::MAX);
+    let mut limits = xml::Limits { elements_left: INSPECT_LIMITS.max_elements, max_depth: INSPECT_LIMITS.max_depth };
+    xml::parse(xml.as_bytes(), &mut xml::Names::default(), &mut limits, &mut budget)?;
+    Ok(u64::MAX - budget.work_left())
+}
+
+/// W1-23 (H4): resolving a name walks the namespace declarations in scope, newest first: each
+/// resolution is charged for every declaration it may walk, before it runs, and no more than 1,024
+/// declarations may be in scope at once.
+#[test]
+fn charges_each_namespace_declaration_a_name_walks() {
+    // Declarations `from..to`; an element carries at most 512 attributes, so a thousand stand on two.
+    let declarations = |from: usize, to: usize| -> String { (from..to).map(|n| format!(r#" xmlns:p{n}="urn:{n}""#)).collect() };
+    let thousand = |inner: &str| format!("<r{}><s{}>{inner}</s></r>", declarations(0, 500), declarations(500, 1_000));
+    // Unprefixed names with no default namespace walk every declaration.
+    let elements = "<e/>".repeat(50_000);
+    let plain = parse_work(&format!("<r><s>{elements}</s></r>")).unwrap();
+    let declared = parse_work(&thousand(&elements)).unwrap();
+    assert!(declared - plain >= 50_000 * 1_000 / 8, "declared {declared}, plain {plain}");
+    // So do prefixed attribute names, but not unprefixed ones.
+    let attributes = r#"<e p0:a="1" b="2"/>"#.repeat(50_000);
+    let walked = parse_work(&thousand(&attributes)).unwrap();
+    assert!(walked - declared >= 50_000 * 1_000 / 8, "walked {walked}, declared {declared}");
+    // In scope at once: nested declarations add up.
+    assert!(parse_work(&thousand(&format!("<e{}/>", declarations(1_000, 1_024)))).is_ok());
+    let over = parse_work(&thousand(&format!("<e{}/>", declarations(1_000, 1_025))));
+    assert!(matches!(&over, Err(message) if message.contains("namespace declarations")), "{over:?}");
+    // Declarations leave scope with their element.
+    let siblings = |close: bool| {
+        let element = if close { format!("<e{}></e>", declarations(0, 500)) } else { format!("<e{}/>", declarations(0, 500)) };
+        format!("<r>{}</r>", element.repeat(3))
+    };
+    assert!(parse_work(&siblings(false)).is_ok());
+    assert!(parse_work(&siblings(true)).is_ok());
+}
+
+/// W1-23 (H5): an attribute name is at most 256 bytes, and a name written twice is found through a
+/// set, not by comparing every pair of names.
+#[test]
+fn bounds_attribute_names_and_checks_them_once() {
+    let named = |length: usize| format!(r#"<r {}="1"/>"#, "a".repeat(length));
+    assert!(parse_work(&named(256)).is_ok());
+    let long = parse_work(&named(257));
+    assert!(matches!(&long, Err(message) if message.contains("attribute name longer")), "{long:?}");
+    let long_declaration = parse_work(&format!(r#"<r xmlns:{}="urn:x"/>"#, "p".repeat(251)));
+    assert!(matches!(&long_declaration, Err(message) if message.contains("attribute name longer")), "{long_declaration:?}");
+    for twice in [r#"<r a="1" a="2"/>"#, r#"<r xmlns:p="urn:x" xmlns:p="urn:y"/>"#, r#"<r xmlns:p="urn:x" xmlns:q="urn:x" p:a="1" q:a="2"/>"#] {
+        assert!(matches!(parse_work(twice), Err(message) if message.contains("twice")), "{twice}");
+    }
+    // 512 attributes of 256 bytes each, all alike but the last byte: read in linear work.
+    let attributes: String = (0..500).map(|n| format!(r#" {}{n:03}="1""#, "k".repeat(253))).collect();
+    let work = parse_work(&format!("<r{attributes}/>")).unwrap();
+    assert!(work < 200_000, "work {work}");
+}

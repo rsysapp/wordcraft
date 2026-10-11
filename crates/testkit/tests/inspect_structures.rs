@@ -242,10 +242,15 @@ fn growth_points() -> Vec<(&'static str, Probe)> {
     shapes.push(("tree: names at a resize point", tree(format!("<r>{names}</r>"))));
     let namespaces: String = (0..resize_point(15)).map(|n| format!(r#"<a:e xmlns:a="urn:{n}"/>"#)).collect();
     shapes.push(("tree: namespaces at a resize point", tree(format!("<r>{namespaces}</r>"))));
-    // Long prefixes in the reader's buffer of open names, nested.
-    let prefix = "p".repeat(4_000);
-    let nested =
-        format!(r#"<{prefix}:e xmlns:{prefix}="urn:x">{}{}</{prefix}:e>"#, format!("<{prefix}:e>").repeat(60), format!("</{prefix}:e>").repeat(60));
+    // Long names in the reader's buffer of open names, nested: the longest prefix a declaration
+    // can name (its attribute name at most 256 bytes) and a long local name.
+    let prefix = "p".repeat(250);
+    let local = "e".repeat(4_000);
+    let nested = format!(
+        r#"<{prefix}:{local} xmlns:{prefix}="urn:x">{}{}</{prefix}:{local}>"#,
+        format!("<{prefix}:{local}>").repeat(60),
+        format!("</{prefix}:{local}>").repeat(60)
+    );
     shapes.push(("tree: open names", tree(format!("<r>{}</r>", nested.repeat(20)))));
 
     for (name, entries, count) in [
