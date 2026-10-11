@@ -13,6 +13,9 @@ mod units;
 mod write;
 mod xml;
 
+// embed: the edited-against-base comparison a host's server runs on every save.
+pub mod inspect;
+
 // embed: a caller with less memory or stack than the desktop reads within tighter limits.
 pub use package::ReadLimits;
 pub use read::{read, read_with_limits};
