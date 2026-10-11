@@ -15,6 +15,8 @@ use quick_xml::events::{BytesStart, Event};
 use quick_xml::name::{QName, ResolveResult};
 use quick_xml::reader::NsReader;
 
+use super::budget::Budget;
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(super) enum XNode {
     El(XEl),
@@ -78,10 +80,19 @@ impl Names {
 }
 
 /// What a package's parts may still spend: one element budget for all of them, and a depth.
-pub(super) struct Budget {
+pub(super) struct Limits {
     pub elements_left: usize,
     pub max_depth: usize,
 }
+
+/// Memory charged for each element of a parsed tree: its node in its parent's children, twice (a
+/// growing vector holds up to twice its length, and both copies while it moves; vectors are shrunk
+/// to fit as elements close), and the allocator's share.
+const ELEMENT_BYTES: u64 = 2 * std::mem::size_of::<XNode>() as u64 + 16;
+/// Memory charged for each attribute, besides its value.
+const ATTRIBUTE_BYTES: u64 = std::mem::size_of::<(Rc<str>, String)>() as u64 + 16;
+/// The longest element, attribute or namespace name read; a longer one is no WordprocessingML.
+const MAX_NAME: usize = 4_096;
 
 /// Namespaces outside the WordprocessingML body set, with the prefixes the desktop parser uses.
 const OTHER_NAMESPACES: &[(&str, &str)] = &[
@@ -107,6 +118,9 @@ fn qualified(namespace: &[u8], local: &str) -> Result<String, String> {
 
 fn resolved(result: ResolveResult<'_>, local: &[u8]) -> Result<String, String> {
     let local = std::str::from_utf8(local).map_err(|_| "a name that is not UTF-8".to_string())?;
+    if local.len() > MAX_NAME || matches!(&result, ResolveResult::Bound(namespace) if namespace.as_ref().len() > MAX_NAME) {
+        return Err("a name longer than any WordprocessingML name".into());
+    }
     match result {
         ResolveResult::Bound(namespace) => qualified(namespace.as_ref(), local),
         ResolveResult::Unbound => Ok(local.to_string()),
@@ -176,8 +190,53 @@ fn attribute_value(raw: &[u8]) -> Result<String, String> {
     Ok(out)
 }
 
-/// Parse a part. Elements count against `budget` (one budget across the package).
-pub(super) fn parse(bytes: &[u8], names: &mut Names, budget: &mut Budget) -> Result<XEl, String> {
+/// A parsed part and the memory it holds (to release once the tree is dropped).
+pub(super) struct Parsed {
+    pub root: XEl,
+    pub held: u64,
+    /// At least as many as the items a walk of this tree can make: each character of text, and two
+    /// marks for each element (a container's start and end).
+    pub most_items: u64,
+}
+
+/// Parse a part. Elements count against `limits` (one element budget across the package); work
+/// and the tree's memory against `budget`, charged as the tree grows.
+pub(super) fn parse(bytes: &[u8], names: &mut Names, limits: &mut Limits, budget: &mut Budget) -> Result<Parsed, String> {
+    let mut held: u64 = 0;
+    let mut most_items: u64 = 4;
+    let result = parse_into(bytes, names, limits, budget, &mut held, &mut most_items);
+    match result {
+        Ok(root) => Ok(Parsed { root, held, most_items }),
+        Err(error) => {
+            budget.release(held);
+            Err(error)
+        }
+    }
+}
+
+/// How many items a text node can make: a character each inside a text element, else one mark.
+fn item_bound(stack: &[XEl], length: usize) -> u64 {
+    match stack.last().map(|top| &*top.name) {
+        Some("w:t" | "w:delText" | "w:instrText" | "w:delInstrText") => super::budget::units(length),
+        _ => 1,
+    }
+}
+
+fn charge(budget: &mut Budget, held: &mut u64, bytes: u64) -> Result<(), String> {
+    budget.hold(bytes)?;
+    budget.work(1 + bytes / 64)?;
+    *held = held.saturating_add(bytes);
+    Ok(())
+}
+
+fn parse_into(
+    bytes: &[u8],
+    names: &mut Names,
+    limits: &mut Limits,
+    budget: &mut Budget,
+    held: &mut u64,
+    most_items: &mut u64,
+) -> Result<XEl, String> {
     let bytes = bytes.strip_prefix(&[0xEF, 0xBB, 0xBF][..]).unwrap_or(bytes);
     let mut reader = NsReader::from_reader(bytes);
     {
@@ -192,20 +251,23 @@ pub(super) fn parse(bytes: &[u8], names: &mut Names, budget: &mut Budget) -> Res
     }
     let mut stack: Vec<XEl> = Vec::new();
     let mut root: Option<XEl> = None;
-    let mut buf = Vec::new();
     loop {
-        buf.clear();
-        let (result, event) = reader.read_resolved_event_into(&mut buf).map_err(|error| format!("malformed XML: {error}"))?;
+        // Events borrow from the part's bytes: nothing is copied but the text kept.
+        let (result, event) = reader.read_resolved_event().map_err(|error| format!("malformed XML: {error}"))?;
         match event {
             Event::Start(ref start) | Event::Empty(ref start) => {
                 if root.is_some() {
                     return Err("content after the root element".into());
                 }
-                budget.elements_left = budget.elements_left.checked_sub(1).ok_or(super::TOO_MANY_ELEMENTS)?;
+                limits.elements_left = limits.elements_left.checked_sub(1).ok_or(super::TOO_MANY_ELEMENTS)?;
                 let name = resolved(result, start.local_name().as_ref())?;
                 let element = element(&reader, name, start, names)?;
+                let values: usize = element.attrs.iter().map(|(_, value)| value.len()).sum();
+                let attributes = super::budget::units(element.attrs.len()).saturating_mul(ATTRIBUTE_BYTES);
+                charge(budget, held, ELEMENT_BYTES.saturating_add(attributes).saturating_add(super::budget::units(values)))?;
+                *most_items = most_items.saturating_add(2);
                 if matches!(event, Event::Start(_)) {
-                    if stack.len() >= budget.max_depth {
+                    if stack.len() >= limits.max_depth {
                         return Err(super::TOO_DEEP.into());
                     }
                     stack.push(element);
@@ -220,16 +282,21 @@ pub(super) fn parse(bytes: &[u8], names: &mut Names, budget: &mut Budget) -> Res
             Event::Text(text) => {
                 let text = text.xml10_content().map_err(|_| "text that is not UTF-8".to_string())?;
                 checked(&text)?;
+                charge(budget, held, super::budget::units(text.len()))?;
+                *most_items = most_items.saturating_add(item_bound(&stack, text.len()));
                 push_text(&mut stack, &text)?;
             }
             Event::CData(data) => {
                 let text = data.xml10_content().map_err(|_| "text that is not UTF-8".to_string())?;
                 checked(&text)?;
+                charge(budget, held, super::budget::units(text.len()))?;
+                *most_items = most_items.saturating_add(item_bound(&stack, text.len()));
                 push_text(&mut stack, &text)?;
             }
             Event::GeneralRef(reference) => {
                 let name = reference.decode().map_err(|_| "a reference that is not UTF-8".to_string())?;
                 let character = entity(&name)?;
+                *most_items = most_items.saturating_add(1);
                 push_text(&mut stack, character.encode_utf8(&mut [0; 4]))?;
             }
             Event::Decl(declaration) => {
@@ -277,7 +344,10 @@ fn element(reader: &NsReader<&[u8]>, name: String, start: &BytesStart<'_>, names
 /// `p1 p2:local` with each prefix replaced by its namespace in scope (an unprefixed `xsi:type`
 /// takes the default namespace).
 fn qualified_list(reader: &NsReader<&[u8]>, attribute: &str, value: &str) -> Result<String, String> {
-    let mut out = Vec::new();
+    // Each token's namespace is written with its length before it, so no escaping is needed; the
+    // whole stays short, as these attributes are in any real document.
+    const MAX_LIST: usize = 64 * 1024;
+    let mut out = String::new();
     for token in value.split_whitespace() {
         let (prefix, local) = match token.split_once(':') {
             Some(parts) => parts,
@@ -293,9 +363,12 @@ fn qualified_list(reader: &NsReader<&[u8]>, attribute: &str, value: &str) -> Res
             ResolveResult::Unbound => String::new(),
             ResolveResult::Unknown(_) => format!("?{prefix}"),
         };
-        out.push(format!("{{{}}}{}", escape(&uri), escape(local)));
+        if out.len().saturating_add(uri.len()).saturating_add(local.len()) > MAX_LIST {
+            return Err(format!("a {attribute} list longer than any real one"));
+        }
+        out.push_str(&format!("{}:{uri}{local} ", uri.len()));
     }
-    Ok(out.join(" "))
+    Ok(out)
 }
 
 fn push_text(stack: &mut [XEl], text: &str) -> Result<(), String> {

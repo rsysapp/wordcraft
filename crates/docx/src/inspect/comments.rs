@@ -1,20 +1,22 @@
-//! embed: comments by meaning (Ruling W1-4). Edit mode adds comments and replies, so the comments
+//! embed: comments by meaning. Edit mode adds comments and replies, so the comments
 //! parts change on a legitimate save; what matters is which comments were added, by whom, and
 //! whether any comment of the base was removed or altered.
 
 use std::collections::{BTreeMap, HashMap};
 
-use super::opc::Canon;
+use super::budget::Budget;
+use super::digest::{Digest, Hasher};
+use super::opc::{Canon, finish};
 use super::xml::{XEl, XNode, is_space};
 
 /// One comment as compared.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) struct Comment {
     pub author: String,
-    /// Every attribute but the id (author, date, initials…), canonical.
-    pub meta: String,
-    /// Its paragraphs, canonical.
-    pub content: String,
+    /// Every attribute but the id (author, date, initials…), as a digest of their compared form.
+    pub meta: Digest,
+    /// Its paragraphs, as a digest of their compared form.
+    pub content: Digest,
     /// Marked done (`w15:done`).
     pub done: bool,
     /// The comment this one answers (`w15:paraIdParent`).
@@ -25,7 +27,7 @@ pub(super) struct Comment {
 pub(super) type Comments = BTreeMap<String, Comment>;
 
 /// The comments of `w:comments`, with their state from `w15:commentsEx`.
-pub(super) fn read(comments: &XEl, extended: Option<&XEl>, canon: &Canon<'_>) -> Result<Comments, String> {
+pub(super) fn read(comments: &XEl, extended: Option<&XEl>, canon: &Canon<'_>, budget: &mut Budget) -> Result<Comments, String> {
     if &*comments.name != "w:comments" {
         return Err("a comments part without w:comments".into());
     }
@@ -43,9 +45,8 @@ pub(super) fn read(comments: &XEl, extended: Option<&XEl>, canon: &Canon<'_>) ->
         let id = el.attr("w:id").ok_or("a comment without an id")?.to_string();
         let without_id =
             XEl { name: el.name.clone(), attrs: el.attrs.iter().filter(|(key, _)| &**key != "w:id").cloned().collect(), kids: Vec::new() };
-        let mut meta = String::new();
-        canon.start_tag(&without_id, &mut meta);
-        let mut content = String::new();
+        let meta = canon.start_digest(&without_id, budget)?;
+        let mut content = Hasher::default();
         for node in &el.kids {
             match node {
                 XNode::El(child) => canon.element(child, &mut content),
@@ -53,6 +54,8 @@ pub(super) fn read(comments: &XEl, extended: Option<&XEl>, canon: &Canon<'_>) ->
                 XNode::Text(_) => return Err("text directly inside a comment".into()),
             }
         }
+        let content = finish(content, budget)?;
+        budget.hold(256)?;
         if let Some(paragraph) = el.els().filter(|child| &*child.name == "w:p").last().and_then(|p| p.attr("w14:paraId")) {
             by_paragraph.entry(paragraph.to_string()).and_modify(|entry| *entry = None).or_insert_with(|| Some(id.clone()));
         }

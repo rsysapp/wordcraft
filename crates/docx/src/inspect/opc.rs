@@ -3,7 +3,9 @@
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 
-use super::xml::{XEl, XNode, escape, is_space};
+use super::budget::Budget;
+use super::digest::{Digest, Hasher};
+use super::xml::{XEl, XNode, is_space};
 
 // ---- Relationships ------------------------------------------------------------------------------
 
@@ -64,15 +66,6 @@ impl Rels {
 
     pub(super) fn of_type<'a>(&'a self, kind: &'a str) -> impl Iterator<Item = &'a Rel> + 'a {
         self.by_id.values().filter(move |rel| is_type(&rel.kind, kind))
-    }
-
-    /// What a relationship id stands for, so a renumbered id reads the same and a retargeted one
-    /// does not. An id this part does not define reads as itself.
-    pub(super) fn describe(&self, id: &str) -> String {
-        match self.by_id.get(id) {
-            Some(rel) => format!("rel({}|{}|{})", escape(&rel.kind), escape(&rel.target), if rel.external { "external" } else { "internal" }),
-            None => format!("rel?({})", escape(id)),
-        }
     }
 }
 
@@ -220,16 +213,24 @@ pub(super) fn bookmarks(root: &XEl) -> Bookmarks {
     out
 }
 
-/// How a part's XML is printed for comparison: bookkeeping attributes dropped, relationship ids
-/// replaced by what they point at, bookmark ends by their bookmark's name.
+/// How a part's XML is compared: bookkeeping attributes dropped, relationship ids read as what
+/// they point at, bookmark ends as their bookmark's name. The form is hashed as it is produced
+/// (framed fields, nothing escaped or kept), so its size never costs memory.
 pub(super) struct Canon<'a> {
     pub rels: &'a Rels,
     pub bookmarks: Option<&'a Bookmarks>,
 }
 
+/// An attribute's value as compared.
+enum Value<'v> {
+    Plain(&'v str),
+    Rel(&'v str),
+    Bookmark(&'v str),
+}
+
 impl Canon<'_> {
     /// An attribute's value as compared, or `None` when it is bookkeeping.
-    fn value(&self, element: &str, key: &str, value: &str) -> Option<String> {
+    fn value<'v>(element: &str, key: &str, value: &'v str) -> Option<Value<'v>> {
         if key.starts_with("w:rsid") || matches!(key, "w14:paraId" | "w14:textId" | "mc:Ignorable") {
             return None;
         }
@@ -238,67 +239,89 @@ impl Canon<'_> {
                 return None;
             }
             if element == "w:bookmarkEnd" {
-                return Some(match self.bookmarks.and_then(|map| map.get(value)) {
-                    Some(Some(name)) => format!("name={}", escape(name)),
-                    Some(None) => format!("shared={}", escape(value)),
-                    None => format!("missing={}", escape(value)),
-                });
+                return Some(Value::Bookmark(value));
             }
         }
         if key.starts_with("r:") || key == "o:relid" {
-            return Some(self.rels.describe(value));
+            return Some(Value::Rel(value));
         }
-        Some(escape(value))
+        Some(Value::Plain(value))
     }
 
-    /// `<name a="v"…>`, attributes sorted.
-    pub(super) fn start_tag(&self, el: &XEl, out: &mut String) {
-        let mut attributes: Vec<(&str, String)> =
-            el.attrs.iter().filter_map(|(key, value)| self.value(&el.name, key, value).map(|value| (&**key, value))).collect();
-        attributes.sort();
-        out.push('<');
-        out.push_str(&escape(&el.name));
-        for (key, value) in attributes {
-            out.push(' ');
-            out.push_str(&escape(key));
-            out.push_str("=\"");
-            out.push_str(&value);
-            out.push('"');
+    fn write_value(&self, value: &Value<'_>, hasher: &mut Hasher) {
+        match value {
+            Value::Plain(text) => hasher.field(b'=', text.as_bytes()),
+            Value::Rel(id) => match self.rels.by_id.get(*id) {
+                Some(rel) => {
+                    hasher.field(b'R', rel.kind.as_bytes());
+                    hasher.field(b'r', rel.target.as_bytes());
+                    hasher.field(b'm', if rel.external { b"external" } else { b"internal" });
+                }
+                None => hasher.field(b'?', id.as_bytes()),
+            },
+            Value::Bookmark(id) => match self.bookmarks.and_then(|map| map.get(*id)) {
+                Some(Some(name)) => hasher.field(b'N', name.as_bytes()),
+                Some(None) => hasher.field(b'S', id.as_bytes()),
+                None => hasher.field(b'M', id.as_bytes()),
+            },
         }
-        out.push('>');
     }
 
-    pub(super) fn element(&self, el: &XEl, out: &mut String) {
-        self.filtered(el, &|_| true, out);
+    /// Whether any attribute of `el` is compared.
+    pub(super) fn has_attributes(&self, el: &XEl) -> bool {
+        el.attrs.iter().any(|(key, value)| Canon::value(&el.name, key, value).is_some())
     }
 
-    /// The element with only the children `keep` accepts (its descendants are printed whole).
-    pub(super) fn filtered(&self, el: &XEl, keep: &dyn Fn(&XEl) -> bool, out: &mut String) {
-        self.start_tag(el, out);
+    /// The start tag: the name and the compared attributes, sorted.
+    pub(super) fn start_tag(&self, el: &XEl, hasher: &mut Hasher) {
+        let mut attributes: Vec<(&str, Value<'_>)> =
+            el.attrs.iter().filter_map(|(key, value)| Canon::value(&el.name, key, value).map(|value| (&**key, value))).collect();
+        attributes.sort_by(|a, b| a.0.cmp(b.0));
+        hasher.field(b'<', el.name.as_bytes());
+        for (key, value) in &attributes {
+            hasher.field(b'@', key.as_bytes());
+            self.write_value(value, hasher);
+        }
+        hasher.field(b'!', &[]);
+    }
+
+    pub(super) fn element(&self, el: &XEl, hasher: &mut Hasher) {
+        self.filtered(el, &|_| true, hasher);
+    }
+
+    /// The element with only the children `keep` accepts (its descendants whole).
+    pub(super) fn filtered(&self, el: &XEl, keep: &dyn Fn(&XEl) -> bool, hasher: &mut Hasher) {
+        self.start_tag(el, hasher);
         let leaf = !el.has_element_kids();
         for node in &el.kids {
             match node {
-                XNode::El(child) if keep(child) => self.element(child, out),
+                XNode::El(child) if keep(child) => self.element(child, hasher),
                 XNode::El(_) => {}
                 // White space between elements is layout; in a leaf it is the value.
                 XNode::Text(text) if !leaf && is_space(text) => {}
-                XNode::Text(text) => out.push_str(&escape(text)),
+                XNode::Text(text) => hasher.field(b'T', text.as_bytes()),
             }
         }
-        out.push_str("</");
-        out.push_str(&escape(&el.name));
-        out.push('>');
+        hasher.field(b'>', el.name.as_bytes());
     }
 
-    pub(super) fn string(&self, el: &XEl) -> String {
-        let mut out = String::new();
-        self.element(el, &mut out);
-        out
+    /// The digest of the element without the children `keep` refuses, its hashing charged as work.
+    pub(super) fn digest(&self, el: &XEl, keep: &dyn Fn(&XEl) -> bool, budget: &mut Budget) -> Result<Digest, String> {
+        let mut hasher = Hasher::default();
+        self.filtered(el, keep, &mut hasher);
+        finish(hasher, budget)
     }
 
-    pub(super) fn filtered_string(&self, el: &XEl, keep: &dyn Fn(&XEl) -> bool) -> String {
-        let mut out = String::new();
-        self.filtered(el, keep, &mut out);
-        out
+    /// The digest of the start tag alone.
+    pub(super) fn start_digest(&self, el: &XEl, budget: &mut Budget) -> Result<Digest, String> {
+        let mut hasher = Hasher::default();
+        self.start_tag(el, &mut hasher);
+        finish(hasher, budget)
     }
+}
+
+/// A finished digest, its bytes charged as work (one unit per 64 bytes hashed, at least one).
+pub(super) fn finish(hasher: Hasher, budget: &mut Budget) -> Result<Digest, String> {
+    budget.work(1 + hasher.length() / 64)?;
+    Ok(hasher.finish())
 }

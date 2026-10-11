@@ -9,18 +9,26 @@
 //! How it compares. Both packages are read raw (not through WordCraft's document model, which
 //! would hide what the reader drops):
 //! - **Stories** (the main document, headers, footers, footnotes, endnotes; known by content
-//!   type) become streams of characters and marks, each with its tracked-change wrappers and
-//!   formatting. Revisions are known by author and date; those the base lacks are the save's
-//!   own. The edited stream with the save's own changes undone (its insertions dropped, its
-//!   deletions unmarked, its formatting changes reverted, its new comments' anchors dropped) must
-//!   equal the base, except where a base change was accepted or rejected. A word-level diff, then a
-//!   character-level diff of each stretch that differs (Myers, each bounded by `max_changes`, all
-//!   within one work budget), finds what differs.
+//!   type) become streams of characters and marks, each with its tracked-change wrappers, its
+//!   formatting and its context: the fields it is code or result of (with their instructions), and
+//!   the properties of the paragraph and section a reader shows it in, worked out on the stream as
+//!   saved. Revisions are known by author and date; those the base lacks are the save's own. The
+//!   edited stream with the save's own changes undone (its insertions dropped, its deletions
+//!   unmarked, its formatting changes reverted, its new comments' empty anchors dropped) must equal
+//!   the base, context included, except where a base change was accepted or rejected. So content the
+//!   save inserts can still be caught changing how base content reads: field characters around it,
+//!   a paragraph mark or section break governing it. A word-level diff, then a character-level diff
+//!   of each stretch that differs (Myers, each bounded by `max_changes`), finds what differs.
 //! - **Comments** are compared by meaning: added, replies, removed, altered.
 //! - **Relationships** are compared as sets of (type, target, mode) per part, and a relationship id
 //!   inside XML reads as what it points at, so renumbering is not a change and retargeting is.
 //! - **Content types** are compared by the type each part gets.
-//! - **Other XML parts** are compared in a canonical form; binaries byte for byte.
+//! - **Other XML parts** are compared by the SHA-256 of a canonical form, produced as it is hashed
+//!   (nothing printed or kept); binaries byte for byte, read side by side.
+//!
+//! Every step is bounded: elements, depth and part sizes by [`INSPECT_LIMITS`], story text by
+//! [`MAX_STORY_ITEMS`], every diff by `max_changes`, all reading, hashing, walking and comparing by
+//! [`MAX_WORK`], and what the inspection holds by [`memory_limit`] (charged before it is allocated).
 //!
 //! Bookkeeping that carries no content is ignored: `w:rsid*`, `w14:paraId`, `w14:textId` and
 //! `mc:Ignorable` attributes, a tracked change's `w:id`, a bookmark's id (its end reads as its
@@ -38,9 +46,11 @@
 //! accepted or as rejected. A character changed without tracking is never counted only as a
 //! comment or a resolution. A host judges every field; none is advisory.
 
+mod budget;
 mod comments;
 mod compare;
 mod diff;
+mod digest;
 mod opc;
 mod package;
 mod story;
@@ -52,12 +62,13 @@ mod tests;
 use std::collections::{BTreeMap, BTreeSet};
 
 use crate::package::{ReadLimits, rt};
-use compare::{CommentIds, Projector, Tally, compare_story};
-use diff::Work;
+use budget::Budget;
+use compare::{CommentIds, Holds, Pairs, Projector, Tally, assign_contexts, compare_story, facts};
+use digest::{Digest, Hasher};
 use opc::{Bookmarks, Canon, ContentTypes, Rel, Rels};
 use package::StrictPackage;
 use story::{Item, Revisions, Tables};
-use xml::{Budget, Names, XEl};
+use xml::{Limits, Names};
 
 /// The most token differences compared in one diff; beyond it the comparison stops and says so, so
 /// a rewritten document cannot make the check run without end.
@@ -73,9 +84,18 @@ pub const INSPECT_LIMITS: ReadLimits = ReadLimits { max_part_bytes: 64 << 20, ma
 /// agreement of two thousand pages holds about six million.
 pub const MAX_STORY_ITEMS: usize = 8_000_000;
 
-/// Comparisons and steps one inspection may spend in its diffs, whatever the clock: past it the
-/// comparison stops with `too_many_changes`.
-pub const MAX_WORK: u64 = 200_000_000;
+/// Work one inspection may spend, whatever the clock: decompressing, parsing, hashing, walking and
+/// comparing, counted in steps (an element, a character, 64 bytes hashed or read, a diff
+/// comparison). Past it, reading is refused as an error and a comparison stops with
+/// `too_many_changes`.
+pub const MAX_WORK: u64 = 400_000_000;
+
+/// The most memory one inspection holds, whatever the uploads.
+pub const MAX_MEMORY: u64 = 512 << 20;
+/// Memory an inspection may hold per byte uploaded (base and save together)…
+pub const MEMORY_PER_UPLOADED_BYTE: u64 = 8;
+/// …but never less than this, so an ordinary agreement, whose text compresses well, is read.
+pub const MEMORY_FLOOR: u64 = 384 << 20;
 
 /// Why a package over its element budget is unreadable.
 const TOO_MANY_ELEMENTS: &str = "more XML elements than an inspection reads";
@@ -95,7 +115,7 @@ pub struct Inspection {
     /// change the base already had that the base does not hold.
     pub altered_revisions: u32,
     /// Characters, marks or formatting that differ from the base without a tracked change of this
-    /// save: an untracked edit, an untracked formatting change (Ruling W1-3), a tracked insertion
+    /// save: an untracked edit, an untracked formatting change, a tracked insertion
     /// whose content Word would show plainly.
     pub untracked_changes: u32,
     /// Parts or story elements of the base missing or different, outside tracked changes.
@@ -103,18 +123,18 @@ pub struct Inspection {
     /// The comparison stopped at a bound (`max_changes` in one diff, or [`MAX_WORK`]). Every count
     /// is then incomplete: a host must refuse.
     pub too_many_changes: bool,
-    /// Parts the base does not have (Ruling W1-2): macros, embedded objects, alternative chunks,
+    /// Parts the base does not have: macros, embedded objects, alternative chunks,
     /// custom XML, anything. Relationship parts and `[Content_Types].xml` are reported through
     /// [`Self::changed_relationships`] and [`Self::content_types`]; the comments parts through
     /// [`Self::comments`].
     pub added_parts: Vec<AddedPart>,
-    /// Relationships added or removed, per source part (Ruling W1-2). A relationship is its type,
+    /// Relationships added or removed, per source part. A relationship is its type,
     /// target and mode; its id is not compared. The main part's links to its comments parts are
     /// reported through [`Self::comments`] instead.
     pub changed_relationships: Vec<RelationshipChange>,
-    /// Parts in both packages whose content type differs (Ruling W1-2).
+    /// Parts in both packages whose content type differs.
     pub content_types: Vec<ContentTypeChange>,
-    /// What happened to comments (Ruling W1-4).
+    /// What happened to comments.
     pub comments: CommentChanges,
 }
 
@@ -129,6 +149,23 @@ pub struct AuthorRevisions {
     pub deletions: u32,
     /// Tracked formatting changes (`w:rPrChange`, `w:pPrChange`, `w:sectPrChange`, table ones).
     pub format_changes: u32,
+    /// The earliest and latest `w:date` among these changes, as written (ISO 8601 sorts as text);
+    /// `None` when none has a date.
+    pub earliest_date: Option<String>,
+    pub latest_date: Option<String>,
+    /// Changes with no `w:date`.
+    pub undated: u32,
+    /// Characters and marks inside these insertions that are hidden (`w:vanish`, `w:webHidden`,
+    /// `w:specVanish`), plus content these formatting changes hide.
+    pub hidden_text: u32,
+    /// Field characters and field code inside these insertions: a field can show other text than
+    /// its code reads, and change it when updated.
+    pub field_codes: u32,
+    /// Directional formatting characters (U+202A–U+202E, U+2066–U+2069, U+200E, U+200F,
+    /// U+061C) inside these insertions: they reorder the text after them.
+    pub bidi_controls: u32,
+    /// Drawings, pictures and embedded objects inside these insertions: they can cover text.
+    pub objects: u32,
 }
 
 /// Base tracked changes resolved, counted once per kind, author, date and attributes.
@@ -256,16 +293,30 @@ pub fn inspect_with_limit(base: &[u8], edited: &[u8], max_changes: usize) -> Res
 
 /// [`inspect`] with each package read within `limits` and each diff bounded by `max_changes`.
 pub fn inspect_within(base: &[u8], edited: &[u8], limits: &ReadLimits, max_changes: usize) -> Result<Inspection, InspectError> {
+    let mut budget = Budget::new(MAX_WORK, memory_limit(base.len(), edited.len()));
+    inspect_budgeted(base, edited, limits, max_changes, &mut budget)
+}
+
+fn inspect_budgeted(base: &[u8], edited: &[u8], limits: &ReadLimits, max_changes: usize, budget: &mut Budget) -> Result<Inspection, InspectError> {
     let mut names = Names::default();
     let mut tables = Tables::new();
-    let base = Side::read(base, limits, &mut names, &mut tables).map_err(InspectError::Base)?;
-    let edited = Side::read(edited, limits, &mut names, &mut tables).map_err(InspectError::Edited)?;
-    let inspection = compare(base, edited, &mut tables, max_changes)?;
+    let base = Side::read(base, limits, &mut names, &mut tables, budget).map_err(InspectError::Base)?;
+    let edited = Side::read(edited, limits, &mut names, &mut tables, budget).map_err(InspectError::Edited)?;
+    let inspection = compare(base, edited, &mut tables, max_changes, budget)?;
     // Ids that ran out would make different pieces read as one; no fact stands then.
     if tables.overflowed() {
         return Err(InspectError::Edited("more distinct content than an inspection reads".into()));
     }
+    if budget.memory_refused {
+        return Err(InspectError::Edited(budget::TOO_MUCH_MEMORY.into()));
+    }
     Ok(inspection)
+}
+
+/// The memory one inspection may hold for uploads of these sizes.
+pub fn memory_limit(base: usize, edited: usize) -> u64 {
+    let uploaded = budget::units(base).saturating_add(budget::units(edited));
+    uploaded.saturating_mul(MEMORY_PER_UPLOADED_BYTE).clamp(MEMORY_FLOOR, MAX_MEMORY)
 }
 
 fn count(value: usize) -> u32 {
@@ -292,7 +343,8 @@ struct Side<'a> {
     comments: comments::Comments,
     kinds: BTreeMap<String, Kind>,
     stories: BTreeMap<String, Vec<Item>>,
-    canonical: BTreeMap<String, String>,
+    /// Each other XML part's compared form, as a digest.
+    canonical: BTreeMap<String, Digest>,
     revisions: Revisions,
 }
 
@@ -311,21 +363,37 @@ fn single_target(rels: &BTreeMap<String, Rels>, source: &str, kind: &str) -> Res
     Ok(Some(crate::package::resolve(dir, &rel.target)))
 }
 
-impl<'a> Side<'a> {
-    fn read(bytes: &'a [u8], limits: &ReadLimits, names: &mut Names, tables: &mut Tables) -> Result<Side<'a>, String> {
-        let mut package = StrictPackage::open(bytes, limits)?;
-        let mut budget = Budget { elements_left: limits.max_elements, max_depth: limits.max_depth.min(crate::xml::MAX_DEPTH) };
-        let all: Vec<String> = package.names().map(str::to_string).collect();
-        let mut parse = |package: &mut StrictPackage<'_>, name: &str| -> Result<XEl, String> {
-            let bytes = package.read(name)?.ok_or_else(|| format!("no part {name}"))?;
-            xml::parse(&bytes, names, &mut budget).map_err(|error| format!("{name}: {error}"))
-        };
+/// A part's bytes, held only while it is parsed.
+fn parse_part(
+    package: &mut StrictPackage<'_>,
+    name: &str,
+    names: &mut Names,
+    limits: &mut Limits,
+    budget: &mut Budget,
+) -> Result<xml::Parsed, String> {
+    let bytes = package.read(name, budget)?.ok_or_else(|| format!("no part {name}"))?;
+    let parsed = xml::parse(&bytes, names, limits, budget).map_err(|error| format!("{name}: {error}"));
+    budget.release(budget::units(bytes.len()));
+    parsed
+}
 
-        let types = ContentTypes::parse(&parse(&mut package, "[Content_Types].xml")?)?;
+impl<'a> Side<'a> {
+    fn read(bytes: &'a [u8], limits: &ReadLimits, names: &mut Names, tables: &mut Tables, budget: &mut Budget) -> Result<Side<'a>, String> {
+        let mut package = StrictPackage::open(bytes, limits, budget)?;
+        let mut limits = Limits { elements_left: limits.max_elements, max_depth: limits.max_depth.min(crate::xml::MAX_DEPTH) };
+        let all: Vec<String> = package.names().map(str::to_string).collect();
+
+        let parsed = parse_part(&mut package, "[Content_Types].xml", names, &mut limits, budget)?;
+        let types = ContentTypes::parse(&parsed.root);
+        budget.release(parsed.held);
+        let types = types?;
         let mut rels = BTreeMap::new();
         for name in &all {
             if let Some(source) = opc::rels_source(name) {
-                rels.insert(source, Rels::parse(&parse(&mut package, name)?).map_err(|error| format!("{name}: {error}"))?);
+                let parsed = parse_part(&mut package, name, names, &mut limits, budget)?;
+                let part = Rels::parse(&parsed.root).map_err(|error| format!("{name}: {error}"));
+                budget.release(parsed.held);
+                rels.insert(source, part?);
             }
         }
         let main = single_target(&rels, "", rt::OFFICE_DOC)?.ok_or("no main document part")?;
@@ -368,43 +436,60 @@ impl<'a> Side<'a> {
             let content_type = types.of(name);
             let part_rels = rels.get(name.as_str()).unwrap_or(&empty);
             if content_type.is_some_and(opc::is_story_type) {
-                let root = parse(&mut package, name)?;
-                let marks: Bookmarks = opc::bookmarks(&root);
+                let parsed = parse_part(&mut package, name, names, &mut limits, budget)?;
+                let marks: Bookmarks = opc::bookmarks(&parsed.root);
                 let canon = Canon { rels: part_rels, bookmarks: Some(&marks) };
-                let items = story::walk(&root, &canon, tables, &mut revisions, &mut items_left).map_err(|error| format!("{name}: {error}"))?;
+                let items = story::walk(&parsed.root, &canon, tables, &mut revisions, &mut items_left, parsed.most_items, budget)
+                    .map_err(|error| format!("{name}: {error}"));
+                drop(parsed.root);
+                budget.release(parsed.held);
                 kinds.insert(name.clone(), Kind::Story);
-                stories.insert(name.clone(), items);
+                stories.insert(name.clone(), items?);
             } else if opc::is_xml(name, content_type) {
-                let root = parse(&mut package, name)?;
+                let parsed = parse_part(&mut package, name, names, &mut limits, budget)?;
+                let root = &parsed.root;
                 let canon = Canon { rels: part_rels, bookmarks: None };
-                let text = if *name == settings {
-                    canon.filtered_string(&root, &|child| !matches!(&*child.name, "w:rsids" | "w:trackRevisions"))
+                let digest = if *name == settings {
+                    canon.digest(root, &|child| !matches!(&*child.name, "w:rsids" | "w:trackRevisions"), budget)
                 } else if *name == core {
-                    canon.filtered_string(&root, &|child| {
-                        !matches!(&*child.name, "cp:lastModifiedBy" | "dcterms:modified" | "cp:revision" | "cp:lastPrinted")
-                    })
+                    canon.digest(
+                        root,
+                        &|child| !matches!(&*child.name, "cp:lastModifiedBy" | "dcterms:modified" | "cp:revision" | "cp:lastPrinted"),
+                        budget,
+                    )
                 } else if *name == app {
-                    let base = root.els().filter(|child| child.name.rsplit([':', '}']).next() == Some("HyperlinkBase"));
-                    base.map(|child| canon.string(child)).collect::<Vec<_>>().join("")
+                    let mut hasher = Hasher::default();
+                    for child in root.els().filter(|child| child.name.rsplit([':', '}']).next() == Some("HyperlinkBase")) {
+                        canon.element(child, &mut hasher);
+                    }
+                    opc::finish(hasher, budget)
                 } else {
-                    canon.string(&root)
+                    canon.digest(root, &|_| true, budget)
                 };
+                budget.release(parsed.held);
                 kinds.insert(name.clone(), Kind::Xml);
-                canonical.insert(name.clone(), text);
+                canonical.insert(name.clone(), digest?);
             } else {
                 kinds.insert(name.clone(), Kind::Binary);
             }
         }
         let comments = match &comments_part {
             Some(part) => {
-                let root = parse(&mut package, part)?;
-                let extended = extended_part.as_deref().map(|part| parse(&mut package, part)).transpose()?;
+                let parsed = parse_part(&mut package, part, names, &mut limits, budget)?;
+                let extended = match extended_part.as_deref() {
+                    Some(extended) => Some(parse_part(&mut package, extended, names, &mut limits, budget)?),
+                    None => None,
+                };
                 let canon = Canon { rels: rels.get(part.as_str()).unwrap_or(&empty), bookmarks: None };
-                comments::read(&root, extended.as_ref(), &canon).map_err(|error| format!("{part}: {error}"))?
+                let read = comments::read(&parsed.root, extended.as_ref().map(|extended| &extended.root), &canon, budget)
+                    .map_err(|error| format!("{part}: {error}"));
+                budget.release(parsed.held.saturating_add(extended.map_or(0, |extended| extended.held)));
+                read?
             }
             None if extended_part.is_some() => return Err("a commentsExtended part without comments".into()),
             None => comments::Comments::new(),
         };
+        tables.charge(budget)?;
         Ok(Side { package, types, rels, main, comment_parts, comments, kinds, stories, canonical, revisions })
     }
 
@@ -420,7 +505,13 @@ impl<'a> Side<'a> {
     }
 }
 
-fn compare(mut base: Side<'_>, mut edited: Side<'_>, tables: &mut Tables, max_changes: usize) -> Result<Inspection, InspectError> {
+fn compare(
+    mut base: Side<'_>,
+    mut edited: Side<'_>,
+    tables: &mut Tables,
+    max_changes: usize,
+    budget: &mut Budget,
+) -> Result<Inspection, InspectError> {
     let mut inspection = Inspection::default();
     let mut tally = Tally::default();
 
@@ -435,28 +526,20 @@ fn compare(mut base: Side<'_>, mut edited: Side<'_>, tables: &mut Tables, max_ch
     let all: BTreeSet<String> = base.kinds.keys().chain(edited.kinds.keys()).cloned().collect();
     let mut story_parts = Vec::new();
     for name in &all {
+        let mut altered = false;
         match (base.kinds.get(name).copied(), edited.kinds.get(name).copied()) {
             (None, Some(_)) => inspection.added_parts.push(AddedPart { part: name.clone(), content_type: edited.types.of(name).map(str::to_string) }),
             (Some(_), None) => {
                 *tally.losses.entry((name.clone(), LossKind::PartMissing, None)).or_default() += 1;
             }
             (Some(Kind::Story), Some(Kind::Story)) => story_parts.push(name.clone()),
-            (Some(Kind::Xml), Some(Kind::Xml)) => {
-                if base.canonical.get(name) != edited.canonical.get(name) {
-                    *tally.losses.entry((name.clone(), LossKind::PartAltered, None)).or_default() += 1;
-                }
-            }
-            (Some(Kind::Binary), Some(Kind::Binary)) => {
-                let before = base.package.read(name).map_err(InspectError::Base)?;
-                let after = edited.package.read(name).map_err(InspectError::Edited)?;
-                if before != after {
-                    *tally.losses.entry((name.clone(), LossKind::PartAltered, None)).or_default() += 1;
-                }
-            }
-            (Some(_), Some(_)) => {
-                *tally.losses.entry((name.clone(), LossKind::PartAltered, None)).or_default() += 1;
-            }
+            (Some(Kind::Xml), Some(Kind::Xml)) => altered = base.canonical.get(name) != edited.canonical.get(name),
+            (Some(Kind::Binary), Some(Kind::Binary)) => altered = !package::same_bytes(&mut base.package, &mut edited.package, name, budget)?,
+            (Some(_), Some(_)) => altered = true,
             (None, None) => {}
+        }
+        if altered {
+            *tally.losses.entry((name.clone(), LossKind::PartAltered, None)).or_default() += 1;
         }
         if base.kinds.contains_key(name) && edited.kinds.contains_key(name) {
             let (before, after) = (base.types.of(name), edited.types.of(name));
@@ -508,28 +591,58 @@ fn compare(mut base: Side<'_>, mut edited: Side<'_>, tables: &mut Tables, max_ch
     }
 
     // Revisions: the save's own are those whose author and date the base does not have.
-    let base_pairs: BTreeSet<(String, String)> = base.revisions.by_pair.keys().cloned().collect();
-    let new_pairs: BTreeSet<(String, String)> = edited.revisions.by_pair.keys().filter(|pair| !base_pairs.contains(*pair)).cloned().collect();
-    let mut by_author: BTreeMap<String, AuthorRevisions> = BTreeMap::new();
-    for (pair, revisions) in edited.revisions.by_pair.iter().filter(|(pair, _)| new_pairs.contains(*pair)) {
-        let entry = by_author.entry(pair.0.clone()).or_insert_with(|| AuthorRevisions { author: pair.0.clone(), ..AuthorRevisions::default() });
-        entry.insertions = entry.insertions.saturating_add(revisions.insertions);
-        entry.deletions = entry.deletions.saturating_add(revisions.deletions);
-        entry.format_changes = entry.format_changes.saturating_add(revisions.format_changes);
-    }
-    inspection.new_revisions = by_author.into_values().collect();
-
-    // Stories.
-    let mut work = Work::new(MAX_WORK);
-    let ids = CommentIds { base: &base_ids, removed: &removed };
-    for name in &story_parts {
-        let (Some(before), Some(after)) = (base.stories.remove(name), edited.stories.remove(name)) else { continue };
-        let projected = Projector::new(tables, &new_pairs, &new_comments).project(&after);
-        drop(after);
-        if !compare_story(name, &before, &projected, tables, &ids, max_changes, &mut work, &mut tally) {
-            inspection.too_many_changes = true;
+    let new_pairs: Pairs = edited.revisions.by_pair.keys().filter(|pair| !base.revisions.by_pair.contains_key(*pair)).copied().collect();
+    let mut by_author: BTreeMap<u32, AuthorRevisions> = BTreeMap::new();
+    for ((author, date), counts) in edited.revisions.by_pair.iter().filter(|(pair, _)| new_pairs.contains(*pair)) {
+        let entry =
+            by_author.entry(*author).or_insert_with(|| AuthorRevisions { author: tables.text_of(*author).to_string(), ..AuthorRevisions::default() });
+        entry.insertions = entry.insertions.saturating_add(counts.insertions);
+        entry.deletions = entry.deletions.saturating_add(counts.deletions);
+        entry.format_changes = entry.format_changes.saturating_add(counts.format_changes);
+        let date = tables.text_of(*date);
+        if date.is_empty() {
+            let elements = counts.insertions.saturating_add(counts.deletions).saturating_add(counts.format_changes);
+            entry.undated = entry.undated.saturating_add(elements);
+        } else {
+            if entry.earliest_date.as_deref().is_none_or(|earliest| date < earliest) {
+                entry.earliest_date = Some(date.to_string());
+            }
+            if entry.latest_date.as_deref().is_none_or(|latest| date > latest) {
+                entry.latest_date = Some(date.to_string());
+            }
         }
     }
+
+    // Stories.
+    let ids = CommentIds { base: &base_ids, removed: &removed };
+    let mut projector = Projector::new(&new_pairs, &new_comments);
+    let mut holds: BTreeMap<u32, Holds> = BTreeMap::new();
+    for name in &story_parts {
+        let (Some(mut before), Some(mut after)) = (base.stories.remove(name), edited.stories.remove(name)) else { continue };
+        let held = story::items_held(&before).saturating_add(story::items_held(&after));
+        let compared = (|| -> Result<bool, String> {
+            assign_contexts(&mut before, tables, &mut |_, format| format, budget)?;
+            assign_contexts(&mut after, tables, &mut |tables, format| projector.format(tables, format), budget)?;
+            let moves = facts(&after, tables, &new_pairs, &mut holds, budget)?;
+            tally.untracked = tally.untracked.saturating_add(moves);
+            projector.project(tables, &mut after, budget)?;
+            Ok(compare_story(name, &before, &after, tables, &ids, max_changes, budget, &mut tally))
+        })();
+        budget.release(held);
+        match compared {
+            Ok(complete) => inspection.too_many_changes |= !complete,
+            Err(error) => return Err(InspectError::Edited(format!("{name}: {error}"))),
+        }
+    }
+    for (author, held) in holds {
+        let entry =
+            by_author.entry(author).or_insert_with(|| AuthorRevisions { author: tables.text_of(author).to_string(), ..AuthorRevisions::default() });
+        entry.hidden_text = held.hidden;
+        entry.field_codes = held.field_codes;
+        entry.bidi_controls = held.bidi_controls;
+        entry.objects = held.objects;
+    }
+    inspection.new_revisions = by_author.into_values().collect();
 
     inspection.resolved = Resolved { accepted: count(tally.accepted.len()), rejected: count(tally.rejected.len()) };
     inspection.altered_revisions = tally.altered;

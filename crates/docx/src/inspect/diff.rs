@@ -19,38 +19,14 @@ pub(super) enum Op {
     Insert(usize),
 }
 
-/// Work an inspection may still do, counted in comparisons and steps, so a crafted pair of
-/// documents stops the comparison on every target alike, whatever the clock says.
-pub(super) struct Work {
-    left: u64,
-}
-
-impl Work {
-    pub(super) fn new(units: u64) -> Work {
-        Work { left: units }
-    }
-
-    /// Spend `units`; false once the budget is gone.
-    pub(super) fn spend(&mut self, units: u64) -> bool {
-        match self.left.checked_sub(units) {
-            Some(left) => {
-                self.left = left;
-                true
-            }
-            None => {
-                self.left = 0;
-                false
-            }
-        }
-    }
-}
+use super::budget::{Budget, units};
 
 /// The edit script between `n` elements and `m` elements, where `same(i, j)` says whether element
 /// `i` of the first equals element `j` of the second. `None` when it needs more than `max_changes`
 /// insertions and deletions, or more work than is left. The common prefix and suffix are matched
 /// first, then Myers' greedy search runs on the rest: memory grows with the square of the edits,
 /// never with the length.
-pub(super) fn script(n: usize, m: usize, same: &dyn Fn(usize, usize) -> bool, max_changes: usize, work: &mut Work) -> Option<Vec<Step>> {
+pub(super) fn script(n: usize, m: usize, same: &dyn Fn(usize, usize) -> bool, max_changes: usize, work: &mut Budget) -> Option<Vec<Step>> {
     // The suffix first: where a resolved change's edge is a white space either side could own,
     // the later one keeps it, which reads a deletion rejected before its text as one change.
     let mut suffix = 0;
@@ -111,16 +87,33 @@ fn entry(previous: &[i64], d: i64, k: i64, n: i64, m: i64) -> Option<(bool, i64)
     }
 }
 
-fn myers(n: usize, m: usize, same: &dyn Fn(usize, usize) -> bool, max_changes: usize, work: &mut Work) -> Option<Vec<Step>> {
+fn myers(n: usize, m: usize, same: &dyn Fn(usize, usize) -> bool, max_changes: usize, work: &mut Budget) -> Option<Vec<Step>> {
     let (n, m) = (i64::try_from(n).ok()?, i64::try_from(m).ok()?);
     let limit = i64::try_from(max_changes).ok()?;
     // trace[d][k + d]: the furthest x on diagonal k after d edits.
     let mut trace: Vec<Vec<i64>> = Vec::new();
+    let mut held: u64 = 0;
+    let result = search(n, m, same, limit, work, &mut trace, &mut held);
+    work.release(held);
+    result
+}
+
+fn search(
+    n: i64,
+    m: i64,
+    same: &dyn Fn(usize, usize) -> bool,
+    limit: i64,
+    work: &mut Budget,
+    trace: &mut Vec<Vec<i64>>,
+    held: &mut u64,
+) -> Option<Vec<Step>> {
     for d in 0..=limit {
         let width = usize::try_from(2 * d + 1).ok()?;
-        if !work.spend(u64::try_from(width).ok()?) {
+        // The frontier is kept for the walk back: held, and worked, before it is allocated.
+        if !work.spend(units(width)) || !work.try_hold(units(width).saturating_mul(8)) {
             return None;
         }
+        *held = held.saturating_add(units(width).saturating_mul(8));
         let mut frontier = vec![NONE; width];
         let mut k = -d;
         while k <= d {
@@ -138,7 +131,7 @@ fn myers(n: usize, m: usize, same: &dyn Fn(usize, usize) -> bool, max_changes: u
                 *frontier.get_mut(usize::try_from(k + d).ok()?)? = x;
                 if x == n && y == m {
                     trace.push(frontier);
-                    return backtrack(&trace, n, m);
+                    return backtrack(trace, n, m);
                 }
             }
             k += 2;
@@ -185,7 +178,7 @@ fn backtrack(trace: &[Vec<i64>], n: i64, m: i64) -> Option<Vec<Step>> {
 /// Test helper: the script between two slices, with unbounded work.
 #[cfg(test)]
 pub(super) fn diff<T: PartialEq>(a: &[T], b: &[T], max_changes: usize) -> Option<Vec<Op>> {
-    let steps = script(a.len(), b.len(), &|i, j| a.get(i) == b.get(j), max_changes, &mut Work::new(u64::MAX))?;
+    let steps = script(a.len(), b.len(), &|i, j| a.get(i) == b.get(j), max_changes, &mut Budget::new(u64::MAX, u64::MAX))?;
     Some(
         steps
             .into_iter()

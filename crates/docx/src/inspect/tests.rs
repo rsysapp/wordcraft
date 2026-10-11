@@ -1,3 +1,5 @@
+//! embed: tests of the save inspector. Every package is built here from zip entries; a case an
+//! attacker could craft carries the rule that refuses it in its name.
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing)]
 
 use super::diff::{Op, diff};
@@ -55,7 +57,7 @@ fn reports_a_tracked_insertion_by_its_author() {
     let base = package(&para(&text("Rent is due.")), &[]);
     let edited = package(&para(&format!("{}{}{}", text("Rent is due"), ins(SARI, " monthly"), text("."))), &[]);
     let inspection = inspect(&base, &edited).unwrap();
-    assert_eq!(inspection.new_revisions, vec![AuthorRevisions { author: "Sari Wulan".into(), insertions: 1, deletions: 0, format_changes: 0 }]);
+    assert_eq!(counts(&inspection), vec![("Sari Wulan".into(), 1, 0, 0)]);
     assert_eq!((inspection.untracked_changes, inspection.losses.len()), (0, 0));
 }
 
@@ -64,7 +66,7 @@ fn reports_a_tracked_deletion_by_its_author() {
     let base = package(&para(&text("Rent is due monthly.")), &[]);
     let edited = package(&para(&format!("{}{}{}", text("Rent is due"), del(SARI, " monthly"), text("."))), &[]);
     let inspection = inspect(&base, &edited).unwrap();
-    assert_eq!(inspection.new_revisions, vec![AuthorRevisions { author: "Sari Wulan".into(), insertions: 0, deletions: 1, format_changes: 0 }]);
+    assert_eq!(counts(&inspection), vec![("Sari Wulan".into(), 0, 1, 0)]);
     assert_eq!(inspection.untracked_changes, 0);
 }
 
@@ -153,7 +155,7 @@ fn stops_at_the_bound_and_says_so() {
     assert!(inspect_with_limit(&base, &edited, 2).unwrap().too_many_changes);
 }
 
-// A host's server inspects inside a small memory budget (D10): a package over the element budget
+// A host's server inspects inside a small memory budget: a package over the element budget
 // is unreadable, never read with the desktop's limits.
 #[test]
 fn refuses_a_package_over_the_element_budget_naming_which() {
@@ -337,13 +339,14 @@ fn clean(inspection: &Inspection) -> bool {
         && inspection.comments.altered == 0
 }
 
-fn sari() -> Vec<AuthorRevisions> {
-    vec![AuthorRevisions { author: SARI.0.into(), insertions: 0, deletions: 0, format_changes: 0 }]
+/// Each new author with their insertions, deletions and formatting changes.
+fn counts(inspection: &Inspection) -> Vec<(String, u32, u32, u32)> {
+    inspection.new_revisions.iter().map(|author| (author.author.clone(), author.insertions, author.deletions, author.format_changes)).collect()
 }
 
-// ---- Ruling W1-6: the adversarial packages ----------------------------------------------------
+// ---- Adversarial packages: each rule's case -------------------------------------------------------
 
-/// W1-2: a macro project added, its relationship and the main part switched to macro-enabled.
+/// a macro project added, its relationship and the main part switched to macro-enabled.
 #[test]
 fn reports_a_macro_project_added() {
     let base = Docx::new(&para(&text("Rent."))).zip();
@@ -371,7 +374,7 @@ fn reports_a_macro_project_added() {
     );
 }
 
-/// W1-2: an embedded object, an alternative chunk and custom XML, each added, are each a part.
+/// an embedded object, an alternative chunk and custom XML, each added, are each a part.
 #[test]
 fn reports_every_added_part_with_its_content_type() {
     let base = Docx::new(&para(&text("Rent."))).zip();
@@ -393,7 +396,7 @@ fn reports_every_added_part_with_its_content_type() {
     );
 }
 
-/// W1-2: an external hyperlink retargeted is a changed relationship, and the link in the text
+/// an external hyperlink retargeted is a changed relationship, and the link in the text
 /// reads differently too.
 #[test]
 fn reports_an_external_hyperlink_target_changed() {
@@ -416,7 +419,7 @@ fn ignores_a_renumbered_relationship() {
     assert_eq!(inspect(&base, &edited).unwrap(), Inspection::default());
 }
 
-/// W1-2: a part's content type switched, without a byte of it changing.
+/// a part's content type switched, without a byte of it changing.
 #[test]
 fn reports_a_content_type_switched() {
     let base = Docx::new(&para(&text("Rent."))).part("word/styles.xml", &format!("<w:styles {W}/>")).zip();
@@ -428,7 +431,7 @@ fn reports_a_content_type_switched() {
     );
 }
 
-/// W1-3: bold added without a tracked formatting change.
+/// bold added without a tracked formatting change.
 #[test]
 fn reports_untracked_bold() {
     let base = package(&para(&text("Rent is due.")), &[]);
@@ -438,7 +441,7 @@ fn reports_untracked_bold() {
     assert!(inspection.new_revisions.is_empty());
 }
 
-/// W1-3: paragraph and section properties changed without tracking.
+/// paragraph and section properties changed without tracking.
 #[test]
 fn reports_untracked_paragraph_and_section_formatting() {
     let base = package(&format!(r#"{}<w:sectPr><w:pgSz w:w="11906" w:h="16838"/></w:sectPr>"#, para(&text("Rent."))), &[]);
@@ -446,12 +449,14 @@ fn reports_untracked_paragraph_and_section_formatting() {
         &format!(r#"<w:p><w:pPr><w:jc w:val="center"/></w:pPr>{}</w:p><w:sectPr><w:pgSz w:w="11906" w:h="16838"/></w:sectPr>"#, text("Rent.")),
         &[],
     );
-    assert_eq!(inspect(&base, &centred).unwrap().untracked_changes, 1);
+    // The mark's own properties, and each character they govern (and the marks before it).
+    assert!(inspect(&base, &centred).unwrap().untracked_changes >= 6);
     let landscape = package(&format!(r#"{}<w:sectPr><w:pgSz w:w="16838" w:h="11906"/></w:sectPr>"#, para(&text("Rent."))), &[]);
-    assert_eq!(inspect(&base, &landscape).unwrap().untracked_changes, 1);
+    // The section's own properties, and everything in the section.
+    assert!(inspect(&base, &landscape).unwrap().untracked_changes >= 7);
 }
 
-/// W1-3: numbering and styles parts are compared, not ignored.
+/// numbering and styles parts are compared, not ignored.
 #[test]
 fn reports_numbering_and_styles_changed() {
     let numbering = |format: &str| {
@@ -467,7 +472,7 @@ fn reports_numbering_and_styles_changed() {
     );
 }
 
-/// W1-4: a base comment's text altered.
+/// a base comment's text altered.
 #[test]
 fn reports_a_comment_altered() {
     let body = para(&anchored("1", "Rent"));
@@ -478,7 +483,7 @@ fn reports_a_comment_altered() {
     assert!(inspection.changed_relationships.is_empty() && inspection.added_parts.is_empty() && inspection.losses.is_empty());
 }
 
-/// W1-4: a base comment re-attributed, marked done, removed, or its anchor moved.
+/// a base comment re-attributed, marked done, removed, or its anchor moved.
 #[test]
 fn reports_each_way_a_base_comment_changes() {
     let comment = |author| [("1", author, "Check the amount.", "00000001")];
@@ -499,7 +504,7 @@ fn reports_each_way_a_base_comment_changes() {
     assert!(report.losses.is_empty() && report.changed_relationships.is_empty(), "{report:#?}");
 }
 
-/// W1-4: comments and replies added, per author; the first comment's parts are its own business.
+/// comments and replies added, per author; the first comment's parts are its own business.
 #[test]
 fn reports_comments_and_replies_added_per_author() {
     let base = Docx::new(&para(&text("Rent is due."))).zip();
@@ -517,7 +522,7 @@ fn reports_comments_and_replies_added_per_author() {
     );
 }
 
-/// W1-1: an unknown element in a run (here equation text) is compared whole, never skipped.
+/// an unknown element in a run (here equation text) is compared whole, never skipped.
 #[test]
 fn reports_a_change_inside_an_unknown_element() {
     let math = |value: &str| {
@@ -535,19 +540,19 @@ fn reports_a_change_inside_an_unknown_element() {
     assert!(!clean(&inspection), "{inspection:#?}");
 }
 
-/// W1-5: the bound on changes, and the work budget, stop the comparison and say so.
+/// the bound on changes, and the work budget, stop the comparison and say so.
 #[test]
 fn stops_at_the_bound_on_changes_and_on_work() {
     let words = |prefix: &str| (0..3_000).map(|n| format!("{prefix}{n} ")).collect::<String>();
     let base = package(&para(&text(&words("a"))), &[]);
     let edited = package(&para(&text(&words("b"))), &[]);
     assert!(inspect(&base, &edited).unwrap().too_many_changes);
-    let mut work = diff::Work::new(100);
+    let mut work = budget::Budget::new(100, u64::MAX);
     let long: Vec<u32> = (0..1_000).collect();
     assert!(diff::script(long.len(), long.len(), &|i, j| long.get(i) == long.get(j), 10, &mut work).is_none());
 }
 
-/// W1-1: a part that does not parse is the edited file's fault; so is one the base has broken.
+/// a part that does not parse is the edited file's fault; so is one the base has broken.
 #[test]
 fn refuses_a_part_that_fails_to_parse() {
     let base = package(&para(&text("Rent.")), &[("word/styles.xml", &format!("<w:styles {W}/>"))]);
@@ -582,7 +587,7 @@ fn reports_a_tracked_format_change_by_its_author() {
         &[],
     );
     let inspection = inspect(&base, &edited).unwrap();
-    assert_eq!(inspection.new_revisions, vec![AuthorRevisions { format_changes: 1, ..sari()[0].clone() }]);
+    assert_eq!(counts(&inspection), vec![(SARI.0.into(), 0, 0, 1)]);
     assert!(clean(&inspection), "{inspection:#?}");
 }
 
@@ -617,7 +622,7 @@ fn reports_a_tracked_paragraph_and_row_inserted() {
     let base = package(&para(&text("Rent.")), &[]);
     let edited = package(&format!("<w:p>{}{}</w:p>{}", mark(SARI), ins(SARI, "New clause."), para(&text("Rent."))), &[]);
     let inspection = inspect(&base, &edited).unwrap();
-    assert_eq!(inspection.new_revisions, vec![AuthorRevisions { insertions: 2, ..sari()[0].clone() }]);
+    assert_eq!(counts(&inspection), vec![(SARI.0.into(), 2, 0, 0)]);
     assert!(clean(&inspection), "{inspection:#?}");
 
     let cell = |content: &str| format!("<w:tc><w:p>{content}</w:p></w:tc>");
@@ -637,7 +642,7 @@ fn reports_a_tracked_paragraph_and_row_inserted() {
     );
     let edited = package(&table(&format!("<w:tr>{}</w:tr>{new_row}", cell(&text("Rent")))), &[]);
     let inspection = inspect(&base, &edited).unwrap();
-    assert_eq!(inspection.new_revisions, vec![AuthorRevisions { insertions: 3, ..sari()[0].clone() }]);
+    assert_eq!(counts(&inspection), vec![(SARI.0.into(), 3, 0, 0)]);
     assert!(clean(&inspection), "{inspection:#?}");
 }
 
@@ -866,7 +871,7 @@ fn reports_a_relationship_removed() {
     assert_eq!(inspection.changed_relationships[0].change, Change::Removed);
 }
 
-// ---- Ruling W1-1: the package and its XML are read strictly ------------------------------------
+// ---- The package and its XML are read strictly ------------------------------------------
 
 fn patched(bytes: &[u8], from: &[u8], to: &[u8], occurrences: usize) -> Vec<u8> {
     assert_eq!(from.len(), to.len());
@@ -1096,4 +1101,290 @@ fn refuses_more_text_than_it_reads() {
     let base = package(&para(&text("Rent.")), &[]);
     let long = package(&para(&text(&"a".repeat(MAX_STORY_ITEMS + 1))), &[]);
     assert!(matches!(inspect(&base, &long), Err(InspectError::Edited(message)) if message.contains("more text")));
+}
+
+// ---- Content the save inserts changes how base content reads --------------------------------
+
+fn field_char(kind: &str) -> String {
+    format!(r#"<w:r><w:fldChar w:fldCharType="{kind}"/></w:r>"#)
+}
+
+fn instruction(code: &str) -> String {
+    format!(r#"<w:r><w:instrText xml:space="preserve">{code}</w:instrText></w:r>"#)
+}
+
+fn inserted((author, date): (&str, &str), runs: &str) -> String {
+    format!(r#"<w:ins w:id="4" w:author="{author}" w:date="{date}">{runs}</w:ins>"#)
+}
+
+/// tracked field characters turn base text into a field's result, whose code reads
+/// otherwise. Without its context, every fact is clean.
+#[test]
+fn reports_base_text_made_a_field_result_by_tracked_field_characters() {
+    let base = package(&para(&text("Rent is due monthly.")), &[]);
+    let opening = format!("{}{}{}", field_char("begin"), instruction(" QUOTE weekly "), field_char("separate"));
+    let edited = package(
+        &para(&format!("{}{}{}{}{}", text("Rent is due "), inserted(SARI, &opening), text("monthly"), inserted(SARI, &field_char("end")), text("."))),
+        &[],
+    );
+    let inspection = inspect(&base, &edited).unwrap();
+    assert_eq!(inspection.untracked_changes, 7, "{inspection:#?}");
+    assert_eq!(inspection.new_revisions[0].field_codes, 17);
+}
+
+/// tracked field characters turn base text into field code, which no reader shows.
+#[test]
+fn reports_base_text_made_field_code_by_tracked_field_characters() {
+    let base = package(&para(&text("Rent is due monthly.")), &[]);
+    let closing = format!("{}{}", field_char("separate"), field_char("end"));
+    let edited = package(
+        &para(&format!(
+            "{}{}{}{}{}",
+            text("Rent is due "),
+            inserted(SARI, &field_char("begin")),
+            text("monthly"),
+            inserted(SARI, &closing),
+            text(".")
+        )),
+        &[],
+    );
+    assert_eq!(inspect(&base, &edited).unwrap().untracked_changes, 7);
+}
+
+/// A whole field the save inserts, beside base text, changes nothing of the base; the field is
+/// reported as what the insertion holds.
+#[test]
+fn accepts_a_whole_tracked_field_and_reports_it() {
+    let base = package(&para(&text("Rent is due monthly.")), &[]);
+    let field = format!("{}{}{}{}{}", field_char("begin"), instruction(" PAGE "), field_char("separate"), text("1"), field_char("end"));
+    let edited = package(&para(&format!("{}{}", text("Rent is due monthly."), inserted(SARI, &field))), &[]);
+    let inspection = inspect(&base, &edited).unwrap();
+    assert!(clean(&inspection), "{inspection:#?}");
+    assert_eq!(inspection.new_revisions[0].field_codes, 9);
+}
+
+/// a tracked paragraph mark gives base text new paragraph properties (here an
+/// indent that puts it off the page) without a tracked formatting change.
+#[test]
+fn reports_base_text_governed_by_a_new_mark_s_properties() {
+    let mark = |properties: &str| format!(r#"<w:pPr>{properties}<w:rPr><w:ins w:id="5" w:author="{}" w:date="{}"/></w:rPr></w:pPr>"#, SARI.0, SARI.1);
+    let base = package(&para(&text("Rent is due.")), &[]);
+    let indented = package(&format!(r#"<w:p>{}{}</w:p><w:p/>"#, mark(r#"<w:ind w:left="-20000"/>"#), text("Rent is due.")), &[]);
+    // The twelve characters, and the document and body starts before the first paragraph.
+    assert_eq!(inspect(&base, &indented).unwrap().untracked_changes, 14);
+    // the new mark ends a section, so the base text gets its own section.
+    let section =
+        package(&format!(r#"<w:p>{}{}</w:p><w:p/>"#, mark(r#"<w:sectPr><w:pgSz w:w="16838" w:h="11906"/></w:sectPr>"#), text("Rent is due.")), &[]);
+    assert!(inspect(&base, &section).unwrap().untracked_changes >= 12);
+    // Splitting with the base's own properties, or tracking the change of them, is no change.
+    let split = package(&format!(r#"<w:p>{}{}</w:p><w:p/>"#, mark(""), text("Rent is due.")), &[]);
+    assert!(clean(&inspect(&base, &split).unwrap()));
+    let tracked = format!(r#"<w:ind w:left="720"/><w:pPrChange w:id="6" w:author="{}" w:date="{}"><w:pPr/></w:pPrChange>"#, SARI.0, SARI.1);
+    let formatted = package(&format!(r#"<w:p>{}{}</w:p><w:p/>"#, mark(&tracked), text("Rent is due.")), &[]);
+    let inspection = inspect(&base, &formatted).unwrap();
+    assert!(clean(&inspection), "{inspection:#?}");
+    assert_eq!(counts(&inspection), vec![(SARI.0.into(), 1, 0, 1)]);
+}
+
+/// a new comment's range start holding a run. Only an empty anchor is dropped with
+/// its comment; this one's content is story content, here untracked.
+#[test]
+fn reports_content_inside_a_new_comment_s_anchor() {
+    let base = Docx::new(&para(&text("Rent is monthly."))).zip();
+    let body = para(&format!(
+        r#"<w:commentRangeStart w:id="1">{}</w:commentRangeStart>{}<w:commentRangeEnd w:id="1"/><w:r><w:commentReference w:id="1"/></w:r>"#,
+        text("Rent is waived."),
+        text("Rent is monthly.")
+    ));
+    let edited = with_comments(&body, &[("1", "Sari Wulan", "Note.", "00000001")], &[("00000001", None, false)]);
+    let inspection = inspect(&base, &edited).unwrap();
+    assert_eq!(inspection.comments.added.len(), 1);
+    assert!(inspection.untracked_changes > 0, "{inspection:#?}");
+    // A range marker holding content inside a tracked change is refused.
+    let wrapped = para(&format!(
+        r#"{}<w:ins w:author="{}" w:date="{}"><w:bookmarkStart w:id="2" w:name="x">{}</w:bookmarkStart></w:ins>"#,
+        text("Rent is monthly."),
+        SARI.0,
+        SARI.1,
+        text("Waived.")
+    ));
+    assert!(matches!(inspect(&base, &package(&wrapped, &[])), Err(InspectError::Edited(_))));
+}
+
+/// a removed comment's anchor that holds content is content, not part of the removal.
+#[test]
+fn reports_content_left_in_a_removed_comment_s_anchor() {
+    let base = with_comments(&para(&anchored("1", "Rent is monthly.")), &[("1", "Ana Setia", "Check.", "00000001")], &[("00000001", None, false)]);
+    let body = para(&format!(
+        r#"<w:commentRangeStart w:id="1">{}</w:commentRangeStart>{}<w:commentRangeEnd w:id="1"/>"#,
+        text("Rent is waived."),
+        text("Rent is monthly.")
+    ));
+    let inspection = inspect(&base, &package(&body, &[])).unwrap();
+    assert_eq!(inspection.comments.removed, 1);
+    assert!(inspection.untracked_changes > 0, "{inspection:#?}");
+}
+
+// ---- Bounds ------------------------------------------------------------------------------------
+
+/// a part of braces kept no copy of itself, escaped or not: what is held stays near the
+/// part's own size, and well under a budget a printed and escaped copy would pass.
+#[test]
+fn holds_little_more_than_a_part_however_it_would_print() {
+    let braces = format!("<data>{}</data>", "{".repeat(8 << 20));
+    let base = package(&para(&text("Rent.")), &[("customXml/item1.xml", &braces)]);
+    let mut budget = budget::Budget::new(u64::MAX, 40 << 20);
+    assert!(inspect_budgeted(&base, &base, &INSPECT_LIMITS, MAX_CHANGES, &mut budget).is_ok());
+    assert!(budget.peak() < 24 << 20, "held {}", budget.peak());
+    // An opaque story element of braces likewise.
+    let element = para(&format!(r#"<w:r><w:customThing>{}</w:customThing></w:r>"#, "{".repeat(8 << 20)));
+    let story = package(&element, &[]);
+    let mut budget = budget::Budget::new(u64::MAX, 40 << 20);
+    assert!(inspect_budgeted(&story, &story, &INSPECT_LIMITS, MAX_CHANGES, &mut budget).is_ok());
+    assert!(budget.peak() < 24 << 20, "held {}", budget.peak());
+}
+
+/// past the memory budget, the inspection is refused before it allocates past it.
+#[test]
+fn refuses_past_the_memory_budget() {
+    let braces = format!("<data>{}</data>", "{".repeat(8 << 20));
+    let base = package(&para(&text("Rent.")), &[("customXml/item1.xml", &braces)]);
+    let mut budget = budget::Budget::new(u64::MAX, 4 << 20);
+    assert!(
+        matches!(inspect_budgeted(&base, &base, &INSPECT_LIMITS, MAX_CHANGES, &mut budget), Err(InspectError::Base(message)) if message.contains("memory"))
+    );
+    assert_eq!(memory_limit(100_000, 100_000), MEMORY_FLOOR);
+    assert_eq!(memory_limit(400 << 20, 400 << 20), MAX_MEMORY);
+}
+
+/// reading and walking spend the work budget, so a package of many elements stops
+/// on it rather than on the clock.
+#[test]
+fn refuses_reading_past_the_work_budget() {
+    let many: String =
+        (0..2_000).map(|n| para(&inserted(("Ana Setia", &format!("2026-01-01T00:{:02}:{:02}Z", n / 60 % 60, n % 60)), &text("x")))).collect();
+    let base = package(&many, &[]);
+    let mut budget = budget::Budget::new(5_000, u64::MAX);
+    assert!(
+        matches!(inspect_budgeted(&base, &base, &INSPECT_LIMITS, MAX_CHANGES, &mut budget), Err(InspectError::Base(message)) if message.contains("work"))
+    );
+}
+
+// ---- The zip layout --------------------------------------------------------------------------
+
+/// The central directory record of the first entry: where it starts and its length.
+fn first_record(zip: &[u8]) -> (usize, usize) {
+    let end = zip.len() - 22;
+    let start = u32::from_le_bytes(zip[end + 16..end + 20].try_into().unwrap()) as usize;
+    let field = |offset: usize| u16::from_le_bytes(zip[start + offset..start + offset + 2].try_into().unwrap()) as usize;
+    (start, 46 + field(28) + field(30) + field(32))
+}
+
+/// a local header that tells another method than the directory.
+#[test]
+fn refuses_a_local_header_that_disagrees_with_the_directory() {
+    let base = package(&para(&text("Rent.")), &[]);
+    let mut edited = base.clone();
+    assert_eq!(&edited[0..4], b"PK\x03\x04");
+    edited[8] = 0; // the first entry claims to be stored
+    assert!(matches!(inspect(&base, &edited), Err(InspectError::Edited(_))));
+}
+
+/// an entry the directory does not list, before the listed ones.
+#[test]
+fn refuses_an_entry_the_directory_does_not_list() {
+    let base = package(&para(&text("Rent.")), &[]);
+    let hidden = zip_entries(&[
+        ("hidden.xml".to_string(), document(&para(&text("Rent is waived."))).into_bytes()),
+        ("[Content_Types].xml".to_string(), CONTENT_TYPES.as_bytes().to_vec()),
+        ("_rels/.rels".to_string(), ROOT_RELS.as_bytes().to_vec()),
+        ("word/document.xml".to_string(), document(&para(&text("Rent."))).into_bytes()),
+    ])
+    .unwrap();
+    // Drop the first entry's directory record; its bytes stay at the start of the file.
+    let (start, length) = first_record(&hidden);
+    let mut edited = [&hidden[..start], &hidden[start + length..]].concat();
+    let end = edited.len() - 22;
+    for offset in [8, 10] {
+        let entries = u16::from_le_bytes(edited[end + offset..end + offset + 2].try_into().unwrap()) - 1;
+        edited[end + offset..end + offset + 2].copy_from_slice(&entries.to_le_bytes());
+    }
+    let size = u32::from_le_bytes(edited[end + 12..end + 16].try_into().unwrap()) - length as u32;
+    edited[end + 12..end + 16].copy_from_slice(&size.to_le_bytes());
+    assert!(matches!(inspect(&base, &edited), Err(InspectError::Edited(message)) if message.contains("bytes")));
+}
+
+/// bytes between the directory and its end record.
+#[test]
+fn refuses_bytes_between_the_directory_and_its_end() {
+    let base = package(&para(&text("Rent.")), &[]);
+    let end = base.len() - 22;
+    let edited = [&base[..end], b"junk", &base[end..]].concat();
+    assert!(matches!(inspect(&base, &edited), Err(InspectError::Edited(_))));
+}
+
+// ---- Facts about the save's own changes -----------------------------------------------------
+
+/// dates, undated changes, and what tracked insertions hold.
+#[test]
+fn reports_what_the_save_s_changes_hold() {
+    let base = package(&para(&text("Rent.")), &[]);
+    let hidden = r#"<w:r><w:rPr><w:vanish/></w:rPr><w:t>secret</w:t></w:r>"#;
+    let body = para(&format!(
+        r#"{}{}{}{}<w:ins w:author="{}">{}</w:ins>"#,
+        text("Rent."),
+        inserted((SARI.0, "2001-01-01T00:00:00Z"), hidden),
+        inserted(SARI, &text("\u{202E}due")),
+        inserted(
+            SARI,
+            r#"<w:r><w:drawing><wp:inline xmlns:wp="http://schemas.openxmlformats.org/drawingml/2006/wordprocessingDrawing"/></w:drawing></w:r>"#
+        ),
+        SARI.0,
+        text(" more")
+    ));
+    let inspection = inspect(&base, &package(&body, &[])).unwrap();
+    let sari = &inspection.new_revisions[0];
+    assert_eq!((sari.earliest_date.as_deref(), sari.latest_date.as_deref(), sari.undated), (Some("2001-01-01T00:00:00Z"), Some(SARI.1), 1));
+    assert_eq!((sari.hidden_text, sari.bidi_controls, sari.objects, sari.field_codes), (6, 1, 1, 0));
+    // A tracked formatting change that hides base text.
+    let hide = package(
+        &para(&format!(
+            r#"<w:r><w:rPr><w:vanish/><w:rPrChange w:author="{}" w:date="{}"><w:rPr/></w:rPrChange></w:rPr><w:t>Rent.</w:t></w:r>"#,
+            SARI.0, SARI.1
+        )),
+        &[],
+    );
+    assert_eq!(inspect(&base, &hide).unwrap().new_revisions[0].hidden_text, 5);
+}
+
+/// a tracked move that arrives as other text than it left is an untracked change.
+#[test]
+fn reports_a_move_whose_text_differs() {
+    let base = package(&format!("{}{}", para(&text("A pays 100.")), para(&text("Terms."))), &[]);
+    let moved = |arrives: &str| {
+        package(
+            &format!(
+                r#"<w:p><w:moveFrom w:author="{0}" w:date="{1}"><w:r><w:delText>A pays 100.</w:delText></w:r></w:moveFrom></w:p><w:p>{2}<w:moveTo w:author="{0}" w:date="{1}">{3}</w:moveTo></w:p>"#,
+                SARI.0,
+                SARI.1,
+                text("Terms."),
+                text(arrives)
+            ),
+            &[],
+        )
+    };
+    assert_eq!(inspect(&base, &moved("A pays 100.")).unwrap().untracked_changes, 0);
+    assert_eq!(inspect(&base, &moved("A pays 900.")).unwrap().untracked_changes, 1);
+}
+
+/// parsing itself is charged, element by element, not only the bytes read and hashed.
+#[test]
+fn parsing_spends_the_work_budget() {
+    let many = format!("<data>{}</data>", "<a/>".repeat(20_000));
+    let base = package(&para(&text("Rent.")), &[("customXml/item1.xml", &many)]);
+    // Reading and hashing both packages costs about 21,000 units; parsing 40,000 elements more.
+    let mut budget = budget::Budget::new(25_000, u64::MAX);
+    assert!(
+        matches!(inspect_budgeted(&base, &base, &INSPECT_LIMITS, MAX_CHANGES, &mut budget), Err(InspectError::Base(message)) if message.contains("work"))
+    );
 }
