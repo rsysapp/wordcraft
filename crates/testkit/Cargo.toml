@@ -1,0 +1,25 @@
+[package]
+name = "wordcraft-testkit"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+description = "WordCraft test tooling: a counting allocator for checking what code holds against what it charges"
+
+# embed: the counting allocator implements `GlobalAlloc`, which takes `unsafe`. The workspace forbids
+# it; this test-only crate denies it instead and allows it in that one module.
+[lints.rust]
+unsafe_code = "deny"
+
+[lints.clippy]
+dbg_macro = "warn"
+todo = "warn"
+
+[dependencies]
+
+[dev-dependencies]
+wordcraft-doc = { workspace = true }
+wordcraft-docx = { workspace = true }
+wordcraft-engine = { workspace = true }
+serde_json = { workspace = true }
+zip = { workspace = true }
