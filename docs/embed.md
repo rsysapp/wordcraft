@@ -300,8 +300,9 @@ allow-list: typing, deleting, line breaks, nonbreaking spaces and hyphens, Tab a
 character, cut, paste as plain text, undo, redo, moving between changes, and going into the header or footer
 a page shows and back (making a new one is refused); accepting and rejecting only with the
 permission to decide. The part entered is the one the page shows, as Word renders it: the
-first-page part on a section's title page, the even part on even pages when odd and even differ,
-and a part inherited from an earlier section when the page's own section has none. Editing an
+first-page part on a section's title page, the even part on even pages when odd and even differ
+(none, and so nothing to enter, when there is no even part), and a part inherited from an earlier
+section when the page's own section has none. Editing an
 inherited part edits every section that shows it (Word's "link to previous"). A command that
 changes nothing (Accept with nothing to accept, an empty paste) leaves no revision record, no undo
 step and the content version as it was. Every change is a tracked change by the session's author,
@@ -353,8 +354,8 @@ with `view`. Every open, a refused one included, ends edit mode first.
 - **Saves** are answered when asked: `requestSave` and Ctrl/Cmd+S serialise the document then, before
   a later command of the same frame (an open, a mode change), each from the state at its own
   request: a save asked in view mode answers `saveFailed` even when a later one in the same frame,
-  after `setMode`, answers `saveRequested`. Two in one frame for the same document in the same mode
-  answer once.
+  after `setMode`, answers `saveRequested`. Two consecutive requests in one frame, for the same
+  document in the same mode, answer once.
 - **The edit strip** follows the zoom controls, and wraps onto a second row of the view bar when the
   bar is too narrow for it and the find controls. While the caret is in a header or footer several
   sections show, it says so ("Header (shared with sections 1–3)").

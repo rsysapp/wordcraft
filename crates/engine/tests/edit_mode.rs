@@ -901,6 +901,70 @@ mod pages {
         let _ = EditRules { may_decide: true };
     }
 
+    fn footer(doc: &mut Document, text: &str) -> u32 {
+        doc.add_part(PartKind::Footer, vec![para_block(Paragraph::with_text(text, CharProps::default()).styled("Footer"))])
+    }
+
+    /// Different odd and even headers and footers, but only the odd (default) parts.
+    fn odd_only() -> (Document, u32, u32) {
+        let mut doc = long();
+        let odd_header = header(&mut doc, "Odd header");
+        let odd_footer = footer(&mut doc, "Odd footer");
+        doc.last_section.headers.default = Some(odd_header);
+        doc.last_section.footers.default = Some(odd_footer);
+        doc.settings.even_odd_headers = true;
+        (doc, odd_header, odd_footer)
+    }
+
+    // m1: with different odd and even pages and no even part, Word draws no header or footer on even
+    // pages (ECMA-376 17.10.5), never the odd one.
+    #[test]
+    fn even_pages_without_an_even_part_draw_no_header_or_footer() {
+        let (doc, odd_header, odd_footer) = odd_only();
+        let mut s = Session::new(doc);
+        let layout = s.layout();
+        assert!(layout.pages.len() >= 3);
+        assert_eq!((layout.pages[0].header_story, layout.pages[0].footer_story), (Some(odd_header), Some(odd_footer)));
+        assert_eq!((layout.pages[1].header_story, layout.pages[1].footer_story), (None, None));
+        assert!(layout.pages[1].header.is_empty() && layout.pages[1].footer.is_empty());
+        assert_eq!(layout.pages[2].header_story, Some(odd_header));
+    }
+
+    // m1: so an even page has no header or footer to enter, and none is made.
+    #[test]
+    fn an_even_page_without_an_even_part_has_nothing_to_enter() {
+        let (doc, odd_header, odd_footer) = odd_only();
+        let parts = doc.parts.len();
+        let mut s = Session::new(doc);
+        start_editing(&mut s, false);
+        for id in ["insert.editHeader", "insert.editFooter"] {
+            let refused = s.run(id, &json!({ "page": 1 }));
+            assert_eq!(refused.as_ref().map_err(CmdError::edit_refusal), Err(Some(Refusal::CommandNotAllowed)), "{id}");
+            assert_eq!(s.sel.focus.story, StoryRef::Body, "{id}");
+        }
+        assert_eq!(s.doc.parts.len(), parts, "nothing was made");
+        assert_eq!(enter_on(&mut s, 0).unwrap(), odd_header);
+        s.run("insert.closeHeader", &json!({})).unwrap();
+        s.run("insert.editFooter", &json!({ "page": 2 })).unwrap();
+        assert_eq!(s.sel.focus.story, StoryRef::Part(odd_footer));
+    }
+
+    // m2: a command refused while it runs leaves redo as it was too.
+    #[test]
+    fn a_refused_command_keeps_redo() {
+        let mut s = Session::new(Document::from_text("Rent is due monthly."));
+        start_editing(&mut s, false);
+        s.run("text.insert", &json!({ "text": "x" })).unwrap();
+        let edited = s.content_version();
+        s.run("edit.undo", &json!({})).unwrap();
+        for (id, params) in [("edit.pasteText", json!({ "text": "a\nb" })), ("text.insert", json!({ "text": "\u{7}" })), ("edit.cut", json!({}))] {
+            assert!(s.run(id, &params).is_err(), "{id} is refused");
+            assert!(s.can_redo(), "{id} kept redo");
+        }
+        s.run("edit.redo", &json!({})).unwrap();
+        assert_eq!(s.content_version(), edited);
+    }
+
     // W3-9: a command that changes nothing leaves redo as it was.
     #[test]
     fn a_command_that_changes_nothing_keeps_redo() {

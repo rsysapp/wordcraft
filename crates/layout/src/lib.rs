@@ -1108,8 +1108,10 @@ fn headers_footers(ctx: &mut Ctx, pages: &mut [Page], sections: &[(usize, &Secti
             if sect.title_page && first_of_section.contains(&i) {
                 return set.first;
             }
+            // embed: with different odd and even pages, an even page shows the even part or none, as
+            // Word draws it (ECMA-376 17.10.5), never the odd (default) one.
             if even_odd && page.number % 2 == 0 {
-                return set.even.or(set.default);
+                return set.even;
             }
             set.default
         };
