@@ -114,7 +114,8 @@ pub(crate) fn held_by(steps: &[Step]) -> u64 {
     let revision = |revision: &Revision| units(revision.author.capacity()).saturating_add(units(revision.date.capacity()));
     let strings = steps.iter().fold(0u64, |total, step| {
         total.saturating_add(match step {
-            Step::Keep { change: Change::Deleted(key), .. } | Step::Break { revision: key } => revision(key),
+            Step::Keep { change: Change::Deleted(key) | Change::AcceptedThenDeleted(key) | Change::RejectedThenDeleted(key), .. }
+            | Step::Break { revision: key } => revision(key),
             Step::Insert { text, revision: key, .. } => units(text.capacity()).saturating_add(revision(key)),
             Step::Keep { .. } | Step::Remove { .. } => 0,
         })
@@ -650,12 +651,14 @@ impl<'a, 'b> Planner<'a, 'b> {
                 while hi - end < reach && partner(pair, hi) == Some(jhi) {
                     (hi, jhi) = (hi + 1, jhi + 1);
                 }
-                if let Some(paired) = self.band(lo, hi, jlo, gone, &can_go, &relates)? {
+                if let Some((paired, held)) = self.band(lo, hi, jlo, gone, &can_go, &relates)? {
                     for (offset, partner) in paired.into_iter().enumerate() {
                         if let Some(entry) = pair.get_mut(lo + offset) {
                             *entry = partner;
                         }
                     }
+                    // The table and the pairs are gone once copied.
+                    self.ledger.release(held);
                     break (lo, hi);
                 }
                 // Grown as far as the pairs beside it go: refused.
@@ -686,8 +689,9 @@ impl<'a, 'b> Planner<'a, 'b> {
 
     /// Source characters `lo..hi` paired in order with the edited ones from `jlo`, all but `gone` of
     /// them, leaving out only those that `can_go`: each one's partner, or `None` when there is no
-    /// such pairing. A table of whether the rest can still be paired, by place and by how many were
-    /// left out so far (never more than `gone`), filled from the end.
+    /// such pairing; with them, what the table and the pairs hold, for the caller to give back once
+    /// it has copied them. A table of whether the rest can still be paired, by place and by how many
+    /// were left out so far (never more than `gone`), filled from the end.
     fn band(
         &mut self,
         lo: usize,
@@ -696,7 +700,7 @@ impl<'a, 'b> Planner<'a, 'b> {
         gone: usize,
         can_go: &dyn Fn(usize) -> bool,
         relates: &dyn Fn(usize, usize) -> bool,
-    ) -> Result<Option<Vec<Option<usize>>>, Unpreservable> {
+    ) -> Result<Option<(Vec<Option<usize>>, u64)>, Unpreservable> {
         let width = gone.saturating_add(1);
         let length = hi.saturating_sub(lo);
         let cells = length.saturating_add(1).saturating_mul(width);
@@ -732,7 +736,7 @@ impl<'a, 'b> Planner<'a, 'b> {
                 skipped += 1;
             }
         }
-        Ok(Some(paired))
+        Ok(Some((paired, units(cells).saturating_add(units(length).saturating_mul(size::<Option<usize>>())))))
     }
 
     /// A stretch the diff could not pair: a source character there gone must have gone with its
@@ -1694,7 +1698,19 @@ mod tests {
             let (before, after) = as_read(&doc(&[ANA, BOB]), &doc(&[ANA, BOB, SARI]));
             let some: &dyn Fn(usize) -> bool = &|piece| piece < 100;
             let all: &dyn Fn(usize) -> bool = &|_| true;
-            for (name, case) in [("first diff", long_case(some)), ("every decision taken", long_case(all)), ("steps", deleted_case())] {
+            // N1: 30,000 characters of Ana's insertion accepted, then deleted by Sari; and Bob's
+            // deletion rejected, then made again by Sari: a revision kept for every character.
+            let text = "abcdefghij".repeat(3_000);
+            let decided_then_deleted =
+                |ins: Option<u32>, del: Option<u32>| (para(&[(&text, ins, del, false)]), vec![para(&[(&text, None, Some(2), false)])]);
+            let cases = [
+                ("first diff", long_case(some)),
+                ("every decision taken", long_case(all)),
+                ("steps", deleted_case()),
+                ("accepted then deleted", decided_then_deleted(Some(0), None)),
+                ("rejected then deleted", decided_then_deleted(None, Some(1))),
+            ];
+            for (name, case) in cases {
                 let (original, edited) = case;
                 let group: Vec<&Paragraph> = edited.iter().collect();
                 let mut budget = Budget::new(MAX_WORK, MAX_MEMORY);
@@ -1784,6 +1800,43 @@ mod tests {
         let mut second = para(&[(" Two.", None, None, false)]);
         second.mark.italic = Some(true);
         assert_eq!(planned(&original, &doc(&[]), &[&first, &second], &doc(&[SARI])), Err(Unpreservable::Formatting));
+    }
+
+    #[test]
+    fn refuses_a_decision_that_empties_a_paragraph_whose_text_was_formatted_otherwise() {
+        // N2: Ana's bold insertion was the whole text of the paragraph; rejecting it deletes the text
+        // from its start to its end, and `Paragraph::delete` gives the mark the text's formatting.
+        // Refused under I4 until the engine leaves a mark its own formatting (Task 10); formatted as
+        // the mark, the same decision plans.
+        for (bold, planned_as) in [(true, Err(Unpreservable::Formatting)), (false, Ok(vec![Step::Remove { unit: 0 }]))] {
+            let original = para(&[("N", Some(0), None, bold)]);
+            let mut edited = original.clone();
+            edited.delete(0, edited.len()).unwrap();
+            edited.mark.ins = None;
+            assert_eq!(edited.mark.bold, bold.then_some(true));
+            assert_eq!(planned(&original, &doc(&[ANA]), &[&edited], &doc(&[ANA])), planned_as);
+        }
+    }
+
+    #[test]
+    fn gives_back_what_pairing_again_held_once_the_pairs_are_copied() {
+        // N4: "q", Bob's deleted "a", a plain "a", Ana's "z"; Sari deletes the "a". The diff paired
+        // Bob's "a" and left the plain one out: paired again, and the table given back.
+        let (before, after) = as_read(&doc(&[ANA, BOB]), &doc(&[ANA, BOB, SARI]));
+        let mut budget = Budget::new(MAX_WORK, MAX_MEMORY);
+        let mut planner = Planner::new(&before, &after, &mut budget);
+        let char_of = |ch: char, ins: Record, del: Record| Char { ch, format: 0, object: None, ins, del };
+        let old = [char_of('q', None, None), char_of('a', None, Some(1)), char_of('a', None, None), char_of('z', Some(0), None)];
+        let edited = [char_of('q', None, None), char_of('a', None, Some(4))];
+        let mut pair = [Some(0), Some(1), None, None];
+        let mut matched = [Some((0, Decided::Same)), Some((1, Decided::RejectedThenDeleted(4)))];
+        let mut removed = [false; 4];
+        let held = planner.ledger.held;
+        planner.realign(&old, &|j| edited.get(j).copied(), &mut pair, &mut matched, &mut removed, 2, 4).unwrap();
+        assert_eq!(pair, [Some(0), None, Some(1), None]);
+        assert_eq!(matched, [Some((0, Decided::Same)), Some((2, Decided::Deleted(4)))]);
+        assert_eq!(removed, [false, true, false, true]);
+        assert_eq!(planner.ledger.held, held);
     }
 
     #[test]
