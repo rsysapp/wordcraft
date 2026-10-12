@@ -2,6 +2,9 @@
 //! read from a Word package carries that package under [`SOURCE_PACKAGE`] and each paragraph where
 //! it came from (`Paragraph::origin`).
 
+#[cfg_attr(not(test), expect(dead_code, reason = "embed: read by the preserving writer's paragraph scan, which is not written yet"))]
+mod tree;
+
 /// The key in `Document::passthrough` under which a document read from a Word package keeps the
 /// package's bytes. Not a part name: nothing writes it as a part.
 pub const SOURCE_PACKAGE: &str = "wordcraft:source-package";

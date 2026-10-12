@@ -56,7 +56,8 @@ const STRICT: &[(&str, &str)] = &[
     ("m", "http://purl.oclc.org/ooxml/officeDocument/math"),
 ];
 
-fn prefix_for(uri: &[u8]) -> &'static str {
+// embed: also used by the preserving writer's positional tree.
+pub(crate) fn prefix_for(uri: &[u8]) -> &'static str {
     for (p, u) in NAMESPACES.iter().chain(OTHER_NAMESPACES).chain(STRICT) {
         if u.as_bytes() == uri {
             return p;
