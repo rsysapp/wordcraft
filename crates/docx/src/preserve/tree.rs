@@ -6,10 +6,10 @@
 //! ranges of the nodes around them.
 //!
 //! Bounds: every record the tree keeps (an element, an attribute, a piece of text, a reference, a
-//! CDATA section), and every namespace declaration the reading keeps in scope, counts as one element
-//! against the caller's limit, because the tree keeps one record for each reference and piece of
-//! text where the desktop parser merges them; elements nest
-//! no deeper than the caller's depth limit (`ReadLimits::max_depth`, at most [`MAX_DEPTH`]). Parsing
+//! CDATA section), and every namespace declaration written, counts as one element against the
+//! caller's limit, because the tree keeps one record for each reference and piece of text where the
+//! desktop parser merges them (the desktop parser counts elements only); elements nest no deeper
+//! than the caller's depth limit (`ReadLimits::max_depth`, at most [`MAX_DEPTH`]). Parsing
 //! and [`PEl::find`] keep their own stacks; the derived `Clone`, `PartialEq`, `Debug` and the drop
 //! recurse once per level, so the depth limit bounds them.
 
@@ -120,9 +120,9 @@ pub(crate) fn parse(bytes: &[u8]) -> Result<PEl, DocxError> {
 /// byte-order marks, names, attributes and refusals), keeping byte ranges into the part as given.
 ///
 /// At most `max_records` records (never more than [`MAX_ELEMENTS`]): each element, attribute, piece
-/// of text, reference, CDATA section and namespace declaration counts one. The desktop parser counts
-/// elements and declarations only, so this can refuse a part it reads (and the writer then falls
-/// back), never the other way round. Elements nest at most `max_depth` deep (never deeper than
+/// of text, reference, CDATA section and namespace declaration written counts one. The desktop
+/// parser counts elements only, so this can refuse a part it reads (and the writer then falls back),
+/// never the other way round. Elements nest at most `max_depth` deep (never deeper than
 /// [`MAX_DEPTH`]). Answers how many records it counted, so a package can spend one budget across
 /// its parts. Past either limit it refuses with the desktop parser's errors.
 pub(crate) fn parse_limited(bytes: &[u8], max_records: usize, max_depth: usize) -> Result<(PEl, usize), DocxError> {
@@ -391,10 +391,10 @@ mod tests {
         let attributes = format!("<a {}/>", (0..1_000).map(|index| format!("a{index}=''")).collect::<Vec<_>>().join(" "));
         assert!(matches!(parse_limited(attributes.as_bytes(), 1_000, MAX_DEPTH), Err(DocxError::Limit(_))));
         assert_eq!(parse_limited(attributes.as_bytes(), 1_001, MAX_DEPTH).map(|(_, used)| used), Ok(1_001));
-        // Namespace declarations are charged too, though the tree keeps none of them.
-        let declarations = format!("<a {}/>", (0..1_000).map(|index| format!("xmlns:p{index}='u'")).collect::<Vec<_>>().join(" "));
-        assert_eq!(parse_limited(declarations.as_bytes(), 1_001, MAX_DEPTH).map(|(_, used)| used), Ok(1_001));
-        assert!(matches!(parse_limited(declarations.as_bytes(), 1_000, MAX_DEPTH), Err(DocxError::Limit(_))));
+        // Every namespace declaration written is charged too, though the tree keeps none of them.
+        let declarations = format!("<a {}/>", (0..MAX_BINDINGS).map(|index| format!("xmlns:p{index}='u'")).collect::<Vec<_>>().join(" "));
+        assert_eq!(parse_limited(declarations.as_bytes(), MAX_BINDINGS + 1, MAX_DEPTH).map(|(_, used)| used), Ok(MAX_BINDINGS + 1));
+        assert_eq!(parse_limited(declarations.as_bytes(), MAX_BINDINGS, MAX_DEPTH), Err(DocxError::Limit(TOO_MANY_ELEMENTS.into())));
     }
 
     #[test]
@@ -482,10 +482,14 @@ mod tests {
         assert!(parse(part.as_bytes()).is_ok());
         assert_eq!(parse(format!("<r{}/>", declarations(MAX_BINDINGS + 1, 0)).as_bytes()), Err(DocxError::Limit(TOO_MANY_BINDINGS.into())));
         // In scope across nested elements, released when an element closes or is written empty.
-        let nested = format!("<r{}><s{}/></r>", declarations(600, 0), declarations(401, 600));
+        let half = MAX_BINDINGS / 2;
+        let nested = format!("<r{}><s{}/></r>", declarations(half, 0), declarations(MAX_BINDINGS - half + 1, half));
         assert_eq!(parse(nested.as_bytes()), Err(DocxError::Limit(TOO_MANY_BINDINGS.into())));
-        let siblings =
-            format!("<r>{}{}</r>", format!("<s{}/>", declarations(999, 0)).repeat(50), format!("<s{}></s>", declarations(999, 0)).repeat(50));
+        let siblings = format!(
+            "<r>{}{}</r>",
+            format!("<s{}/>", declarations(MAX_BINDINGS, 0)).repeat(50),
+            format!("<s{}></s>", declarations(MAX_BINDINGS, 0)).repeat(50)
+        );
         assert!(parse(siblings.as_bytes()).is_ok());
         // Far more than the cap is refused at once, never walked one resolution at a time.
         assert!(parse(format!("<r{}><a/></r>", declarations(100_000, 0)).as_bytes()).is_err());

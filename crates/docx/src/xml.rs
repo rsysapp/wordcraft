@@ -170,8 +170,9 @@ pub const TOO_MANY_ELEMENTS: &str = "too many XML elements";
 pub const TOO_DEEP: &str = "XML nesting too deep";
 
 /// embed: the most namespace declarations in scope at once; a WordprocessingML part declares a few
-/// dozen. Each name is resolved by walking the declarations in scope, so this bounds that walk.
-pub const MAX_BINDINGS: usize = 1_000;
+/// dozen (39 in the largest of 342 real files checked). Each name is resolved by walking the
+/// declarations in scope, so this bounds that walk.
+pub const MAX_BINDINGS: usize = 256;
 /// embed: the error a parse answers past [`MAX_BINDINGS`].
 pub const TOO_MANY_BINDINGS: &str = "too many XML namespace declarations in scope";
 
