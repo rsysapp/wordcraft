@@ -51,7 +51,8 @@
 pub(crate) mod budget;
 mod comments;
 mod compare;
-mod diff;
+// embed: the preserving writer's planner diffs paragraphs with the same bounded Myers.
+pub(crate) mod diff;
 mod digest;
 mod opc;
 mod package;

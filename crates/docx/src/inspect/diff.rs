@@ -4,7 +4,7 @@
 /// `right`), or an element of one side only. Runs keep a script's memory with its edits, not with
 /// the length of what matched.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) enum Step {
+pub(crate) enum Step {
     Same { left: usize, right: usize, len: usize },
     Delete(usize),
     Insert(usize),
@@ -26,7 +26,7 @@ use super::budget::{Budget, units};
 /// insertions and deletions, or more work than is left. The common prefix and suffix are matched
 /// first, then Myers' greedy search runs on the rest: memory grows with the square of the edits,
 /// never with the length.
-pub(super) fn script(n: usize, m: usize, same: &dyn Fn(usize, usize) -> bool, max_changes: usize, work: &mut Budget) -> Option<Vec<Step>> {
+pub(crate) fn script(n: usize, m: usize, same: &dyn Fn(usize, usize) -> bool, max_changes: usize, work: &mut Budget) -> Option<Vec<Step>> {
     // The suffix first: where a resolved change's edge is a white space either side could own,
     // the later one keeps it, which reads a deletion rejected before its text as one change.
     let mut suffix = 0;
@@ -67,7 +67,7 @@ const ROW_BYTES: u64 = 3 * std::mem::size_of::<Vec<i64>>() as u64;
 /// The memory an edit script of a diff bounded by `max_changes` between `n` and `m` elements
 /// can take: each edit and each run of matches between them, twice (the walk back's steps, made to
 /// size, and their copy with the common prefix and suffix).
-pub(super) fn script_bytes(n: usize, m: usize, max_changes: usize) -> u64 {
+pub(crate) fn script_bytes(n: usize, m: usize, max_changes: usize) -> u64 {
     let steps = units(max_changes.min(n.saturating_add(m))).saturating_mul(2).saturating_add(3);
     steps.saturating_mul(2 * std::mem::size_of::<Step>() as u64)
 }
