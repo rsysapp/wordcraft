@@ -11,7 +11,14 @@
 //! (`clean_char`, `choice_understood`, the depth and part limits) are the reader's own; the rest is
 //! checked by the preserving writer, which refuses to rewrite a paragraph whose scanned characters
 //! differ from the model's text.
+//!
+//! Bounds: everything the scan holds (each part's tree and paragraph numbers while it is walked, the
+//! paragraph being walked, every paragraph and part copy it keeps, the ids it remembers) is charged to
+//! the caller's memory budget before it is allocated, and the scan is refused past it. Each node
+//! names only its innermost wrapper, so what a paragraph holds grows with its markup, not with its
+//! nesting.
 
+use std::cell::{Cell, RefCell};
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::ops::Range;
 use std::sync::Arc;
@@ -21,6 +28,7 @@ use wordcraft_doc::table::{MAX_COLS, MAX_ROWS};
 
 use super::tree::{PEl, PKid};
 use crate::DocxError;
+use crate::inspect::budget::{Budget, table_sized, table_slot, tree_slot, units, vector_slot};
 use crate::package::{Package, Rels, rt};
 use crate::read::MAX_PARTS;
 use crate::read::story::{MAX_FIELD_DEPTH, MAX_STORY_DEPTH, MAX_TABLE_DEPTH, choice_understood, clean_char};
@@ -29,6 +37,9 @@ use crate::xml::MAX_DEPTH;
 
 /// The most items a field's result buffers, as the reader's `emit_text`/`emit_obj`.
 const MAX_FIELD_ITEMS: usize = 100_000;
+
+/// Why a scan stopped for memory.
+pub(crate) const SCAN_TOO_LARGE: &str = "more memory than a save may hold to scan the document";
 
 /// A story part: its bytes, its root element, the prefix it writes WordprocessingML names with,
 /// and the paragraphs asked for, by position among the part's `w:p` elements.
@@ -63,9 +74,10 @@ pub(crate) struct ScannedPara {
     pub end: Option<Range<usize>>,
     pub raw_name: String,
     pub ppr: Option<Props>,
-    /// The paragraph's content, flattened: runs and other elements in order, each with the
-    /// wrappers around it.
+    /// The paragraph's content, flattened: runs and other elements in order, each naming the
+    /// innermost wrapper around it.
     pub nodes: Vec<Node>,
+    /// Every wrapper, each after the wrapper around it (its `parent`).
     pub wrappers: Vec<Wrapper>,
     /// One per character of the model paragraph's text, in order.
     pub units: Vec<Unit>,
@@ -81,10 +93,27 @@ impl ScannedPara {
         self.start.start..self.end.as_ref().map_or(self.start.end, |end| end.end)
     }
 
+    /// The wrappers around a node whose innermost wrapper is `innermost`, outermost first
+    /// (positions in `wrappers`).
+    pub fn chain(&self, innermost: Option<usize>) -> Vec<usize> {
+        let mut chain = Vec::new();
+        let mut at = innermost;
+        // A parent always comes before its child, so this ends; the bound only guards that.
+        while let Some(index) = at
+            && chain.len() < self.wrappers.len()
+        {
+            chain.push(index);
+            at = self.wrappers.get(index).and_then(|wrapper| wrapper.parent).filter(|parent| *parent < index);
+        }
+        chain.reverse();
+        chain
+    }
+
     /// Where the paragraph may be edited: the longest stretches of units that are characters of a
     /// `w:t` or one-character children (`Loc::Text`, `Loc::Single`), as ranges of positions in
-    /// `units`. Objects, markers and everything locked (a field's result among them, 6C-18) lie
-    /// between them.
+    /// `units`. Objects, markers and everything locked (a field's result among them, 6C-18, and a
+    /// text box's paragraphs, 6C-39) lie between them. Deleted text and text inside content controls
+    /// count as editable here: a caller choosing edit points filters them by wrapper.
     pub fn editable(&self) -> Vec<Range<usize>> {
         let mut ranges: Vec<Range<usize>> = Vec::new();
         for (index, unit) in self.units.iter().enumerate() {
@@ -117,31 +146,34 @@ pub(crate) enum Node {
     /// a field written as one element, alternative content, an equation.
     Other {
         name: String,
-        chain: Vec<usize>,
+        /// The innermost wrapper around it (`ScannedPara::chain` gives them all).
+        wrapper: Option<usize>,
         span: Range<usize>,
     },
 }
 
 impl Node {
-    fn chain(&self) -> &[usize] {
+    /// The innermost wrapper around the node.
+    pub fn wrapper(&self) -> Option<usize> {
         match self {
-            Node::Run(run) => &run.chain,
-            Node::Other { chain, .. } => chain,
+            Node::Run(run) => run.wrapper,
+            Node::Other { wrapper, .. } => *wrapper,
         }
     }
 }
 
 #[derive(Clone, Debug)]
 pub(crate) struct RunNode {
-    /// The wrappers around it, outermost first (positions in `ScannedPara::wrappers`).
-    pub chain: Vec<usize>,
+    /// The innermost wrapper around it (`ScannedPara::chain` gives them all).
+    pub wrapper: Option<usize>,
     pub start: Range<usize>,
     pub end: Option<Range<usize>>,
     pub raw_name: String,
+    /// The run's first `w:rPr`, which the reader formats it by.
     pub rpr: Option<Range<usize>>,
     /// The `w:rPrChange` inside `rpr`: left out when the properties are copied to typed text.
     pub rpr_change: Option<Range<usize>>,
-    /// Every child element but `w:rPr`, in order.
+    /// Every child element but the first `w:rPr`, in order.
     pub children: Vec<Child>,
 }
 
@@ -162,9 +194,10 @@ pub(crate) enum ChildKind {
     /// `w:t` or `w:delText`, character by character.
     Text { start: Range<usize>, end: Option<Range<usize>>, raw_name: String, deleted: bool, chars: Vec<RawChar> },
     /// A child that is one character (`w:tab`, `w:br`…), and that character's unit (`None` when the
-    /// character is not one of the paragraph's units where it stands: inside a field's result).
+    /// character is not an editable unit where it stands: inside a field's result or a text box).
     Single { unit: Option<usize> },
-    /// Any other child (`w:fldChar`, `w:instrText`, `w:drawing`, a `w:t` with CDATA or elements…).
+    /// Any other child (`w:fldChar`, `w:instrText`, `w:drawing`, a `w:t` with CDATA or elements, a
+    /// second `w:rPr`…).
     Other { start: Range<usize>, end: Option<Range<usize>>, raw_name: String },
 }
 
@@ -173,7 +206,8 @@ pub(crate) struct RawChar {
     /// The character's bytes in the part: itself, or its `&…;` reference.
     pub bytes: Range<usize>,
     /// The unit it became, when it is an editable one (`Loc::Text`); `None` for a character the
-    /// reader drops (a control character, an unknown reference) or one inside a field's result.
+    /// reader drops (a control character, an unknown reference) or one that is locked (inside a
+    /// field's result or a text box).
     pub unit: Option<usize>,
 }
 
@@ -192,6 +226,8 @@ pub(crate) struct Wrapper {
     pub kind: WrapperKind,
     pub start: Range<usize>,
     pub end: Option<Range<usize>>,
+    /// The wrapper around this one (an earlier position in `ScannedPara::wrappers`).
+    pub parent: Option<usize>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -206,16 +242,17 @@ pub(crate) enum Loc {
     Text { node: usize, child: usize, raw: usize },
     /// A one-character child.
     Single { node: usize, child: usize },
-    /// An object made of whole nodes that hold nothing else of the paragraph's units and sit in the
-    /// same wrappers: a field from its first run to its last, a drawing, a note reference, an
-    /// equation.
+    /// An object made of whole nodes that hold nothing but what the object owns, under one wrapper:
+    /// a field of runs from its first to its last (their properties, field characters,
+    /// instructions, result text and characters, rendered page breaks), a picture or note reference
+    /// alone in its run, an equation. Removing those nodes removes the object and nothing else.
     Atomic { first: usize, last: usize },
     /// A bookmark or comment range marker in the paragraph.
     Marker { node: usize },
     /// Inside something copied whole and never edited (alternative content, a field written as
     /// one element, ruby, CDATA, a comment reference, a page number, anything inside a field's
-    /// instruction or result, an object sharing its nodes with other units): where it stands, when
-    /// known.
+    /// instruction or result, a text box's paragraph, an object whose nodes hold anything it does
+    /// not own): where it stands, when known.
     Locked { node: Option<usize>, child: Option<usize> },
     /// A marker the reader moved into the paragraph from between blocks: at its start, or, for
     /// the last paragraph of a story, at its end.
@@ -232,15 +269,32 @@ pub(crate) fn main_part(pkg: &Package) -> String {
 /// there change what the reader makes later.
 ///
 /// The parts are parsed within the package's read limits and element budget (`Package::tree`). As
-/// the reader does, it refuses a package whose main part cannot be read, skips a secondary part that
-/// cannot (its paragraphs stay unscanned), and refuses the scan when a caller's limit was reached.
-pub(crate) fn scan_package(pkg: &Package, wanted: &BTreeMap<String, BTreeSet<u32>>) -> Result<BTreeMap<String, ScannedPart>, DocxError> {
+/// the reader does, it refuses a package whose main part cannot be read and skips a secondary part
+/// that is not well formed (its paragraphs stay unscanned). A part refused for any limit refuses the
+/// scan, as does a caller's limit reached: the reader may have read that part, and the scan must
+/// never go on with state the reader's did not have. What the scan holds is charged to `budget`'s
+/// memory, refused past it.
+pub(crate) fn scan_package(
+    pkg: &Package,
+    wanted: &BTreeMap<String, BTreeSet<u32>>,
+    budget: &mut Budget,
+) -> Result<BTreeMap<String, ScannedPart>, DocxError> {
+    // The budget is lent to the walk and given back whatever it answers.
+    let memory = Memory { budget: RefCell::new(std::mem::replace(budget, Budget::new(0, 0))), refused: Cell::new(false) };
+    let scanned = scan_with(pkg, wanted, &memory);
+    *budget = memory.budget.into_inner();
+    scanned
+}
+
+fn scan_with(pkg: &Package, wanted: &BTreeMap<String, BTreeSet<u32>>, memory: &Memory) -> Result<BTreeMap<String, ScannedPart>, DocxError> {
     let main = main_part(pkg);
     let rels = pkg.rels(&main);
     let part = |kind: &str| rels.by_type(kind).filter(|rel| !rel.external).map(|rel| rel.target.clone());
     let mut scanner = Scanner {
         pkg,
         wanted,
+        memory,
+        failure: None,
         bookmarks: HashSet::new(),
         comments: HashSet::new(),
         comments_ended: HashSet::new(),
@@ -250,17 +304,23 @@ pub(crate) fn scan_package(pkg: &Package, wanted: &BTreeMap<String, BTreeSet<u32
         parts_made: 0,
         parts: BTreeMap::new(),
     };
-    // The reader skips an unreadable secondary part; a caller's limit reached is refused below.
     if let Some(name) = part(rt::FOOTNOTES) {
-        scanner.notes(&name, true).ok();
+        secondary(scanner.notes(&name, true))?;
     }
     if let Some(name) = part(rt::ENDNOTES) {
-        scanner.notes(&name, false).ok();
+        secondary(scanner.notes(&name, false))?;
     }
     if let Some(name) = part(rt::COMMENTS) {
-        scanner.comments(&name).ok();
+        secondary(scanner.comments(&name))?;
     }
-    if !scanner.main(&main)? {
+    let found = scanner.main(&main)?;
+    if let Some(failure) = scanner.failure.take() {
+        return Err(failure);
+    }
+    if memory.refused.get() {
+        return Err(DocxError::Limit(SCAN_TOO_LARGE.into()));
+    }
+    if !found {
         return Err(DocxError::MissingPart(main));
     }
     if pkg.limit_reached() {
@@ -269,9 +329,98 @@ pub(crate) fn scan_package(pkg: &Package, wanted: &BTreeMap<String, BTreeSet<u32
     Ok(scanner.parts)
 }
 
+/// A secondary part's outcome: skipped when it is not well formed, as the reader skips it; refused
+/// when a limit stopped it.
+fn secondary(outcome: Result<bool, DocxError>) -> Result<(), DocxError> {
+    match outcome {
+        Err(error @ DocxError::Limit(_)) => Err(error),
+        _ => Ok(()),
+    }
+}
+
+/// The caller's budget, lent to the walk: every holder charges it through here.
+struct Memory {
+    budget: RefCell<Budget>,
+    /// A charge was refused: the walk stops and the scan is refused.
+    refused: Cell<bool>,
+}
+
+impl Memory {
+    /// Hold `bytes` more, or refuse (once refused, always).
+    fn hold(&self, bytes: u64) -> bool {
+        if self.refused.get() {
+            return false;
+        }
+        let held = self.budget.try_borrow_mut().is_ok_and(|mut budget| budget.hold(bytes).is_ok());
+        if !held {
+            self.refused.set(true);
+        }
+        held
+    }
+
+    fn release(&self, bytes: u64) {
+        if let Ok(mut budget) = self.budget.try_borrow_mut() {
+            budget.release(bytes);
+        }
+    }
+}
+
+fn bytes_of_size<T>(count: usize) -> u64 {
+    units(count).saturating_mul(units(std::mem::size_of::<T>()))
+}
+
+/// What a parsed part holds: each element's record, names and attributes. Walked with its own stack.
+fn tree_bytes(root: &PEl) -> u64 {
+    let mut total = units(std::mem::size_of::<PEl>());
+    let mut stack = vec![root];
+    while let Some(element) = stack.pop() {
+        total = total
+            .saturating_add(units(element.name.capacity()))
+            .saturating_add(units(element.raw_name.capacity()))
+            .saturating_add(bytes_of_size::<(String, String)>(element.attrs.capacity()))
+            .saturating_add(element.attrs.iter().fold(0u64, |sum, (key, value)| sum.saturating_add(units(key.capacity() + value.capacity()))))
+            .saturating_add(bytes_of_size::<PKid>(element.kids.capacity()));
+        stack.extend(element.els());
+    }
+    total
+}
+
+/// What a kept paragraph holds, its entry in the part's map included.
+fn paragraph_bytes(paragraph: &ScannedPara) -> u64 {
+    fn props_bytes(props: &Props) -> u64 {
+        units(props.raw_name.capacity())
+            .saturating_add(bytes_of_size::<(String, Range<usize>)>(props.children.capacity()))
+            .saturating_add(props.children.iter().fold(0u64, |sum, (name, _)| sum.saturating_add(units(name.capacity()))))
+            .saturating_add(props.rpr.as_ref().map_or(0, |rpr| units(std::mem::size_of::<Props>()).saturating_add(props_bytes(rpr))))
+    }
+    let nodes = paragraph.nodes.iter().fold(0u64, |sum, node| {
+        sum.saturating_add(match node {
+            Node::Other { name, .. } => units(name.capacity()),
+            Node::Run(run) => units(run.raw_name.capacity()).saturating_add(bytes_of_size::<Child>(run.children.capacity())).saturating_add(
+                run.children.iter().fold(0u64, |sum, child| {
+                    sum.saturating_add(match &child.kind {
+                        ChildKind::Text { raw_name, chars, .. } => {
+                            units(raw_name.capacity()).saturating_add(bytes_of_size::<RawChar>(chars.capacity()))
+                        }
+                        ChildKind::Other { raw_name, .. } => units(raw_name.capacity()),
+                        ChildKind::Single { .. } => 0,
+                    })
+                }),
+            ),
+        })
+    });
+    tree_slot::<u32, ScannedPara>()
+        .saturating_add(units(paragraph.raw_name.capacity()))
+        .saturating_add(paragraph.ppr.as_ref().map_or(0, props_bytes))
+        .saturating_add(bytes_of_size::<Node>(paragraph.nodes.capacity()))
+        .saturating_add(nodes)
+        .saturating_add(bytes_of_size::<Wrapper>(paragraph.wrappers.capacity()))
+        .saturating_add(bytes_of_size::<Unit>(paragraph.units.capacity()))
+}
+
 /// Every `w:p` of a part by address, numbered in document order (pre-order, every branch of
 /// alternative content included), as the reader's `with_part` numbers them.
-fn number_paragraphs(root: &PEl) -> HashMap<usize, u32> {
+fn number_paragraphs(root: &PEl, count: usize) -> HashMap<usize, u32> {
     fn go(element: &PEl, next: &mut u32, out: &mut HashMap<usize, u32>, depth: usize) {
         if depth > MAX_DEPTH {
             return;
@@ -284,9 +433,19 @@ fn number_paragraphs(root: &PEl) -> HashMap<usize, u32> {
             go(child, next, out, depth + 1);
         }
     }
-    let mut out = HashMap::new();
+    let mut out = HashMap::with_capacity(count);
     go(root, &mut 0, &mut out, 0);
     out
+}
+
+/// How many `w:p` elements `element` holds, as `number_paragraphs` counts them.
+fn count_paragraphs(element: &PEl, depth: usize) -> usize {
+    if depth > MAX_DEPTH {
+        return 0;
+    }
+    element
+        .els()
+        .fold(0usize, |count, child| count.saturating_add(usize::from(child.name == "w:p")).saturating_add(count_paragraphs(child, depth + 1)))
 }
 
 fn address(element: &PEl) -> usize {
@@ -299,7 +458,7 @@ struct Story {
     fields: Vec<Field>,
     ignored_begins: usize,
     pending: Vec<Unit>,
-    /// Text-box nesting.
+    /// Text-box nesting: a story deeper than 0 is a text box's.
     depth: usize,
 }
 
@@ -311,29 +470,82 @@ struct Field {
     /// The result's units, and how many items (the reader's `buf` entries) they came in.
     buf: Vec<Unit>,
     items: usize,
+    /// What `buf` is charged.
+    charged: u64,
     /// The node it began in.
     first: Option<usize>,
 }
 
-#[derive(Default)]
-struct Builder {
+/// One paragraph under construction, charging what it holds as it grows.
+struct Builder<'m> {
+    memory: &'m Memory,
+    /// What this paragraph holds, charged: released when it is not kept, or settled to what the kept
+    /// paragraph holds.
+    held: u64,
     nodes: Vec<Node>,
     wrappers: Vec<Wrapper>,
     units: Vec<Unit>,
     /// Whether every written name recorded can be written again.
     reusable: bool,
+    /// The child that made each picture or note object standing alone in a node (by node).
+    makers: HashMap<usize, usize>,
+    /// The spans of fields that became objects.
+    fields: HashSet<(usize, usize)>,
+    /// What an object may own among the children recorded whole, by (node, child), from their
+    /// canonical names.
+    owned: HashMap<(usize, usize), Owned>,
 }
 
-impl Builder {
-    fn new() -> Builder {
-        Builder { reusable: true, ..Builder::default() }
+/// A child recorded whole that an object may own.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Owned {
+    /// `w:fldChar`, `w:instrText`, `w:delInstrText`, a `w:sym` the reader drops: a field's own.
+    Field,
+    /// A `w:t`/`w:delText` copied whole (a custom note mark, CDATA).
+    Text,
+    /// `w:lastRenderedPageBreak`: where Word last broke the page, owned by whatever holds it.
+    Break,
+}
+
+fn owned_kind(name: &str) -> Option<Owned> {
+    match name {
+        "w:fldChar" | "w:instrText" | "w:delInstrText" | "w:sym" => Some(Owned::Field),
+        "w:t" | "w:delText" => Some(Owned::Text),
+        "w:lastRenderedPageBreak" => Some(Owned::Break),
+        _ => None,
+    }
+}
+
+impl<'m> Builder<'m> {
+    fn new(memory: &'m Memory) -> Builder<'m> {
+        Builder {
+            memory,
+            held: 0,
+            nodes: Vec::new(),
+            wrappers: Vec::new(),
+            units: Vec::new(),
+            reusable: true,
+            makers: HashMap::new(),
+            fields: HashSet::new(),
+            owned: HashMap::new(),
+        }
+    }
+
+    /// Charge `bytes` more to this paragraph, or refuse.
+    fn hold(&mut self, bytes: u64) -> bool {
+        let held = self.memory.hold(bytes);
+        if held {
+            self.held = self.held.saturating_add(bytes);
+        }
+        held
     }
 
     /// The written name of `element`, to record; one the part could not write again marks the
     /// paragraph unscannable.
     fn name(&mut self, element: &PEl) -> String {
         match element.reusable_name() {
-            Some(name) => name.to_string(),
+            Some(name) if self.hold(units(name.len())) => name.to_string(),
+            Some(_) => String::new(),
             None => {
                 self.reusable = false;
                 String::new()
@@ -341,15 +553,31 @@ impl Builder {
         }
     }
 
-    fn other(&mut self, element: &PEl, chain: &[usize]) -> usize {
-        self.nodes.push(Node::Other { name: element.name.clone(), chain: chain.to_vec(), span: element.span() });
-        self.nodes.len() - 1
+    /// Units into the paragraph; none past the budget.
+    fn units(&mut self, units: impl IntoIterator<Item = Unit>) {
+        for unit in units {
+            if !self.hold(vector_slot::<Unit>()) {
+                return;
+            }
+            self.units.push(unit);
+        }
     }
 
-    fn run(&mut self, element: &PEl, chain: &[usize]) -> usize {
+    fn other(&mut self, element: &PEl, wrapper: Option<usize>) -> Option<usize> {
+        if !self.hold(vector_slot::<Node>().saturating_add(units(element.name.len()))) {
+            return None;
+        }
+        self.nodes.push(Node::Other { name: element.name.clone(), wrapper, span: element.span() });
+        Some(self.nodes.len() - 1)
+    }
+
+    fn run(&mut self, element: &PEl, wrapper: Option<usize>) -> Option<usize> {
+        if !self.hold(vector_slot::<Node>()) {
+            return None;
+        }
         let raw_name = self.name(element);
         self.nodes.push(Node::Run(RunNode {
-            chain: chain.to_vec(),
+            wrapper,
             start: element.start.clone(),
             end: element.end.clone(),
             raw_name,
@@ -357,10 +585,21 @@ impl Builder {
             rpr_change: None,
             children: Vec::new(),
         }));
-        self.nodes.len() - 1
+        Some(self.nodes.len() - 1)
+    }
+
+    fn wrapper(&mut self, wrapper: Wrapper) -> Option<usize> {
+        if !self.hold(vector_slot::<Wrapper>()) {
+            return None;
+        }
+        self.wrappers.push(wrapper);
+        Some(self.wrappers.len() - 1)
     }
 
     fn child(&mut self, node: Option<usize>, child: Child) -> Option<usize> {
+        if !matches!(node.and_then(|node| self.nodes.get(node)), Some(Node::Run(_))) || !self.hold(vector_slot::<Child>()) {
+            return None;
+        }
         let Some(Node::Run(run)) = node.and_then(|node| self.nodes.get_mut(node)) else { return None };
         run.children.push(child);
         Some(run.children.len() - 1)
@@ -369,18 +608,27 @@ impl Builder {
     /// A child recorded whole.
     fn other_child(&mut self, node: Option<usize>, element: &PEl) -> Option<usize> {
         let raw_name = self.name(element);
-        self.child(node, Child { span: element.span(), kind: ChildKind::Other { start: element.start.clone(), end: element.end.clone(), raw_name } })
+        let child = self
+            .child(node, Child { span: element.span(), kind: ChildKind::Other { start: element.start.clone(), end: element.end.clone(), raw_name } });
+        if let (Some(node), Some(child), Some(kind)) = (node, child, owned_kind(&element.name))
+            && self.hold(table_slot::<((usize, usize), Owned)>())
+        {
+            self.owned.insert((node, child), kind);
+        }
+        child
     }
 
     fn props(&mut self, element: &PEl) -> Props {
         let raw_name = self.name(element);
-        Props {
-            start: element.start.clone(),
-            end: element.end.clone(),
-            raw_name,
-            children: element.els().map(|child| (child.name.clone(), child.span())).collect(),
-            rpr: element.child("w:rPr").map(|rpr| Box::new(self.props(rpr))),
-        }
+        let names = element.els().fold(0u64, |sum, child| sum.saturating_add(units(child.name.len())));
+        let count = element.els().count();
+        let children = if self.hold(bytes_of_size::<(String, Range<usize>)>(count).saturating_add(names)) {
+            element.els().map(|child| (child.name.clone(), child.span())).collect()
+        } else {
+            Vec::new()
+        };
+        let rpr = element.child("w:rPr").filter(|_| self.hold(units(std::mem::size_of::<Props>()))).map(|rpr| Box::new(self.props(rpr)));
+        Props { start: element.start.clone(), end: element.end.clone(), raw_name, children, rpr }
     }
 }
 
@@ -408,6 +656,8 @@ struct Note {
     custom: bool,
     /// The reference stood inside something copied whole.
     locked: bool,
+    /// The reference's child in its run.
+    child: Option<usize>,
 }
 
 struct Ctx<'t> {
@@ -421,6 +671,9 @@ struct Ctx<'t> {
 struct Scanner<'p> {
     pkg: &'p Package,
     wanted: &'p BTreeMap<String, BTreeSet<u32>>,
+    memory: &'p Memory,
+    /// A part refused for a limit while the walk went on (a header): the scan is refused.
+    failure: Option<DocxError>,
     /// Bookmark ids a `w:bookmarkStart` opened (the reader's `bookmarks`).
     bookmarks: HashSet<String>,
     /// Comment ids the comments part holds, as far as it has been read (`comment_map`).
@@ -435,8 +688,21 @@ struct Scanner<'p> {
     parts: BTreeMap<String, ScannedPart>,
 }
 
-/// A unit inside a field (in a spilled field's result or instruction): copied whole, never edited.
-fn in_field(unit: Unit) -> Unit {
+/// Remember `id` in `set`, charged for the room a growing table can hold; false past the budget.
+fn remember<T: std::hash::Hash + Eq>(memory: &Memory, set: &mut HashSet<T>, id: T, extra: usize) -> bool {
+    if set.contains(&id) {
+        return true;
+    }
+    if !memory.hold(table_slot::<T>().saturating_add(units(extra))) {
+        return false;
+    }
+    set.insert(id);
+    true
+}
+
+/// A unit that is locked where it stands: inside a field (a spilled field's result or
+/// instruction) or a text box, copied whole and never edited.
+fn locked_unit(unit: Unit) -> Unit {
     let loc = match unit.loc {
         Loc::Text { node, child, .. } | Loc::Single { node, child } => Loc::Locked { node: Some(node), child: Some(child) },
         Loc::Atomic { first, .. } => Loc::Locked { node: Some(first), child: None },
@@ -448,12 +714,16 @@ fn in_field(unit: Unit) -> Unit {
 
 /// One item where the reader's `emit_text`/`emit_obj` put it: the innermost open field's result,
 /// nowhere (its instruction), or the paragraph (locked while a spilled field is open).
-fn emit(story: &mut Story, b: &mut Builder, item: Vec<Unit>) {
+fn emit(story: &mut Story, b: &mut Builder<'_>, item: Vec<Unit>) {
     match story.fields.last_mut() {
         Some(field) if !field.spilled => {
             if field.result && field.items < MAX_FIELD_ITEMS {
-                field.items += 1;
-                field.buf.extend(item);
+                let charge = vector_slot::<Unit>().saturating_mul(units(item.len()));
+                if b.memory.hold(charge) {
+                    field.items += 1;
+                    field.charged = field.charged.saturating_add(charge);
+                    field.buf.extend(item);
+                }
             }
         }
         _ => push(story, b, item),
@@ -461,9 +731,9 @@ fn emit(story: &mut Story, b: &mut Builder, item: Vec<Unit>) {
 }
 
 /// Straight into the paragraph (markers, comment references, emitted items), locked inside a field.
-fn push(story: &Story, b: &mut Builder, item: Vec<Unit>) {
+fn push(story: &Story, b: &mut Builder<'_>, item: Vec<Unit>) {
     let inside = !story.fields.is_empty();
-    b.units.extend(item.into_iter().map(|unit| if inside { in_field(unit) } else { unit }));
+    b.units(item.into_iter().map(|unit| if inside { locked_unit(unit) } else { unit }));
 }
 
 fn object(loc: Loc) -> Vec<Unit> {
@@ -512,19 +782,30 @@ fn collect<'a>(element: &'a PEl, name: &str, found: &mut Vec<&'a PEl>, depth: us
 }
 
 impl Scanner<'_> {
+    /// Whether the walk has stopped: a part refused for a limit, or the budget spent.
+    fn stopped(&self) -> bool {
+        self.failure.is_some() || self.memory.refused.get()
+    }
+
     /// Walks one part, read under `name` as the reader reads it: its tree and paragraph numbers live
-    /// for the walk. `Ok(false)`: the part is absent. A part that cannot be parsed gave the model no
-    /// paragraphs, so it gives none here either; its error is the caller's.
+    /// for the walk, charged while they do. `Ok(false)`: the part is absent. A part that cannot be
+    /// parsed gave the model no paragraphs, so it gives none here either; its error is the caller's.
     fn with_part(&mut self, name: &str, walk: impl FnOnce(&mut Self, &Ctx<'_>, &PEl)) -> Result<bool, DocxError> {
         let pkg = self.pkg;
         let Some(key) = pkg.part_index(name).and_then(|index| pkg.part_name(index)) else { return Ok(false) };
         let Some(bytes) = pkg.get(key) else { return Ok(false) };
         let Some(root) = pkg.tree(name)? else { return Ok(false) };
-        let ordinals = number_paragraphs(&root);
+        let count = count_paragraphs(&root, 0);
+        let walked = tree_bytes(&root).saturating_add(table_sized::<(usize, u32)>(count));
+        if !self.memory.hold(walked) {
+            return Ok(true);
+        }
+        let ordinals = number_paragraphs(&root, count);
         let rels = pkg.rels(name);
         if self.wanted.contains_key(key)
             && !self.parts.contains_key(key)
             && let Some(written) = root.reusable_name()
+            && self.memory.hold(units(bytes.len()).saturating_add(tree_slot::<String, ScannedPart>()).saturating_add(units(key.len())))
         {
             let prefix = written.split_once(':').map(|(prefix, _)| prefix.to_string()).unwrap_or_default();
             self.parts.insert(
@@ -534,6 +815,9 @@ impl Scanner<'_> {
         }
         let ctx = Ctx { part: key, src: bytes, rels: &rels, ordinals: &ordinals };
         walk(self, &ctx, &root);
+        drop(ordinals);
+        drop(root);
+        self.memory.release(walked);
         Ok(true)
     }
 
@@ -546,16 +830,13 @@ impl Scanner<'_> {
                     continue;
                 }
                 let Some(id) = note.attr("w:id").and_then(int) else { continue };
-                if scanner.parts_made >= MAX_PARTS {
+                if scanner.parts_made >= MAX_PARTS || scanner.stopped() {
                     break;
                 }
                 scanner.story(ctx, note, 0);
                 scanner.parts_made += 1;
-                if foot {
-                    scanner.footnotes.insert(id);
-                } else {
-                    scanner.endnotes.insert(id);
-                }
+                let notes = if foot { &mut scanner.footnotes } else { &mut scanner.endnotes };
+                remember(scanner.memory, notes, id, 0);
             }
         })
     }
@@ -564,7 +845,7 @@ impl Scanner<'_> {
     fn comments(&mut self, name: &str) -> Result<bool, DocxError> {
         self.with_part(name, |scanner, ctx, root| {
             for comment in root.els().filter(|element| element.name == "w:comment") {
-                if scanner.parts_made >= MAX_PARTS {
+                if scanner.parts_made >= MAX_PARTS || scanner.stopped() {
                     break;
                 }
                 let id = comment.attr("w:id").unwrap_or("").to_string();
@@ -573,7 +854,8 @@ impl Scanner<'_> {
                 }
                 scanner.story(ctx, comment, 0);
                 scanner.parts_made += 1;
-                scanner.comments.insert(id);
+                let extra = id.len();
+                remember(scanner.memory, &mut scanner.comments, id, extra);
             }
         })
     }
@@ -602,13 +884,17 @@ impl Scanner<'_> {
     fn header_footer(&mut self, target: &str) {
         let pkg = self.pkg;
         let name = pkg.part_index(target).and_then(|index| pkg.part_name(index)).unwrap_or(target).to_string();
-        if self.headers.contains(&name) || self.parts_made >= MAX_PARTS {
+        if self.headers.contains(&name) || self.parts_made >= MAX_PARTS || self.stopped() {
             return;
         }
         self.parts_made += 1;
-        self.headers.insert(name.clone());
-        // An unreadable header is an empty one to the reader.
-        self.with_part(&name, |scanner, ctx, root| scanner.story(ctx, root, 0)).ok();
+        let extra = name.len();
+        remember(self.memory, &mut self.headers, name.clone(), extra);
+        // A header that is not well formed is an empty one to the reader; one past a limit stops
+        // the scan.
+        if let Err(error @ DocxError::Limit(_)) = self.with_part(&name, |scanner, ctx, root| scanner.story(ctx, root, 0)) {
+            self.failure.get_or_insert(error);
+        }
     }
 
     /// A story's blocks with fresh state, then its leftover markers (the reader's `read_blocks`
@@ -618,6 +904,10 @@ impl Scanner<'_> {
         let mut out = Out::default();
         self.blocks(ctx, &mut story, container, &mut out, 0);
         self.flush(ctx, &mut story, &out);
+        // Fields left open at the story's end give their buffers back.
+        for field in story.fields.drain(..) {
+            self.memory.release(field.charged);
+        }
     }
 
     /// The reader's `read_section`: the headers and footers a section names.
@@ -634,11 +924,21 @@ impl Scanner<'_> {
 
     fn flush(&mut self, ctx: &Ctx<'_>, story: &mut Story, out: &Out) {
         let pending = std::mem::take(&mut story.pending);
+        self.memory.release(vector_slot::<Unit>().saturating_mul(units(pending.len())));
         if pending.is_empty() {
             return;
         }
         let Some(Last::Para(Some(ordinal))) = out.last else { return };
+        let memory = self.memory;
         if let Some(paragraph) = self.parts.get_mut(ctx.part).and_then(|part| part.paragraphs.get_mut(&ordinal)) {
+            // A kept paragraph is charged for its room: the room these need, before it is made.
+            let room = paragraph.units.capacity();
+            let needed = paragraph.units.len().saturating_add(pending.len());
+            if !memory.hold(bytes_of_size::<Unit>(needed.saturating_sub(room))) {
+                return;
+            }
+            paragraph.units.reserve_exact(pending.len());
+            memory.hold(bytes_of_size::<Unit>(paragraph.units.capacity().saturating_sub(room.max(needed))));
             paragraph.units.extend(pending.into_iter().map(|unit| Unit { ch: unit.ch, loc: Loc::Outside { at_end: true } }));
         }
     }
@@ -650,6 +950,9 @@ impl Scanner<'_> {
             return;
         }
         for element in parent.els() {
+            if self.stopped() {
+                return;
+            }
             match element.name.as_str() {
                 "w:p" => {
                     let ordinal = self.paragraph(ctx, story, element, depth);
@@ -673,8 +976,11 @@ impl Scanner<'_> {
                         self.blocks(ctx, story, branch, out, depth + 1);
                     }
                 }
-                // The guard registers what the marker opens or closes, as the reader's `marker` does.
-                "w:bookmarkStart" | "w:bookmarkEnd" | "w:commentRangeStart" | "w:commentRangeEnd" if self.marker(element) => {
+                // The guard registers what the marker opens or closes, as the reader's `marker` does,
+                // then charges the unit waiting for the next paragraph.
+                "w:bookmarkStart" | "w:bookmarkEnd" | "w:commentRangeStart" | "w:commentRangeEnd"
+                    if self.marker(element) && self.memory.hold(vector_slot::<Unit>()) =>
+                {
                     story.pending.push(Unit { ch: OBJ, loc: Loc::Outside { at_end: false } });
                 }
                 _ => {}
@@ -716,13 +1022,14 @@ impl Scanner<'_> {
     /// Whether the reader makes an object of this marker, registering what it opens or closes.
     fn marker(&mut self, element: &PEl) -> bool {
         let id = element.attr("w:id").unwrap_or("").to_string();
+        let extra = id.len();
         match element.name.as_str() {
             "w:bookmarkStart" => {
                 let name = element.attr("w:name").unwrap_or("");
                 if name.is_empty() || name.len() > 256 {
                     return false;
                 }
-                self.bookmarks.insert(id);
+                remember(self.memory, &mut self.bookmarks, id, extra);
                 true
             }
             "w:bookmarkEnd" => self.bookmarks.contains(&id),
@@ -731,7 +1038,7 @@ impl Scanner<'_> {
                 if !self.comments.contains(&id) {
                     return false;
                 }
-                self.comments_ended.insert(id);
+                remember(self.memory, &mut self.comments_ended, id, extra);
                 true
             }
             _ => false,
@@ -741,8 +1048,10 @@ impl Scanner<'_> {
     /// The reader's `read_para`; answers the paragraph's position in the part.
     fn paragraph(&mut self, ctx: &Ctx<'_>, story: &mut Story, paragraph: &PEl, depth: usize) -> Option<u32> {
         let ordinal = ctx.ordinals.get(&address(paragraph)).copied();
-        let mut b = Builder::new();
-        b.units.append(&mut story.pending);
+        let mut b = Builder::new(self.memory);
+        let pending = std::mem::take(&mut story.pending);
+        self.memory.release(vector_slot::<Unit>().saturating_mul(units(pending.len())));
+        b.units(pending);
         let props = paragraph.child("w:pPr");
         if let Some(section) = props.and_then(|props| props.child("w:sectPr")) {
             self.section(ctx, section);
@@ -750,7 +1059,7 @@ impl Scanner<'_> {
         for element in paragraph.els() {
             // The paragraph's properties are recorded apart; a second `w:pPr` is content like any other.
             if !props.is_some_and(|props| std::ptr::eq(props, element)) {
-                self.inline(ctx, story, &mut b, element, &[], depth + 1, None);
+                self.inline(ctx, story, &mut b, element, None, depth + 1, None);
             }
         }
         // The reader's `spill_fields`: an open field cannot keep buffering past the paragraph; the
@@ -760,74 +1069,103 @@ impl Scanner<'_> {
                 continue;
             }
             field.spilled = true;
-            b.units.push(Unit { ch: OBJ, loc: Loc::Locked { node: field.first, child: None } });
-            b.units.extend(field.buf.drain(..).map(in_field));
+            let buffered = std::mem::take(&mut field.buf);
+            self.memory.release(std::mem::take(&mut field.charged));
+            b.units(
+                std::iter::once(Unit { ch: OBJ, loc: Loc::Locked { node: field.first, child: None } }).chain(buffered.into_iter().map(locked_unit)),
+            );
+        }
+        // 6C-39: a text box's paragraphs are read-only.
+        if story.depth > 0 {
+            let units = std::mem::take(&mut b.units);
+            b.units = units.into_iter().map(locked_unit).collect();
         }
         let wanted = ordinal.is_some_and(|ordinal| self.wanted.get(ctx.part).is_some_and(|positions| positions.contains(&ordinal)));
+        let mut keep = None;
         if let (true, Some(ordinal)) = (wanted, ordinal) {
             let ppr = props.map(|props| b.props(props));
             let raw_name = b.name(paragraph);
-            if b.reusable
-                && let Some(part) = self.parts.get_mut(ctx.part)
-            {
-                part.paragraphs.insert(ordinal, finish(paragraph, raw_name, ppr, b));
+            if b.reusable && !self.memory.refused.get() && self.parts.contains_key(ctx.part) {
+                keep = Some((ordinal, raw_name, ppr));
             }
+        }
+        match keep {
+            Some((ordinal, raw_name, ppr)) => {
+                let (memory, held) = (b.memory, b.held);
+                let scanned = finish(paragraph, raw_name, ppr, b);
+                // What the kept paragraph holds replaces what growing it was charged.
+                memory.release(held);
+                if memory.hold(paragraph_bytes(&scanned))
+                    && let Some(part) = self.parts.get_mut(ctx.part)
+                {
+                    part.paragraphs.insert(ordinal, scanned);
+                }
+            }
+            None => self.memory.release(b.held),
         }
         ordinal
     }
 
-    /// A wrapper around inline content; nothing is recorded inside something copied whole.
-    fn wrap(&mut self, b: &mut Builder, element: &PEl, chain: &[usize], lock: Option<Lock>) -> Vec<usize> {
+    /// A wrapper around inline content (inside `parent`); nothing is recorded inside something
+    /// copied whole. Answers the innermost wrapper for its content.
+    fn wrap(&mut self, b: &mut Builder<'_>, element: &PEl, parent: Option<usize>, lock: Option<Lock>) -> Option<usize> {
         if lock.is_some() {
-            return chain.to_vec();
+            return parent;
         }
         let kind = match element.name.as_str() {
             "w:ins" | "w:moveTo" => WrapperKind::Inserted,
             "w:del" | "w:moveFrom" => WrapperKind::Deleted,
             _ => WrapperKind::Other,
         };
-        b.wrappers.push(Wrapper { kind, start: element.start.clone(), end: element.end.clone() });
-        let mut inner = chain.to_vec();
-        inner.push(b.wrappers.len() - 1);
-        inner
+        b.wrapper(Wrapper { kind, start: element.start.clone(), end: element.end.clone(), parent }).or(parent)
     }
 
-    /// The reader's `read_inline`, for one child of a paragraph or of inline content at `depth`.
+    /// The reader's `read_inline`, for one child of a paragraph or of inline content at `depth`,
+    /// inside the wrapper `wrapper`.
     #[allow(clippy::too_many_arguments)]
-    fn inline(&mut self, ctx: &Ctx<'_>, story: &mut Story, b: &mut Builder, element: &PEl, chain: &[usize], depth: usize, lock: Option<Lock>) {
-        if depth > MAX_DEPTH {
+    fn inline(
+        &mut self,
+        ctx: &Ctx<'_>,
+        story: &mut Story,
+        b: &mut Builder<'_>,
+        element: &PEl,
+        wrapper: Option<usize>,
+        depth: usize,
+        lock: Option<Lock>,
+    ) {
+        if depth > MAX_DEPTH || self.stopped() {
             return;
         }
-        let node_of = |b: &mut Builder| if lock.is_none() { Some(b.other(element, chain)) } else { None };
+        let node_of = |b: &mut Builder<'_>| if lock.is_none() { b.other(element, wrapper) } else { None };
         match element.name.as_str() {
             "w:r" => {
-                let node = if lock.is_none() { Some(b.run(element, chain)) } else { None };
+                let node = if lock.is_none() { b.run(element, wrapper) } else { None };
                 let mut note = None;
                 for child in element.els() {
                     self.run_child(ctx, story, b, child, node, lock, &mut note, depth + 1);
                 }
                 if let Some(waiting) = note.take() {
-                    emit(story, b, object(note_loc(node, lock, waiting)));
+                    note_object(story, b, node, lock, waiting);
                 }
             }
             "w:hyperlink" | "w:ins" | "w:moveTo" | "w:del" | "w:moveFrom" | "w:smartTag" | "w:customXml" | "w:dir" | "w:bdo" => {
-                let inner = self.wrap(b, element, chain, lock);
+                let inner = self.wrap(b, element, wrapper, lock);
                 for child in element.els() {
-                    self.inline(ctx, story, b, child, &inner, depth + 1, lock);
+                    self.inline(ctx, story, b, child, inner, depth + 1, lock);
                 }
             }
             "w:sdt" => {
                 // The reader reads the first `w:sdtContent` only; the rest is copied whole.
                 let content = element.child("w:sdtContent");
-                let outer = self.wrap(b, element, chain, lock);
+                let outer = self.wrap(b, element, wrapper, lock);
                 for child in element.els() {
                     if content.is_some_and(|content| std::ptr::eq(content, child)) {
-                        let inner = self.wrap(b, child, &outer, lock);
+                        let inner = self.wrap(b, child, outer, lock);
                         for inside in child.els() {
-                            self.inline(ctx, story, b, inside, &inner, depth + 1, lock);
+                            self.inline(ctx, story, b, inside, inner, depth + 1, lock);
                         }
                     } else if lock.is_none() {
-                        b.other(child, &outer);
+                        b.other(child, outer);
                     }
                 }
             }
@@ -841,7 +1179,7 @@ impl Scanner<'_> {
                     field.result = true;
                 }
                 for child in element.els() {
-                    self.inline(ctx, story, b, child, chain, depth + 1, inner);
+                    self.inline(ctx, story, b, child, wrapper, depth + 1, inner);
                 }
                 self.end_field(story, b, None, inner);
             }
@@ -871,7 +1209,7 @@ impl Scanner<'_> {
                 if let Some(branch) = choice(element) {
                     let inner = Some(lock.unwrap_or(Lock(node)));
                     for child in branch.els() {
-                        self.inline(ctx, story, b, child, chain, depth + 1, inner);
+                        self.inline(ctx, story, b, child, wrapper, depth + 1, inner);
                     }
                 }
             }
@@ -887,17 +1225,17 @@ impl Scanner<'_> {
         &mut self,
         ctx: &Ctx<'_>,
         story: &mut Story,
-        b: &mut Builder,
+        b: &mut Builder<'_>,
         element: &PEl,
         node: Option<usize>,
         lock: Option<Lock>,
         note: &mut Option<Note>,
         depth: usize,
     ) {
-        if depth > MAX_DEPTH {
+        if depth > MAX_DEPTH || self.stopped() {
             return;
         }
-        let other = |b: &mut Builder| if lock.is_some() { None } else { b.other_child(node, element) };
+        let other = |b: &mut Builder<'_>| if lock.is_some() { None } else { b.other_child(node, element) };
         // The text right after a custom note mark is the mark itself.
         if note.is_some_and(|waiting| waiting.custom) && element.name == "w:t" {
             other(b);
@@ -906,15 +1244,19 @@ impl Scanner<'_> {
         if element.name != "w:rPr"
             && let Some(waiting) = note.take()
         {
-            emit(story, b, object(note_loc(node, lock, waiting)));
+            note_object(story, b, node, lock, waiting);
         }
         match element.name.as_str() {
             "w:rPr" => {
-                if lock.is_none()
-                    && let Some(Node::Run(run)) = node.and_then(|node| b.nodes.get_mut(node))
-                {
-                    run.rpr = Some(element.span());
-                    run.rpr_change = element.child("w:rPrChange").map(PEl::span);
+                // The reader formats the run by its first properties; a later `w:rPr` is copied whole.
+                let first = lock.is_none() && matches!(node.and_then(|node| b.nodes.get(node)), Some(Node::Run(run)) if run.rpr.is_none());
+                if first {
+                    if let Some(Node::Run(run)) = node.and_then(|node| b.nodes.get_mut(node)) {
+                        run.rpr = Some(element.span());
+                        run.rpr_change = element.child("w:rPrChange").map(PEl::span);
+                    }
+                } else {
+                    other(b);
                 }
             }
             "w:t" | "w:delText" => self.text(ctx, story, b, element, node, lock),
@@ -958,24 +1300,23 @@ impl Scanner<'_> {
                     _ => {}
                 }
             }
-            "w:drawing" => {
-                other(b);
-                if self.drawing(ctx, story.depth, element) {
-                    emit(story, b, object(whole(node, lock)));
-                }
-            }
-            "w:pict" | "w:object" => {
-                other(b);
-                if self.vml(ctx, story.depth, element) {
-                    emit(story, b, object(whole(node, lock)));
+            "w:drawing" | "w:pict" | "w:object" => {
+                let child = other(b);
+                let made = if element.name == "w:drawing" { self.drawing(ctx, story.depth, element) } else { self.vml(ctx, story.depth, element) };
+                if made {
+                    let loc = whole(node, lock);
+                    if let (Loc::Atomic { first, .. }, Some(child)) = (&loc, child) {
+                        b.makers.insert(*first, child);
+                    }
+                    emit(story, b, object(loc));
                 }
             }
             "w:footnoteReference" | "w:endnoteReference" => {
-                other(b);
+                let child = other(b);
                 let notes = if element.name == "w:footnoteReference" { &self.footnotes } else { &self.endnotes };
                 if notes.contains(&element.attr("w:id").and_then(int).unwrap_or(i64::MIN)) {
                     let custom = element.attr("w:customMarkFollows").is_some_and(|value| !matches!(value, "0" | "false" | "off"));
-                    *note = Some(Note { custom, locked: lock.is_some() });
+                    *note = Some(Note { custom, locked: lock.is_some(), child });
                 }
             }
             "w:commentReference" => {
@@ -985,7 +1326,7 @@ impl Scanner<'_> {
                     && self.comments.contains(id)
                     && !self.comments_ended.contains(id)
                 {
-                    self.comments_ended.insert(id.to_string());
+                    remember(self.memory, &mut self.comments_ended, id.to_string(), id.len());
                     push(story, b, object(locked(node, lock, child)));
                 }
             }
@@ -1019,7 +1360,7 @@ impl Scanner<'_> {
         }
     }
 
-    fn single(&mut self, story: &mut Story, b: &mut Builder, element: &PEl, node: Option<usize>, lock: Option<Lock>, ch: char) {
+    fn single(&mut self, story: &mut Story, b: &mut Builder<'_>, element: &PEl, node: Option<usize>, lock: Option<Lock>, ch: char) {
         let child = if lock.is_none() { b.child(node, Child { span: element.span(), kind: ChildKind::Single { unit: None } }) } else { None };
         let loc = match (lock, node, child) {
             (None, Some(node), Some(child)) => Loc::Single { node, child },
@@ -1031,14 +1372,32 @@ impl Scanner<'_> {
     /// A `w:t` or `w:delText`: its direct text as the reader reads it (`El::text`: text and
     /// references, unknown references left out, CDATA as written), one item. A child holding CDATA
     /// or elements is copied whole: its characters cannot be placed one by one.
-    fn text(&mut self, ctx: &Ctx<'_>, story: &mut Story, b: &mut Builder, element: &PEl, node: Option<usize>, lock: Option<Lock>) {
-        let mut raw: Vec<(Range<usize>, Option<char>)> = Vec::new();
+    fn text(&mut self, ctx: &Ctx<'_>, story: &mut Story, b: &mut Builder<'_>, element: &PEl, node: Option<usize>, lock: Option<Lock>) {
+        let piece = |range: &Range<usize>| ctx.src.get(range.clone()).unwrap_or_default();
+        let cdata = |range: &Range<usize>| {
+            String::from_utf8_lossy(ctx.src.get(range.start.saturating_add(9)..range.end.saturating_sub(3)).unwrap_or_default()).into_owned()
+        };
+        // How many characters, to charge before anything is kept: the tree refuses a part whose text
+        // is not UTF-8, as the reader does.
+        let count = element.kids.iter().fold(0usize, |count, kid| {
+            count.saturating_add(match kid {
+                PKid::Text(range) => std::str::from_utf8(piece(range)).map_or(0, |text| text.chars().count()),
+                PKid::Ref { .. } => 1,
+                PKid::CData(range) => cdata(range).chars().count(),
+                PKid::El(_) => 0,
+            })
+        });
+        // The characters while they are placed, the ones kept, and the item's units.
+        let transient = bytes_of_size::<(Range<usize>, Option<char>)>(count).saturating_add(bytes_of_size::<Unit>(count));
+        if !b.memory.hold(transient) {
+            return;
+        }
+        let mut raw: Vec<(Range<usize>, Option<char>)> = Vec::with_capacity(count);
         let mut whole_only = false;
         for kid in &element.kids {
             match kid {
                 PKid::Text(range) => {
-                    // The tree refuses a part whose text is not UTF-8, as the reader does.
-                    let text = ctx.src.get(range.clone()).and_then(|bytes| std::str::from_utf8(bytes).ok()).unwrap_or("");
+                    let text = std::str::from_utf8(piece(range)).unwrap_or("");
                     for (offset, ch) in text.char_indices() {
                         let start = range.start.saturating_add(offset);
                         raw.push((start..start.saturating_add(ch.len_utf8()), Some(ch)));
@@ -1047,9 +1406,7 @@ impl Scanner<'_> {
                 PKid::Ref { range, ch } => raw.push((range.clone(), *ch)),
                 PKid::CData(range) => {
                     whole_only = true;
-                    let inner = range.start.saturating_add(9)..range.end.saturating_sub(3);
-                    let text = String::from_utf8_lossy(ctx.src.get(inner).unwrap_or_default());
-                    raw.extend(text.chars().map(|ch| (range.clone(), Some(ch))));
+                    raw.extend(cdata(range).chars().map(|ch| (range.clone(), Some(ch))));
                 }
                 PKid::El(_) => whole_only = true,
             }
@@ -1058,14 +1415,17 @@ impl Scanner<'_> {
             None
         } else if whole_only {
             b.other_child(node, element)
-        } else {
-            let chars = raw.iter().map(|(bytes, _)| RawChar { bytes: bytes.clone(), unit: None }).collect();
+        } else if b.hold(bytes_of_size::<RawChar>(raw.len())) {
+            let mut chars = Vec::with_capacity(raw.len());
+            chars.extend(raw.iter().map(|(bytes, _)| RawChar { bytes: bytes.clone(), unit: None }));
             let raw_name = b.name(element);
             let kind =
                 ChildKind::Text { start: element.start.clone(), end: element.end.clone(), raw_name, deleted: element.local() == "delText", chars };
             b.child(node, Child { span: element.span(), kind })
+        } else {
+            None
         };
-        let mut item = Vec::new();
+        let mut item = Vec::with_capacity(count);
         for (index, (_, ch)) in raw.iter().enumerate() {
             let Some(cleaned) = ch.and_then(clean_char) else { continue };
             let loc = match (lock, node, child, whole_only) {
@@ -1074,7 +1434,9 @@ impl Scanner<'_> {
             };
             item.push(Unit { ch: cleaned, loc });
         }
+        drop(raw);
         emit(story, b, item);
+        b.memory.release(transient);
     }
 
     fn begin_field(&mut self, story: &mut Story, first: Option<usize>) {
@@ -1082,15 +1444,16 @@ impl Scanner<'_> {
             story.ignored_begins += 1;
             return;
         }
-        story.fields.push(Field { result: false, spilled: false, buf: Vec::new(), items: 0, first });
+        story.fields.push(Field { result: false, spilled: false, buf: Vec::new(), items: 0, charged: 0, first });
     }
 
-    fn end_field(&mut self, story: &mut Story, b: &mut Builder, last: Option<usize>, lock: Option<Lock>) {
+    fn end_field(&mut self, story: &mut Story, b: &mut Builder<'_>, last: Option<usize>, lock: Option<Lock>) {
         if story.ignored_begins > 0 {
             story.ignored_begins -= 1;
             return;
         }
         let Some(field) = story.fields.pop() else { return };
+        self.memory.release(field.charged);
         if field.spilled {
             return;
         }
@@ -1099,7 +1462,10 @@ impl Scanner<'_> {
             return;
         }
         let loc = match (lock, field.first, last) {
-            (None, Some(first), Some(last)) if first <= last => Loc::Atomic { first, last },
+            (None, Some(first), Some(last)) if first <= last => {
+                b.fields.insert((first, last));
+                Loc::Atomic { first, last }
+            }
             (Some(Lock(at)), _, _) => Loc::Locked { node: at, child: None },
             (None, first, last) => Loc::Locked { node: last.or(first), child: None },
         };
@@ -1149,17 +1515,22 @@ impl Scanner<'_> {
     }
 }
 
-/// An object for a note reference: the run, unless the reference or the object stands inside
+/// The object of a note reference: the run, unless the reference or the object stands inside
 /// something copied whole.
-fn note_loc(node: Option<usize>, lock: Option<Lock>, note: Note) -> Loc {
-    match lock {
+fn note_object(story: &mut Story, b: &mut Builder<'_>, node: Option<usize>, lock: Option<Lock>, note: Note) {
+    let loc = match lock {
         None if note.locked => Loc::Locked { node, child: None },
         lock => whole(node, lock),
+    };
+    if let (Loc::Atomic { first, .. }, Some(child)) = (&loc, note.child) {
+        b.makers.insert(*first, child);
     }
+    emit(story, b, object(loc));
 }
 
-/// The scanned paragraph, each character and one-character child knowing its unit.
-fn finish(paragraph: &PEl, raw_name: String, ppr: Option<Props>, mut b: Builder) -> ScannedPara {
+/// The scanned paragraph, each character and one-character child knowing its unit, every vector
+/// holding no more room than it needs.
+fn finish(paragraph: &PEl, raw_name: String, ppr: Option<Props>, mut b: Builder<'_>) -> ScannedPara {
     settle_objects(&mut b);
     for (index, unit) in b.units.iter().enumerate() {
         match unit.loc {
@@ -1181,13 +1552,40 @@ fn finish(paragraph: &PEl, raw_name: String, ppr: Option<Props>, mut b: Builder)
             _ => {}
         }
     }
-    ScannedPara { start: paragraph.start.clone(), end: paragraph.end.clone(), raw_name, ppr, nodes: b.nodes, wrappers: b.wrappers, units: b.units }
+    for node in &mut b.nodes {
+        if let Node::Run(run) = node {
+            run.children.shrink_to_fit();
+        }
+    }
+    b.nodes.shrink_to_fit();
+    b.wrappers.shrink_to_fit();
+    b.units.shrink_to_fit();
+    ScannedPara {
+        start: paragraph.start.clone(),
+        end: paragraph.end.clone(),
+        raw_name,
+        ppr,
+        nodes: std::mem::take(&mut b.nodes),
+        wrappers: std::mem::take(&mut b.wrappers),
+        units: std::mem::take(&mut b.units),
+    }
 }
 
-/// An object stays `Atomic` only when its nodes are its alone (no other unit stands in them, no
-/// other object covers them) and sit in the same wrappers: removing those nodes then removes the
-/// object and nothing else. Otherwise it is locked where it begins.
-fn settle_objects(b: &mut Builder) {
+/// What an object is made of, to tell what its nodes may hold.
+enum Made {
+    /// A field from its first run to its last.
+    Field,
+    /// A picture or note reference: the child that made it.
+    By(usize),
+    /// An equation: its own element.
+    Equation,
+}
+
+/// An object stays `Atomic` only when removing its nodes removes it and nothing else: no other unit
+/// stands in them and no other object covers them, they sit under one wrapper, and they hold only
+/// what the object owns (I1): each node a run, or the equation's own element, and each run child one
+/// the object owns. Otherwise it is locked where it begins.
+fn settle_objects(b: &mut Builder<'_>) {
     let count = b.nodes.len();
     // How many units stand in, or objects cover, each node.
     let mut cover = vec![0i64; count + 1];
@@ -1216,19 +1614,54 @@ fn settle_objects(b: &mut Builder) {
         total += running;
         prefix.push(total);
     }
-    let nodes = &b.nodes;
+    let (nodes, makers, fields, owned) = (&b.nodes, &b.makers, &b.fields, &b.owned);
+    // The children of node `at` an object owns, given which it may own whole.
+    let holds_only = |at: usize, run: &RunNode, may: &dyn Fn(usize, Option<Owned>) -> bool| {
+        run.children.iter().enumerate().all(|(index, child)| match child.kind {
+            ChildKind::Text { .. } | ChildKind::Single { .. } => may(index, Some(Owned::Text)),
+            ChildKind::Other { .. } => may(index, owned.get(&(at, index)).copied()),
+        })
+    };
     for unit in &mut b.units {
         let Loc::Atomic { first, last } = unit.loc else { continue };
         let alone = first <= last
             && last < count
             && prefix.get(last + 1).copied().unwrap_or(0) - prefix.get(first).copied().unwrap_or(0)
                 == i64::try_from(last - first + 1).unwrap_or(i64::MAX);
-        let same_wrappers =
-            alone && nodes.get(first..=last).is_some_and(|span| span.iter().all(|node| node.chain() == span.first().map_or(&[][..], Node::chain)));
-        if !same_wrappers {
+        let span = nodes.get(first..=last).unwrap_or_default();
+        let one_wrapper = span.iter().all(|node| node.wrapper() == span.first().and_then(Node::wrapper));
+        // A field and a picture both standing alone in one node cannot be told apart: neither is whole.
+        let made = match (fields.contains(&(first, last)), (first == last).then(|| makers.get(&first)).flatten()) {
+            (true, None) => Some(Made::Field),
+            (false, Some(child)) => Some(Made::By(*child)),
+            (false, None)
+                if first == last && matches!(span.first(), Some(Node::Other { name, .. }) if name == "m:oMath" || name == "m:oMathPara") =>
+            {
+                Some(Made::Equation)
+            }
+            _ => None,
+        };
+        // A field owns its field characters, instructions, result text and characters and page
+        // breaks; a picture or note owns the child that made it, a custom mark and page breaks.
+        let owns = |at: usize, node: &Node| match (&made, node) {
+            (Some(Made::Field), Node::Run(run)) => holds_only(at, run, &|_, kind| kind.is_some()),
+            (Some(Made::By(maker)), Node::Run(run)) => holds_only(at, run, &|index, kind| {
+                index == *maker || (matches!(kind, Some(Owned::Text | Owned::Break)) && !is_unit_child(run, index))
+            }),
+            (Some(Made::Equation), Node::Other { .. }) => true,
+            _ => false,
+        };
+        let only_owned = span.iter().enumerate().all(|(offset, node)| owns(first + offset, node));
+        if !(alone && one_wrapper && only_owned) {
             unit.loc = Loc::Locked { node: Some(first), child: None };
         }
     }
+}
+
+/// Whether a run's child is one the reader makes a character of (`w:t` placed character by
+/// character, or a one-character child): a picture's run holding one is not the picture's alone.
+fn is_unit_child(run: &RunNode, index: usize) -> bool {
+    matches!(run.children.get(index).map(|child| &child.kind), Some(ChildKind::Text { .. } | ChildKind::Single { .. }))
 }
 
 #[cfg(test)]
@@ -1262,6 +1695,18 @@ mod tests {
         ];
         entries.extend(parts.iter().map(|(name, bytes)| (name.to_string(), bytes.clone())));
         zip_entries(&entries).unwrap()
+    }
+
+    fn budget() -> Budget {
+        Budget::new(crate::inspect::MAX_WORK, crate::inspect::MAX_MEMORY)
+    }
+
+    /// The prefix the part's root is written with.
+    fn written_prefix(bytes: &[u8]) -> String {
+        let text = String::from_utf8_lossy(bytes);
+        let root = text.split('<').find(|tag| !tag.is_empty() && !tag.starts_with('?') && !tag.starts_with('!')).unwrap_or_default();
+        let name = root.split(|c: char| c.is_whitespace() || c == '>' || c == '/').next().unwrap_or_default();
+        name.split_once(':').map(|(prefix, _)| prefix.to_string()).unwrap_or_default()
     }
 
     /// The paragraphs the reader made with an origin: (part, position) → text.
@@ -1301,10 +1746,27 @@ mod tests {
         for (part, index) in expected.keys() {
             wanted.entry(part.clone()).or_default().insert(*index);
         }
-        let scanned = scan_package(&pkg, &wanted).unwrap();
+        let mut budget = budget();
+        let scanned = scan_package(&pkg, &wanted, &mut budget).unwrap();
+        // Everything held only while walking was given back: what stays charged is what is kept
+        // (paragraphs and part copies) and the ids remembered.
+        let kept = scanned.iter().fold(0u64, |sum, (name, part)| {
+            sum + units(part.bytes.len())
+                + tree_slot::<String, ScannedPart>()
+                + units(name.len())
+                + part.paragraphs.values().map(paragraph_bytes).sum::<u64>()
+        });
+        // Each id remembered is at most one table entry and its text: bounded by the ids written.
+        let ids: usize = (0..)
+            .map_while(|index| pkg.part_name(index))
+            .filter_map(|name| pkg.get(name))
+            .map(|part| String::from_utf8_lossy(part).matches("id=\"").count())
+            .sum();
+        let remembered = 128 * units(ids) + (4 << 10);
+        assert!(budget.held() >= kept && budget.held() - kept <= remembered, "held {} kept {kept} ids {ids}", budget.held());
         for part in scanned.values() {
             assert!(["w:document", "w:hdr", "w:ftr", "w:footnotes", "w:endnotes", "w:comments"].contains(&part.root.as_str()));
-            assert_eq!(part.prefix, "w");
+            assert_eq!(part.prefix, written_prefix(&part.bytes));
         }
         for ((part, index), text) in &expected {
             let paragraph = scanned.get(part).and_then(|p| p.paragraphs.get(index)).unwrap_or_else(|| panic!("{part} #{index} was not scanned"));
@@ -1339,19 +1801,36 @@ mod tests {
         }
     }
 
+    /// The name a tag is written with (`<x:p …>`, `</x:p>`, `<x:p/>`).
+    fn tag_name(bytes: &[u8], range: &Range<usize>) -> String {
+        let tag = String::from_utf8_lossy(&bytes[range.clone()]).into_owned();
+        let tag = tag.trim_start_matches('<').trim_start_matches('/');
+        tag.split(|c: char| c.is_whitespace() || c == '>' || c == '/').next().unwrap_or_default().to_string()
+    }
+
     /// `range` is a start tag (or an element written empty) written with `name`.
     fn is_start(bytes: &[u8], range: &Range<usize>, name: &str) -> bool {
         let tag = &bytes[range.clone()];
-        tag.starts_with(format!("<{name}").as_bytes()) && tag.ends_with(b">") && !tag.starts_with(b"</")
+        tag.starts_with(b"<") && !tag.starts_with(b"</") && tag.ends_with(b">") && tag_name(bytes, range) == name
     }
 
-    /// `range`, when there is one, is an end tag written with `name`.
-    fn is_end(bytes: &[u8], range: &Option<Range<usize>>, name: &str) -> bool {
-        range.as_ref().is_none_or(|range| &bytes[range.clone()] == format!("</{name}>").as_bytes())
+    /// `end` closes the element `start` opens: an end tag of the same name, or none when the start
+    /// tag is written empty.
+    fn closes(bytes: &[u8], start: &Range<usize>, end: &Option<Range<usize>>) -> bool {
+        match end {
+            None => bytes[start.clone()].ends_with(b"/>"),
+            Some(end) => {
+                let tag = &bytes[end.clone()];
+                !bytes[start.clone()].ends_with(b"/>")
+                    && tag.starts_with(b"</")
+                    && tag.ends_with(b">")
+                    && tag_name(bytes, end) == tag_name(bytes, start)
+            }
+        }
     }
 
     fn check_props(bytes: &[u8], props: &Props) {
-        assert!(is_start(bytes, &props.start, &props.raw_name) && is_end(bytes, &props.end, &props.raw_name));
+        assert!(is_start(bytes, &props.start, &props.raw_name) && closes(bytes, &props.start, &props.end));
         for (name, range) in &props.children {
             assert!(range.start >= props.start.end && bytes[range.clone()].starts_with(b"<") && !name.is_empty());
         }
@@ -1360,31 +1839,128 @@ mod tests {
         }
     }
 
+    /// The local part of a written or canonical name.
+    fn local(name: &str) -> &str {
+        name.rsplit(':').next().unwrap_or(name)
+    }
+
+    /// The character a one-character child stands for, read from its tag.
+    fn single_char(bytes: &[u8], range: &Range<usize>) -> Option<char> {
+        let tag = String::from_utf8_lossy(&bytes[range.clone()]).into_owned();
+        // Prefixed or not (a part in the default namespace writes its attributes bare).
+        let attribute = |name: &str| {
+            [format!(":{name}=\""), format!(" {name}=\"")]
+                .iter()
+                .find_map(|pattern| tag.split(pattern.as_str()).nth(1))
+                .and_then(|rest| rest.split('"').next())
+                .map(str::to_string)
+        };
+        match local(&tag_name(bytes, range)) {
+            "tab" | "ptab" => Some('\t'),
+            "br" => Some(match attribute("type").as_deref() {
+                Some("page") => '\u{000C}',
+                Some("column") => '\u{000E}',
+                _ => '\n',
+            }),
+            "cr" => Some('\n'),
+            "noBreakHyphen" => Some('\u{2011}'),
+            "softHyphen" => Some('\u{00AD}'),
+            "sym" => attribute("char").and_then(|hex| u32::from_str_radix(&hex, 16).ok()).and_then(char::from_u32),
+            _ => None,
+        }
+    }
+
+    /// The span a wrapper covers.
+    fn covers(wrapper: &Wrapper) -> Range<usize> {
+        wrapper.start.start..wrapper.end.as_ref().map_or(wrapper.start.end, |end| end.end)
+    }
+
+    fn node_span(node: &Node) -> Range<usize> {
+        match node {
+            Node::Run(run) => run.span(),
+            Node::Other { span, .. } => span.clone(),
+        }
+    }
+
+    /// I1: an object's nodes hold only what it owns. A picture or note owns the child that made
+    /// it, alone in its run; a field owns runs of field characters, instructions, result text and
+    /// characters; an equation its element; and every one of them rendered page breaks.
+    fn atomic_is_whole(paragraph: &ScannedPara, first: usize, last: usize) -> bool {
+        let span = &paragraph.nodes[first..=last];
+        if let [Node::Other { name, .. }] = span {
+            return name == "m:oMath" || name == "m:oMathPara";
+        }
+        let children: Vec<(&str, bool)> = span
+            .iter()
+            .flat_map(|node| match node {
+                Node::Run(run) => run
+                    .children
+                    .iter()
+                    .map(|child| match &child.kind {
+                        ChildKind::Text { raw_name, .. } | ChildKind::Other { raw_name, .. } => {
+                            (local(raw_name), matches!(child.kind, ChildKind::Text { .. }))
+                        }
+                        ChildKind::Single { .. } => ("single", true),
+                    })
+                    .collect(),
+                Node::Other { .. } => vec![("not a run", false)],
+            })
+            .collect();
+        let makers =
+            children.iter().filter(|(name, _)| matches!(*name, "drawing" | "pict" | "object" | "footnoteReference" | "endnoteReference")).count();
+        if first == last && makers == 1 {
+            return children.iter().all(|(name, unit)| {
+                matches!(*name, "drawing" | "pict" | "object" | "footnoteReference" | "endnoteReference" | "lastRenderedPageBreak")
+                    || (!unit && matches!(*name, "t" | "delText"))
+            });
+        }
+        makers == 0
+            && children.iter().all(|(name, unit)| {
+                *unit || matches!(*name, "fldChar" | "instrText" | "delInstrText" | "t" | "delText" | "sym" | "lastRenderedPageBreak")
+            })
+    }
+
     /// Each editable unit points at bytes that hold its character, inside its run, inside the
     /// paragraph; each character and one-character child points back at its unit; nodes are in
-    /// order; every recorded tag is where it says, under the name recorded.
+    /// order; every recorded tag is where it says, under the name recorded, and closed by its own
+    /// end tag; each wrapper holds exactly the nodes that name it; objects, markers, locked and
+    /// outside units are what they say.
     fn check_locations(bytes: &[u8], paragraph: &ScannedPara) {
         let span = paragraph.span();
-        assert!(is_start(bytes, &paragraph.start, &paragraph.raw_name) && is_end(bytes, &paragraph.end, &paragraph.raw_name));
+        assert!(is_start(bytes, &paragraph.start, &paragraph.raw_name) && closes(bytes, &paragraph.start, &paragraph.end));
         if let Some(ppr) = &paragraph.ppr {
             check_props(bytes, ppr);
         }
-        for wrapper in &paragraph.wrappers {
-            assert!(wrapper.start.start > paragraph.start.start && bytes[wrapper.start.clone()].starts_with(b"<"));
-            assert!(wrapper.end.as_ref().is_none_or(|end| bytes[end.clone()].starts_with(b"</") && end.end <= span.end));
+        for (index, wrapper) in paragraph.wrappers.iter().enumerate() {
+            assert!(wrapper.start.start > paragraph.start.start && covers(wrapper).end <= span.end);
+            assert!(bytes[wrapper.start.clone()].starts_with(b"<") && closes(bytes, &wrapper.start, &wrapper.end), "wrapper {index}");
+            let kind = match local(&tag_name(bytes, &wrapper.start)) {
+                "ins" | "moveTo" => WrapperKind::Inserted,
+                "del" | "moveFrom" => WrapperKind::Deleted,
+                _ => WrapperKind::Other,
+            };
+            assert_eq!(wrapper.kind, kind);
+            if let Some(parent) = wrapper.parent {
+                let outer = covers(&paragraph.wrappers[parent]);
+                assert!(parent < index && outer.start < wrapper.start.start && covers(wrapper).end <= outer.end, "wrapper {index} inside its parent");
+            }
         }
         let mut at = paragraph.start.end;
         for node in &paragraph.nodes {
-            let node_span = match node {
-                Node::Run(run) => run.span(),
-                Node::Other { span, .. } => span.clone(),
-            };
+            let node_span = node_span(node);
             assert!(node_span.start >= at && node_span.end <= span.end, "nodes in order inside the paragraph");
-            assert!(node.chain().iter().all(|wrapper| *wrapper < paragraph.wrappers.len()));
             at = node_span.end;
+            // A wrapper covers a node exactly when the node names it, itself or through its parents.
+            let chain = paragraph.chain(node.wrapper());
+            for (index, wrapper) in paragraph.wrappers.iter().enumerate() {
+                let inside = covers(wrapper).start < node_span.start && node_span.end <= covers(wrapper).end;
+                assert_eq!(inside, chain.contains(&index), "wrapper {index} and node at {node_span:?}");
+            }
             if let Node::Run(run) = node {
-                assert!(is_start(bytes, &run.start, &run.raw_name) && is_end(bytes, &run.end, &run.raw_name));
-                assert!(run.rpr.as_ref().is_none_or(|rpr| bytes[rpr.clone()].starts_with(b"<") && rpr.start >= run.start.end));
+                assert!(is_start(bytes, &run.start, &run.raw_name) && closes(bytes, &run.start, &run.end));
+                assert!(run.rpr.as_ref().is_none_or(|rpr| local(&tag_name(bytes, rpr)) == "rPr" && rpr.start >= run.start.end));
+                // The first `w:rPr` is the run's; any later one is a child.
+                assert!(run.children.iter().all(|child| run.rpr.as_ref().is_some_and(|rpr| rpr.end <= child.span.start) || local(&tag_name(bytes, &child.span)) != "rPr"));
                 assert!(
                     run.rpr_change.as_ref().is_none_or(|change| run.rpr.as_ref().is_some_and(|rpr| change.start > rpr.start && change.end < rpr.end))
                 );
@@ -1392,15 +1968,18 @@ mod tests {
                     assert!(child.span.start >= run.start.end && child.span.end <= run.span().end);
                     match &child.kind {
                         ChildKind::Text { start, end, raw_name, chars, .. } => {
-                            assert!(is_start(bytes, start, raw_name) && is_end(bytes, end, raw_name));
+                            assert!(is_start(bytes, start, raw_name) && closes(bytes, start, end));
                             assert!(chars.iter().all(|raw| raw.bytes.start >= start.end));
                         }
-                        ChildKind::Other { start, end, raw_name } => assert!(is_start(bytes, start, raw_name) && is_end(bytes, end, raw_name)),
-                        ChildKind::Single { .. } => assert!(bytes[child.span.clone()].starts_with(b"<")),
+                        ChildKind::Other { start, end, raw_name } => assert!(is_start(bytes, start, raw_name) && closes(bytes, start, end)),
+                        ChildKind::Single { .. } => assert!(single_char(bytes, &child.span).is_some()),
                     }
                 }
             }
         }
+        let outside_start = paragraph.units.iter().take_while(|unit| unit.loc == Loc::Outside { at_end: false }).count();
+        let outside_end = paragraph.units.iter().rev().take_while(|unit| unit.loc == Loc::Outside { at_end: true }).count();
+        let mut markers = BTreeSet::new();
         for (index, unit) in paragraph.units.iter().enumerate() {
             match unit.loc {
                 Loc::Text { node, child, raw } => {
@@ -1413,12 +1992,43 @@ mod tests {
                 Loc::Single { node, child } => {
                     let Node::Run(run) = &paragraph.nodes[node] else { panic!("a child outside a run") };
                     assert!(matches!(run.children[child].kind, ChildKind::Single { unit: Some(found) } if found == index));
+                    assert_eq!(single_char(bytes, &run.children[child].span), Some(unit.ch), "unit {index}");
                 }
-                Loc::Atomic { first, last } => assert!(first <= last && last < paragraph.nodes.len()),
+                Loc::Atomic { first, last } => {
+                    assert!(first <= last && last < paragraph.nodes.len() && unit.ch == OBJ);
+                    assert!(atomic_is_whole(paragraph, first, last), "Atomic {{ {first}, {last} }} holds what it does not own");
+                    let wrapper = paragraph.nodes[first].wrapper();
+                    assert!(paragraph.nodes[first..=last].iter().all(|node| node.wrapper() == wrapper));
+                    // No other unit stands in its nodes.
+                    for (other, unit) in paragraph.units.iter().enumerate() {
+                        let node = match unit.loc {
+                            Loc::Text { node, .. } | Loc::Single { node, .. } | Loc::Marker { node } | Loc::Locked { node: Some(node), .. } => node,
+                            Loc::Atomic { first: start, .. } if other != index => start,
+                            _ => continue,
+                        };
+                        assert!(!(first..=last).contains(&node), "unit {other} stands in object {index}");
+                    }
+                }
                 Loc::Marker { node } => {
-                    assert!(matches!(&paragraph.nodes[node], Node::Other { name, .. } if name.contains("bookmark") || name.contains("comment")))
+                    assert!(unit.ch == OBJ && markers.insert(node), "one unit for each marker");
+                    let Node::Other { name, span, .. } = &paragraph.nodes[node] else { panic!("a marker that is a run") };
+                    assert!(matches!(name.as_str(), "w:bookmarkStart" | "w:bookmarkEnd" | "w:commentRangeStart" | "w:commentRangeEnd"));
+                    assert_eq!(local(&tag_name(bytes, span)), local(name));
                 }
-                Loc::Locked { .. } | Loc::Outside { .. } => {}
+                Loc::Locked { node, child } => {
+                    if let Some(node) = node {
+                        assert!(node < paragraph.nodes.len());
+                        if let Some(child) = child {
+                            assert!(matches!(&paragraph.nodes[node], Node::Run(run) if child < run.children.len()));
+                        }
+                    } else {
+                        assert!(child.is_none());
+                    }
+                }
+                Loc::Outside { at_end } => {
+                    assert_eq!(unit.ch, OBJ);
+                    assert!(if at_end { index >= paragraph.units.len() - outside_end } else { index < outside_start }, "outside units at the ends");
+                }
             }
         }
         // Every character a unit was made of points back at it.
@@ -1498,7 +2108,7 @@ mod tests {
         assert_eq!(kinds, vec![WrapperKind::Inserted, WrapperKind::Deleted, WrapperKind::Other]);
         assert_eq!(paragraph.units[0].loc, Loc::Marker { node: 0 });
         let Node::Run(deleted) = &paragraph.nodes[2] else { panic!("the deleted run") };
-        assert_eq!(deleted.chain, vec![1]);
+        assert_eq!(paragraph.chain(deleted.wrapper), vec![1]);
         assert!(matches!(deleted.children[0].kind, ChildKind::Text { deleted: true, .. }));
         // The comment's own paragraph is scanned too.
         assert_eq!(scanned["word/comments.xml"].paragraphs[&0].text(), "Why?");
@@ -1513,9 +2123,10 @@ mod tests {
         );
         let scanned = scans_as_read(&bytes);
         let paragraph = body_paragraph(&scanned, 1);
-        assert!(matches!(paragraph.nodes[0], Node::Other { ref name, ref chain, .. } if name == "w:sdtPr" && chain == &vec![0]));
+        assert!(matches!(paragraph.nodes[0], Node::Other { ref name, wrapper: Some(0), .. } if name == "w:sdtPr"));
         let Node::Run(inside) = &paragraph.nodes[1] else { panic!("the run in the control") };
-        assert_eq!(inside.chain, vec![0, 1]);
+        assert_eq!(paragraph.chain(inside.wrapper), vec![0, 1]);
+        assert_eq!(paragraph.wrappers[1].parent, Some(0));
     }
 
     #[test]
@@ -1563,7 +2174,7 @@ mod tests {
         let scanned = scans_as_read(&bytes);
         assert!(scanned.contains_key("word/header1.xml"));
         let pkg = Package::open_with(&bytes, &ReadLimits::default()).unwrap();
-        assert!(scan_package(&pkg, &BTreeMap::new()).unwrap().is_empty());
+        assert!(scan_package(&pkg, &BTreeMap::new(), &mut budget()).unwrap().is_empty());
     }
 
     fn para(text: &str) -> String {
@@ -1942,13 +2553,13 @@ mod tests {
         assert_eq!(expected.values().cloned().collect::<Vec<_>>(), vec!["fine".to_string(), "odd".to_string()]);
         let wanted = BTreeMap::from([("word/document.xml".to_string(), BTreeSet::from([0, 1]))]);
         let pkg = Package::open_with(&bytes, &ReadLimits::default()).unwrap();
-        let scanned = scan_package(&pkg, &wanted).unwrap();
+        let scanned = scan_package(&pkg, &wanted, &mut budget()).unwrap();
         assert_eq!(scanned["word/document.xml"].paragraphs.keys().copied().collect::<Vec<_>>(), vec![0]);
         // A part whose own prefix cannot be written again is not scanned at all.
         let document = [&b"<\xff:document xmlns:\xff=\""[..], w.as_bytes(), b"\"><\xff:body><\xff:p/></\xff:body></\xff:document>"].concat();
         let bytes = package_of(document, &[], &[]);
         let pkg = Package::open_with(&bytes, &ReadLimits::default()).unwrap();
-        assert!(scan_package(&pkg, &BTreeMap::from([("word/document.xml".to_string(), BTreeSet::from([0]))])).unwrap().is_empty());
+        assert!(scan_package(&pkg, &BTreeMap::from([("word/document.xml".to_string(), BTreeSet::from([0]))]), &mut budget()).unwrap().is_empty());
     }
 
     #[test]
@@ -1958,13 +2569,13 @@ mod tests {
         // Within the package's element budget, and every record counted is spent.
         let tight = ReadLimits { max_elements: 15, ..ReadLimits::default() };
         let pkg = Package::open_with(&bytes, &tight).unwrap();
-        let refused = scan_package(&pkg, &wanted);
+        let refused = scan_package(&pkg, &wanted, &mut budget());
         assert!(matches!(refused, Err(DocxError::Limit(_))), "{refused:?}");
         assert!(pkg.limit_reached());
         let pkg = Package::open_with(&bytes, &ReadLimits { max_elements: 1_000, ..ReadLimits::default() }).unwrap();
-        assert_eq!(scan_package(&pkg, &wanted).unwrap()["word/document.xml"].paragraphs.len(), 1);
+        assert_eq!(scan_package(&pkg, &wanted, &mut budget()).unwrap()["word/document.xml"].paragraphs.len(), 1);
         let shallow = ReadLimits { max_depth: 4, ..ReadLimits::default() };
-        assert!(matches!(scan_package(&Package::open_with(&bytes, &shallow).unwrap(), &wanted), Err(DocxError::Limit(_))));
+        assert!(matches!(scan_package(&Package::open_with(&bytes, &shallow).unwrap(), &wanted, &mut budget()), Err(DocxError::Limit(_))));
         // The tree spends what it counts: a second reading of the part finds less left.
         let pkg = Package::open_with(&bytes, &ReadLimits { max_elements: 30, ..ReadLimits::default() }).unwrap();
         assert!(pkg.tree("word/document.xml").unwrap().is_some());
@@ -1973,9 +2584,9 @@ mod tests {
         // No main part, or one that is not a document.
         let entries = vec![("_rels/.rels".to_string(), b"<Relationships/>".to_vec())];
         let pkg = Package::open_with(&zip_entries(&entries).unwrap(), &ReadLimits::default()).unwrap();
-        assert!(matches!(scan_package(&pkg, &wanted), Err(DocxError::MissingPart(_))));
+        assert!(matches!(scan_package(&pkg, &wanted, &mut budget()), Err(DocxError::MissingPart(_))));
         let pkg = Package::open_with(&package_of(format!("<w:hdr {W}/>").into_bytes(), &[], &[]), &ReadLimits::default()).unwrap();
-        assert!(matches!(scan_package(&pkg, &wanted), Err(DocxError::NotWord(_))));
+        assert!(matches!(scan_package(&pkg, &wanted, &mut budget()), Err(DocxError::NotWord(_))));
     }
 
     /// The reader stops making parts at MAX_PARTS: the notes past it are not read, nor a header
@@ -2038,6 +2649,15 @@ mod tests {
         r#"<w:pict><v:rect><v:textbox><w:txbxContent><w:p><w:r><w:t>vml</w:t></w:r></w:p></w:txbxContent></v:textbox></v:rect></w:pict>"#,
         "<w:ruby><w:rubyBase><w:r><w:t>base</w:t><w:tab/></w:r></w:rubyBase></w:ruby>",
         r#"<mc:AlternateContent><mc:Choice Requires="wps"><w:t>choice</w:t><w:fldChar w:fldCharType="begin"/></mc:Choice><mc:Fallback><w:t>fallback</w:t></mc:Fallback></mc:AlternateContent>"#,
+        // Several notes and comments, markup the reader ignores, a second w:rPr, white space.
+        r#"<w:footnoteReference w:id="2"/>"#,
+        r#"<w:endnoteReference w:id="2"/>"#,
+        r#"<w:commentReference w:id="1"/>"#,
+        "<w:rPr><w:i/></w:rPr>",
+        "<w:separator/>",
+        "<w:annotationRef/>",
+        "<w:lastRenderedPageBreak/>",
+        " \r\n ",
     ];
 
     /// Inline content that holds no other inline content.
@@ -2051,6 +2671,15 @@ mod tests {
         r#"<w:proofErr w:type="spellStart"/>"#,
         "<m:oMath><m:r><m:t>x</m:t></m:r></m:oMath>",
         "<m:oMathPara><m:oMath/><m:oMath/></m:oMathPara>",
+        r#"<w:commentRangeStart w:id="1"/>"#,
+        r#"<w:commentRangeEnd w:id="1"/>"#,
+        r#"<w:bookmarkEnd w:id="4"/>"#,
+        r#"<w:bookmarkStart w:id="4" w:name="late"/>"#,
+        r#"<w:permStart w:id="1" w:edGrp="everyone"/>"#,
+        r#"<w:permEnd w:id="1"/>"#,
+        r#"<w:moveFromRangeStart w:id="2" w:name="m"/>"#,
+        r#"<w:moveFromRangeEnd w:id="2"/>"#,
+        "\n  ",
     ];
 
     /// Inline wrappers: `{}` is their content, `{f}` a second content (a Fallback).
@@ -2074,13 +2703,30 @@ mod tests {
         "",
         r#"<w:pPr><w:jc w:val="center"/><w:rPr><w:b/></w:rPr></w:pPr>"#,
         r#"<w:pPr><w:sectPr><w:headerReference w:type="default" r:id="rId4"/></w:sectPr></w:pPr>"#,
+        r#"<w:pPr><w:framePr w:dropCap="drop" w:lines="2"/></w:pPr>"#,
     ];
+
+    /// Wrappers nested deep: every kind, twenty levels.
+    fn deeply_wrapped() -> String {
+        let open = r#"<w:hyperlink w:anchor="one"><w:ins w:id="5" w:author="A"><w:sdt><w:sdtContent><w:smartTag w:element="x">"#;
+        let close = "</w:smartTag></w:sdtContent></w:sdt></w:ins></w:hyperlink>";
+        format!("{}<w:r><w:t>deep</w:t></w:r><w:bookmarkStart w:id=\"1\" w:name=\"one\"/>{}", open.repeat(5), close.repeat(5))
+    }
+
+    /// The same part written with the prefix `x`, or in the default namespace, instead of `w`.
+    fn written_as(xml: &str, form: usize) -> String {
+        match form {
+            0 => xml.to_string(),
+            1 => xml.replace("<w:", "<x:").replace("</w:", "</x:").replace(" w:", " x:").replace("xmlns:w=", "xmlns:x="),
+            _ => xml.replace("<w:", "<").replace("</w:", "</").replace(" w:", " ").replace("xmlns:w=", "xmlns="),
+        }
+    }
 
     fn inline_content() -> impl Strategy<Value = String> {
         let run =
             proptest::collection::vec(proptest::sample::select(RUN_CHILDREN), 0..5).prop_map(|children| format!("<w:r>{}</w:r>", children.concat()));
-        let leaf = prop_oneof![4 => run, 1 => proptest::sample::select(INLINE_LEAVES).prop_map(str::to_string)];
-        leaf.prop_recursive(3, 32, 4, |inner| {
+        let leaf = prop_oneof![8 => run, 2 => proptest::sample::select(INLINE_LEAVES).prop_map(str::to_string), 1 => Just(deeply_wrapped())];
+        leaf.prop_recursive(4, 40, 4, |inner| {
             (proptest::sample::select(WRAPPERS), proptest::collection::vec(inner.clone(), 0..4), proptest::collection::vec(inner, 0..2))
                 .prop_map(|(wrapper, content, fallback)| wrapper.replace("{f}", &fallback.concat()).replace("{}", &content.concat()))
         })
@@ -2090,7 +2736,7 @@ mod tests {
         let paragraph = (proptest::sample::select(PARAGRAPH_PROPERTIES), proptest::collection::vec(inline_content(), 0..5))
             .prop_map(|(props, content)| format!("<w:p>{props}{}</w:p>", content.concat()));
         let marker = proptest::sample::select(&INLINE_LEAVES[..6]).prop_map(str::to_string);
-        let leaf = prop_oneof![5 => paragraph, 1 => marker];
+        let leaf = prop_oneof![5 => paragraph, 1 => marker, 1 => Just("\n\t".to_string())];
         leaf.prop_recursive(3, 24, 4, |inner| {
             let list = || proptest::collection::vec(inner.clone(), 0..4).prop_map(|blocks| blocks.concat());
             prop_oneof![
@@ -2118,15 +2764,25 @@ mod tests {
             note in proptest::collection::vec(blocks(), 1..3),
             comment in proptest::collection::vec(blocks(), 1..3),
             header in proptest::collection::vec(blocks(), 1..3),
+            second in proptest::collection::vec(blocks(), 1..3),
+            form in 0..3usize,
         ) {
-            let footnotes = format!(r#"<w:footnotes {W}><w:footnote w:type="separator" w:id="-1"><w:p/></w:footnote><w:footnote w:id="1">{}</w:footnote></w:footnotes>"#, note.concat());
-            let endnotes = format!(r#"<w:endnotes {W}><w:endnote w:id="1">{}</w:endnote></w:endnotes>"#, note.concat());
-            let comments = format!(r#"<w:comments {W}><w:comment w:id="0">{}</w:comment></w:comments>"#, comment.concat());
+            let footnotes = format!(
+                r#"<w:footnotes {W}><w:footnote w:type="separator" w:id="-1"><w:p/></w:footnote><w:footnote w:id="1">{}</w:footnote><w:footnote w:id="2">{}</w:footnote></w:footnotes>"#,
+                note.concat(),
+                second.concat()
+            );
+            let endnotes = format!(r#"<w:endnotes {W}><w:endnote w:id="2">{}</w:endnote><w:endnote w:id="1">{}</w:endnote></w:endnotes>"#, second.concat(), note.concat());
+            let comments = format!(r#"<w:comments {W}><w:comment w:id="1">{}</w:comment><w:comment w:id="0">{}</w:comment></w:comments>"#, second.concat(), comment.concat());
             let header = format!(r#"<w:hdr {W}>{}</w:hdr>"#, header.concat());
+            let second_header = format!(r#"<w:hdr {W}>{}</w:hdr>"#, second.concat());
             // Ends with a paragraph, so that some paragraph has an origin whatever was generated.
             let body = format!(r#"{}<w:p><w:r><w:t>end</w:t></w:r></w:p><w:sectPr><w:headerReference w:type="default" r:id="rId4"/></w:sectPr>"#, body.concat());
-            let bytes = package(
-                &body,
+            let document = written_as(&format!(r#"<w:document {W}><w:body>{body}</w:body></w:document>"#), form);
+            // Notes and comments name their own headers through their own relationships.
+            let own_header = |target: &str| format!(r#"<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId4" Type="{REL}/header" Target="{target}"/><Relationship Id="rId9" Type="{REL}/image" Target="media/image1.png"/></Relationships>"#).into_bytes();
+            let bytes = package_of(
+                document.into_bytes(),
                 &[
                     ("rId1", "footnotes", "footnotes.xml"),
                     ("rId2", "endnotes", "endnotes.xml"),
@@ -2135,10 +2791,16 @@ mod tests {
                     ("rId9", "image", "media/image1.png"),
                 ],
                 &[
-                    ("word/footnotes.xml", footnotes.into_bytes()),
-                    ("word/endnotes.xml", endnotes.into_bytes()),
-                    ("word/comments.xml", comments.into_bytes()),
-                    ("word/header1.xml", header.into_bytes()),
+                    ("word/footnotes.xml", written_as(&footnotes, form).into_bytes()),
+                    ("word/endnotes.xml", written_as(&endnotes, form).into_bytes()),
+                    ("word/comments.xml", written_as(&comments, form).into_bytes()),
+                    ("word/header1.xml", written_as(&header, form).into_bytes()),
+                    ("word/header2.xml", written_as(&second_header, form).into_bytes()),
+                    ("word/_rels/footnotes.xml.rels", own_header("header2.xml")),
+                    ("word/_rels/comments.xml.rels", own_header("header2.xml")),
+                    ("word/_rels/endnotes.xml.rels", own_header("header1.xml")),
+                    ("word/_rels/header1.xml.rels", own_header("header2.xml")),
+                    ("word/_rels/header2.xml.rels", own_header("header1.xml")),
                     ("word/media/image1.png", PNG.to_vec()),
                 ],
             );
@@ -2159,5 +2821,108 @@ mod tests {
         let paragraph = body_paragraph(&scanned, 0);
         assert_eq!(paragraph.text(), format!("{OBJ}{}{}", "a".repeat(MAX_FIELD_ITEMS + 1), "\t".repeat(MAX_FIELD_ITEMS - 1)));
         assert!(paragraph.editable().is_empty());
+    }
+
+    const PICTURE: &str = r#"<w:drawing><wp:inline><wp:extent cx="9525" cy="9525"/><a:graphic><a:graphicData uri="p"><pic:pic><pic:blipFill><a:blip r:embed="rId9"/></pic:blipFill></pic:pic></a:graphicData></a:graphic></wp:inline></w:drawing>"#;
+
+    /// I1: an object whose nodes hold markup the model does not (a permission range, a bookmark end
+    /// before its start, a comment's only reference mark) is locked: deleting it would delete that
+    /// markup where no comparison of models can see it.
+    #[test]
+    fn locks_an_object_whose_nodes_hold_markup_the_model_does_not() {
+        let comments = format!(r#"<w:comments {W}><w:comment w:id="0"><w:p/></w:comment></w:comments>"#);
+        let body = format!(
+            concat!(
+                r#"<w:p><w:r><w:fldChar w:fldCharType="begin"/></w:r><w:r><w:instrText>X</w:instrText></w:r><w:r><w:fldChar w:fldCharType="separate"/></w:r><w:r><w:t>r</w:t></w:r><w:proofErr w:type="spellStart"/><w:permStart w:id="1"/><w:r><w:commentReference w:id="77"/></w:r><w:r><w:fldChar w:fldCharType="end"/></w:r></w:p>"#,
+                r#"<w:p><w:r><w:fldChar w:fldCharType="begin"/></w:r><w:r><w:instrText> PAGE </w:instrText></w:r><w:r><w:fldChar w:fldCharType="separate"/></w:r><w:bookmarkEnd w:id="9"/><w:r><w:t>1</w:t></w:r><w:r><w:fldChar w:fldCharType="end"/></w:r></w:p>"#,
+                r#"<w:p><w:bookmarkStart w:id="9" w:name="late"/><w:r><w:t>x</w:t></w:r></w:p>"#,
+                r#"<w:p><w:commentRangeStart w:id="0"/><w:r><w:t>a</w:t></w:r><w:commentRangeEnd w:id="0"/><w:r>{picture}<w:commentReference w:id="0"/></w:r></w:p>"#,
+                r#"<w:p><w:r><w:fldChar w:fldCharType="begin"/></w:r><w:r><w:instrText> PAGE </w:instrText></w:r><w:r><w:fldChar w:fldCharType="separate"/></w:r><w:r><w:lastRenderedPageBreak/><w:t>2</w:t></w:r><w:r><w:fldChar w:fldCharType="end"/></w:r><w:r>{picture}</w:r></w:p>"#,
+            ),
+            picture = PICTURE
+        );
+        let bytes = package(
+            &body,
+            &[("rId1", "comments", "comments.xml"), ("rId9", "image", "media/image1.png")],
+            &[("word/comments.xml", comments.into_bytes()), ("word/media/image1.png", PNG.to_vec())],
+        );
+        let scanned = scans_as_read(&bytes);
+        assert_eq!(objects(body_paragraph(&scanned, 0)), vec![&Loc::Locked { node: Some(0), child: None }]);
+        assert_eq!(objects(body_paragraph(&scanned, 1)), vec![&Loc::Locked { node: Some(0), child: None }]);
+        assert_eq!(objects(body_paragraph(&scanned, 3)).last(), Some(&&Loc::Locked { node: Some(3), child: None }));
+        // What an object owns keeps it whole: a field of runs with a rendered page break, a picture
+        // alone in its run.
+        assert_eq!(objects(body_paragraph(&scanned, 4)), vec![&Loc::Atomic { first: 0, last: 4 }, &Loc::Atomic { first: 5, last: 5 }]);
+    }
+
+    /// I3: a part the tree refuses for a limit refuses the scan, whatever the package's budget: the
+    /// scan never goes on with state the reader's did not have.
+    #[test]
+    fn refuses_when_a_secondary_part_is_past_a_limit() {
+        let declarations: String = (0..=crate::xml::MAX_BINDINGS).map(|index| format!(r#" xmlns:p{index}="u""#)).collect();
+        let footnotes = format!(r#"<w:footnotes {W}{declarations}><w:footnote w:id="1"><w:p/></w:footnote></w:footnotes>"#);
+        let header = format!(r#"<w:hdr {W}{declarations}><w:p/></w:hdr>"#);
+        let wanted = BTreeMap::from([("word/document.xml".to_string(), BTreeSet::from([0]))]);
+        let note = r#"<w:p><w:r><w:footnoteReference w:id="1"/></w:r></w:p>"#;
+        let named = r#"<w:p/><w:sectPr><w:headerReference w:type="default" r:id="rId1"/></w:sectPr>"#;
+        for (kind, name, part, body) in [("footnotes", "word/footnotes.xml", footnotes, note), ("header", "word/header1.xml", header, named)] {
+            let target = name.trim_start_matches("word/");
+            let bytes = package(body, &[("rId1", kind, target)], &[(name, part.into_bytes())]);
+            // The reader skips the part; the scan refuses.
+            assert!(crate::read(&bytes).is_ok());
+            let pkg = Package::open_with(&bytes, &ReadLimits::default()).unwrap();
+            assert!(matches!(scan_package(&pkg, &wanted, &mut budget()), Err(DocxError::Limit(_))), "{kind}");
+        }
+    }
+
+    /// M1: the reader formats a run by its first `w:rPr`; a later one is a child copied whole.
+    #[test]
+    fn takes_a_runs_first_properties() {
+        let bytes = package(r#"<w:p><w:r><w:rPr><w:b/></w:rPr><w:rPr><w:i/></w:rPr><w:t>x</w:t></w:r></w:p>"#, &[], &[]);
+        let scanned = scans_as_read(&bytes);
+        let Node::Run(run) = &body_paragraph(&scanned, 0).nodes[0] else { panic!("a run") };
+        assert_eq!(&bytes_of(&scanned, "word/document.xml")[run.rpr.clone().unwrap()], b"<w:rPr><w:b/></w:rPr>");
+        assert!(matches!(&run.children[0].kind, ChildKind::Other { raw_name, .. } if raw_name == "w:rPr"));
+    }
+
+    /// 6C-39: a text box's paragraphs are read-only: every unit locked, nothing editable.
+    #[test]
+    fn locks_every_paragraph_of_a_text_box() {
+        let body = r#"<w:p><w:r><w:t>Body</w:t></w:r><w:r><w:pict><v:rect><v:textbox><w:txbxContent><w:p><w:r><w:t>box text</w:t><w:tab/></w:r><w:bookmarkStart w:id="1" w:name="b"/></w:p></w:txbxContent></v:textbox></v:rect></w:pict></w:r><w:r><w:drawing><wp:inline><a:graphic><a:graphicData uri="s"><wps:wsp><wps:txbx><w:txbxContent><w:p><w:r><w:t>shape text</w:t></w:r></w:p></w:txbxContent></wps:txbx></wps:wsp></a:graphicData></a:graphic></wp:inline></w:drawing></w:r></w:p>"#;
+        let scanned = scans_as_read(&package(body, &[], &[]));
+        assert_eq!(body_paragraph(&scanned, 0).editable(), vec![0..4]);
+        for index in [1, 2] {
+            let paragraph = body_paragraph(&scanned, index);
+            assert!(paragraph.units.iter().all(|unit| matches!(unit.loc, Loc::Locked { .. })), "{:?}", paragraph.units);
+            assert!(paragraph.editable().is_empty());
+        }
+    }
+
+    /// I2: what the scan holds grows with the markup, not with its nesting, and all of it is
+    /// charged: 200 hyperlinks around 100,000 runs (600 KB of XML) keep 200 wrappers, each node
+    /// naming one, within a bounded budget; a smaller budget refuses the scan before passing it.
+    #[test]
+    fn charges_what_it_holds_and_names_one_wrapper_a_node() {
+        let body = format!("<w:p>{}{}{}</w:p>", "<w:hyperlink>".repeat(200), "<w:r/>".repeat(100_000), "</w:hyperlink>".repeat(200));
+        let bytes = package(&body, &[], &[]);
+        let wanted = BTreeMap::from([("word/document.xml".to_string(), BTreeSet::from([0]))]);
+        let pkg = Package::open_with(&bytes, &ReadLimits::default()).unwrap();
+        let mut budget = Budget::new(crate::inspect::MAX_WORK, 96 << 20);
+        let scanned = scan_package(&pkg, &wanted, &mut budget).unwrap();
+        let paragraph = body_paragraph(&scanned, 0);
+        assert_eq!((paragraph.nodes.len(), paragraph.wrappers.len()), (100_000, 200));
+        assert_eq!(paragraph.chain(paragraph.nodes[0].wrapper()), (0..200).collect::<Vec<_>>());
+        // What is kept stays charged: the paragraph and the part's copy.
+        let kept = paragraph_bytes(paragraph) + units(scanned["word/document.xml"].bytes.len());
+        assert!(budget.held() >= kept);
+        // Everything held only while walking was given back: what is left is the kept paragraph, the
+        // part's copy and the ids remembered.
+        assert!(budget.held() - kept < 4 << 10, "held {} kept {kept}", budget.held());
+        // Linear in the markup: at most 128 bytes held at once for each byte of XML (the chains
+        // cloned per node held 160 MB here).
+        assert!(budget.peak() <= 128 * units(body.len()), "peak {}", budget.peak());
+        let mut small = Budget::new(crate::inspect::MAX_WORK, 4 << 20);
+        assert!(matches!(scan_package(&pkg, &wanted, &mut small), Err(DocxError::Limit(message)) if message == SCAN_TOO_LARGE));
+        assert!(small.peak() <= 4 << 20);
     }
 }

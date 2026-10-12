@@ -47,7 +47,8 @@
 //! accepted or as rejected. A character changed without tracking is never counted only as a
 //! comment or a resolution. A host judges every field; none is advisory.
 
-mod budget;
+// embed: shared with the preserving writer, whose scan and planner charge the same budget (6C-12).
+pub(crate) mod budget;
 mod comments;
 mod compare;
 mod diff;
