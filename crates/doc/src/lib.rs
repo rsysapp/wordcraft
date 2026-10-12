@@ -29,8 +29,8 @@ use serde::{Deserialize, Serialize};
 pub use numbering::{ListKind, Numbering};
 // embed: Origin, for a writer that keeps the source package.
 pub use para::{InlineObject, Origin, Paragraph, Run};
-// embed: the kept parts' map.
-pub use passthrough::Passthrough;
+// embed: the kept parts' and the media's maps.
+pub use passthrough::{Media, NamedBytes, Passthrough};
 pub use props::{Align, CharProps, ParaProps, Rgb, TextColor};
 pub use section::SectionProps;
 pub use styles::{Style, StyleKind, StyleSheet};
@@ -330,8 +330,9 @@ pub struct Document {
     /// Bibliography sources (References › Manage Sources).
     pub sources: Vec<Source>,
     /// Embedded media (images) by key.
+    // embed: a map that prints names and lengths, never a picture's bytes.
     #[serde(skip)]
-    pub media: BTreeMap<String, Arc<Vec<u8>>>,
+    pub media: Media,
     /// Source-format parts we keep verbatim for round-trip (e.g. custom XML), by part name.
     // embed: a map that prints lengths and compares shared bytes without reading them, since a
     // document read from a package keeps the whole package here.
@@ -359,7 +360,8 @@ impl Document {
             settings: Settings::default(),
             core: CoreProps::default(),
             sources: Vec::new(),
-            media: BTreeMap::new(),
+            // embed: see the field.
+            media: Media::new(),
             // embed: see the field.
             passthrough: Passthrough::new(),
         }
