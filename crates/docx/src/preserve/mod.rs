@@ -9,6 +9,9 @@ mod scan;
 // embed: read only by the preserving writer (Task 9 removes the allowance).
 #[cfg_attr(not(test), expect(dead_code, reason = "embed: read by the preserving writer, which is not written yet (Task 9)"))]
 mod plan;
+// embed: read only by the preserving writer (Task 9 removes the allowance).
+#[cfg_attr(not(test), expect(dead_code, reason = "embed: read by the preserving writer, which is not written yet (Task 9)"))]
+mod emit;
 pub(crate) mod tree;
 
 /// The key in `Document::passthrough` under which a document read from a Word package keeps the
