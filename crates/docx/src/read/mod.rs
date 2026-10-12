@@ -1,7 +1,8 @@
 //! DOCX → [`Document`].
 
 mod props;
-mod story;
+// embed: the preserving writer's scan follows the story reader's rules.
+pub(crate) mod story;
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Arc;
@@ -22,7 +23,8 @@ pub(crate) use props::PropCtx;
 use story::StoryCtx;
 
 /// Most parts (headers, notes, comments, text boxes) we create from one file.
-const MAX_PARTS: usize = 50_000;
+// embed: shared with the preserving writer's scan (preserve::scan).
+pub(crate) const MAX_PARTS: usize = 50_000;
 
 pub(crate) struct Reader<'p> {
     pkg: &'p Package,

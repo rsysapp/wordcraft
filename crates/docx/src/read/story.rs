@@ -13,12 +13,13 @@ use crate::package::Rels;
 use crate::units::{int, measure};
 use crate::xml::El;
 
+// embed: shared with the preserving writer's scan (preserve::scan).
 /// Deepest table nesting we build (deeper tables become plain paragraphs).
-const MAX_TABLE_DEPTH: usize = 24;
+pub(crate) const MAX_TABLE_DEPTH: usize = 24;
 /// Deepest field nesting we track.
-const MAX_FIELD_DEPTH: usize = 32;
+pub(crate) const MAX_FIELD_DEPTH: usize = 32;
 /// Deepest text-box-in-text-box nesting.
-const MAX_STORY_DEPTH: usize = 4;
+pub(crate) const MAX_STORY_DEPTH: usize = 4;
 
 /// Inherited run context (from `w:hyperlink`, `w:ins`, `w:del` wrappers).
 #[derive(Clone, Default)]
@@ -91,22 +92,31 @@ impl PB {
 /// Clean text from `w:t`: drop characters with special meaning in the model and control
 /// characters XML producers shouldn't have put there.
 fn clean_text(s: &str) -> String {
-    s.chars()
-        .filter_map(|c| match c {
-            '\n' | '\r' => Some(' '),
-            '\t' => Some('\t'),
-            wordcraft_doc::para::OBJ => None,
-            c if (c as u32) < 0x20 => None,
-            c => Some(c),
-        })
-        .collect()
+    s.chars().filter_map(clean_char).collect()
+}
+
+/// embed: one character of `w:t` text as the model holds it, or none (shared with preserve::scan).
+pub(crate) fn clean_char(c: char) -> Option<char> {
+    match c {
+        '\n' | '\r' => Some(' '),
+        '\t' => Some('\t'),
+        wordcraft_doc::para::OBJ => None,
+        c if (c as u32) < 0x20 => None,
+        c => Some(c),
+    }
 }
 
 fn children_of_choice(ac: &El) -> Option<&El> {
     // Prefer a Choice whose requirements we understand; else the Fallback; else any Choice.
-    const KNOWN: &[&str] = &["wps", "w14", "w15", "wp14", "a14", "w16se", "w16cid", "w16", "w16cex", "w16sdtdh", "v"];
-    let ok = |c: &El| c.attr("Requires").unwrap_or("").split_whitespace().all(|r| KNOWN.contains(&r));
+    let ok = |c: &El| choice_understood(c.attr("Requires").unwrap_or(""));
     ac.children("mc:Choice").find(|c| ok(c)).or_else(|| ac.child("mc:Fallback")).or_else(|| ac.child("mc:Choice"))
+}
+
+/// embed: whether every namespace an `mc:Choice` requires is one the reader understands (shared
+/// with preserve::scan).
+pub(crate) fn choice_understood(requires: &str) -> bool {
+    const KNOWN: &[&str] = &["wps", "w14", "w15", "wp14", "a14", "w16se", "w16cid", "w16", "w16cex", "w16sdtdh", "v"];
+    requires.split_whitespace().all(|r| KNOWN.contains(&r))
 }
 
 impl Reader<'_> {

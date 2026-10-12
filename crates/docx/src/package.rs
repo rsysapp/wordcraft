@@ -158,10 +158,24 @@ impl Package {
     }
 
     pub fn xml(&self, name: &str) -> Result<Option<El>, DocxError> {
+        // embed: the budget is shared with `tree`.
+        self.parse_within(name, xml::parse_limited)
+    }
+
+    /// embed: a part's positional tree (the preserving writer's scan), parsed within the same limits
+    /// and the same element budget as [`Package::xml`]: what it counts is spent, and a limit reached is
+    /// recorded.
+    pub(crate) fn tree(&self, name: &str) -> Result<Option<crate::preserve::tree::PEl>, DocxError> {
+        self.parse_within(name, crate::preserve::tree::parse_limited)
+    }
+
+    /// embed: parse part `name` with `parse` (given the bytes, the elements it may count and the
+    /// depth it may nest), spending what it counted from the package's budget.
+    fn parse_within<T>(&self, name: &str, parse: impl FnOnce(&[u8], usize, usize) -> Result<(T, usize), DocxError>) -> Result<Option<T>, DocxError> {
         let Some(b) = self.get(name) else { return Ok(None) };
         // embed: one element budget across the package, so many parts cannot each fill the per-part limit.
         let left = self.elements_left.get();
-        match xml::parse_limited(b, left.min(xml::MAX_ELEMENTS), self.max_depth) {
+        match parse(b, left.min(xml::MAX_ELEMENTS), self.max_depth) {
             Ok((root, used)) => {
                 self.elements_left.set(left.saturating_sub(used));
                 Ok(Some(root))
