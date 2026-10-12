@@ -501,7 +501,17 @@ fn compare(s: &mut Session, v: &Value) -> CmdResult {
         return Err(CmdError::Params("`path` or `text` of the revised document is required".into()));
     };
     let old: Vec<Paragraph> = s.doc.body.iter().filter_map(|b| b.as_para().cloned()).collect();
-    let new: Vec<Paragraph> = revised.body.iter().filter_map(|b| b.as_para().cloned()).collect();
+    // embed: an origin is a position in the package its document was read from, so a paragraph
+    // brought in from the revised file claims none here.
+    let new: Vec<Paragraph> = revised
+        .body
+        .iter()
+        .filter_map(|b| b.as_para().cloned())
+        .map(|mut paragraph| {
+            paragraph.origin = None;
+            paragraph
+        })
+        .collect();
     let author = "Compare".to_string();
     let date = super::now_iso();
     s.doc.revisions.push(wordcraft_doc::Revision { kind: RevisionKind::Insert, author: author.clone(), date: date.clone() });
@@ -860,6 +870,21 @@ mod tests {
         assert!(r["changes"].as_u64().unwrap() >= 2);
         s.run("review.acceptAll", &json!({})).unwrap();
         assert_eq!(s.doc.plain_text(StoryRef::Body), "The dog sat.\nKeep this.\nNew line here.");
+    }
+
+    // embed: an origin names a position in this document's own package; a paragraph brought in
+    // from another file must not claim one.
+    #[test]
+    fn compare_with_a_file_brings_in_no_origins() {
+        let read_back = |text: &str| wordcraft_docx::read(&wordcraft_docx::write(&Document::from_text(text)).unwrap()).unwrap();
+        let mut s = Session::new(read_back("Keep this."));
+        let revised = std::env::temp_dir().join(format!("compare-origins-{}.docx", std::process::id()));
+        std::fs::write(&revised, wordcraft_docx::write(&Document::from_text("Keep this.\nAdded here.")).unwrap()).unwrap();
+        let result = s.run("review.compare", &json!({"path": revised.to_string_lossy()}));
+        let _ = std::fs::remove_file(&revised);
+        result.unwrap();
+        let origins: Vec<_> = s.doc.body.iter().filter_map(|b| b.as_para()).map(|p| (p.plain_text(), p.origin.is_some())).collect();
+        assert_eq!(origins, [("Keep this.".to_string(), true), ("Added here.".to_string(), false)]);
     }
 
     #[test]

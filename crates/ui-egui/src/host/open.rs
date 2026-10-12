@@ -19,7 +19,10 @@ pub const MAX_OPEN_BYTES: usize = 100 * 1024 * 1024;
 /// stay near 1.3 GB at worst, leaving the rest of the 4 GiB address space for layout and pages. A
 /// formatted page holds roughly a thousand elements, so real documents of a couple of thousand
 /// pages fit. Pictures make up most of a package's bytes: 64 MiB for one is generous, and 192 MiB
-/// in all leaves room beside the up-to-100 MB file itself.
+/// in all leaves room beside the up-to-100 MB file itself. The file is held twice: the host's copy
+/// while it opens, and the copy the document keeps for its lifetime so a save can keep the package
+/// (made after the decompressed parts are freed). The archive is also capped at 192 MiB on its
+/// own, which `MAX_OPEN_BYTES` already keeps it under.
 ///
 /// Elements nest at most 64 deep (the desktop allows 256). The reader recurses once per level, and a
 /// stack overflow traps the module just as a panic does. Measured in Chromium on WebAssembly's

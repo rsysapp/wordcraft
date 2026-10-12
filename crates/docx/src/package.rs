@@ -10,6 +10,7 @@ use crate::xml::{self, El};
 /// Largest single part we decompress.
 pub const MAX_PART: u64 = 256 * 1024 * 1024;
 /// Largest total of all decompressed parts.
+// embed: also the largest archive a read keeps (`SOURCE_PACKAGE`), so a read holds at most twice this.
 pub const MAX_TOTAL: u64 = 512 * 1024 * 1024;
 /// Most zip entries we look at.
 pub const MAX_ENTRIES: usize = 20_000;
@@ -46,7 +47,9 @@ pub fn rel_is(t: &str, full: &str) -> bool {
 pub struct ReadLimits {
     /// Largest single part decompressed, in bytes.
     pub max_part_bytes: u64,
-    /// Largest total of all decompressed parts, in bytes.
+    /// Largest total of all decompressed parts, in bytes. embed: also the largest archive a read
+    /// accepts, since the document keeps the archive's bytes (`SOURCE_PACKAGE`) for its lifetime;
+    /// the archive is capped on its own, so a read holds at most twice this.
     pub max_total_bytes: u64,
     /// Most XML elements parsed across every part of the package (each part also stays within the
     /// parser's own per-part limit). Every parse counts, so a part read twice counts twice.
@@ -141,8 +144,6 @@ impl Package {
     }
 
     /// embed: the part name at `index` (see [`Package::part_index`]).
-    // embed: read by the preserving writer, which keeps the source package's parts.
-    #[allow(dead_code)]
     pub fn part_name(&self, index: u32) -> Option<&str> {
         self.files.keys().nth(usize::try_from(index).ok()?).map(String::as_str)
     }
@@ -259,8 +260,7 @@ pub fn zip_entries(entries: &[(String, Vec<u8>)]) -> Result<Vec<u8>, DocxError> 
 
 /// embed: the archive's file names in the order they are stored (folders left out, each name
 /// once), so a writer that keeps the package keeps its order too.
-// embed: read by the preserving writer, which keeps the source package's parts.
-#[allow(dead_code)]
+#[cfg_attr(not(test), expect(dead_code, reason = "embed: read by the preserving writer, which keeps the source package's order"))]
 pub fn entry_order(bytes: &[u8]) -> Result<Vec<String>, DocxError> {
     let zip = zip::ZipArchive::new(Cursor::new(bytes)).map_err(|e| DocxError::Zip(e.to_string()))?;
     let mut seen = std::collections::HashSet::new();

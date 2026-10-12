@@ -130,6 +130,8 @@ impl Reader<'_> {
                         let lines = first.props.drop_cap;
                         let mut props = p.props.clone();
                         first.append(p);
+                        // embed: two `w:p` elements made one paragraph, which neither origin names.
+                        first.origin = None;
                         props.drop_cap = lines;
                         first.props = props;
                         out.push(para_block(first));

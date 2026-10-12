@@ -37,14 +37,14 @@ pub(crate) struct Reader<'p> {
     pub comments_ended: HashSet<u32>,
     pub bookmarks: HashMap<String, String>,
     /// embed: the origins of the `w:p` elements of each story part being read, innermost last (a
-    /// header is read while the main part is). See `begin_part`.
+    /// header is read while the paragraph whose section names it is). See `with_part`.
     origins: Vec<Option<PartOrigins>>,
 }
 
 /// embed: where each `w:p` element of one story part's tree sits: the part's index (see
 /// `Package::part_index`) and, by the element's address, its position among the part's `w:p`
 /// elements in document order. An address means something only while that tree is alive, so the
-/// entry lives exactly as long as the part's reading (`begin_part` to `end_part`), and a lookup
+/// entry lives exactly as long as the part's reading (`with_part`), and a lookup
 /// asks only the part being read: an element of one part can never take another part's origin,
 /// nor one a dropped tree left at the same address.
 struct PartOrigins {
@@ -77,26 +77,8 @@ pub fn read_with_limits(bytes: &[u8], limits: &ReadLimits) -> Result<Document, D
         return Err(DocxError::NotWord(format!("root element is {}", root.name)));
     }
     let rels = pkg.rels(&main);
-    let mut doc = Document::new();
-    doc.body.clear();
-    let mut r = Reader {
-        pkg: &pkg,
-        doc,
-        pc: PropCtx::default(),
-        revs: HashMap::new(),
-        media_by_path: HashMap::new(),
-        hf_by_path: HashMap::new(),
-        footnotes: HashMap::new(),
-        endnotes: HashMap::new(),
-        comment_map: HashMap::new(),
-        comments_ended: HashSet::new(),
-        bookmarks: HashMap::new(),
-        // embed: paragraph origins, filled part by part.
-        origins: Vec::new(),
-    };
-    // embed: the main part's paragraphs, and the text boxes inside it, know where they came from.
-    // Its tree lives for the whole read, so it stays the outermost part read.
-    r.begin_part(&root, &main);
+    // embed: the reader's starting state is shared with the reader's unit tests.
+    let mut r = Reader::new(&pkg);
     r.pc.major_font = r.doc.settings.major_font.clone();
     r.pc.minor_font = r.doc.settings.minor_font.clone();
     let part = |t: &str| rels.by_type(t).filter(|x| !x.external).map(|x| x.target.clone());
@@ -134,14 +116,17 @@ pub fn read_with_limits(bytes: &[u8], limits: &ReadLimits) -> Result<Document, D
         r.doc.settings.page_color = Some(bg);
     }
     if let Some(body) = root.child("w:body") {
-        let mut sc = StoryCtx::default();
-        let mut blocks = Blocks::new();
-        r.read_blocks(&mut sc, body, &rels, &mut blocks, 0);
-        r.flush_pending(&mut sc, &mut blocks);
-        r.doc.body = blocks;
-        if let Some(s) = body.child("w:sectPr") {
-            r.doc.last_section = r.read_section(s, &rels);
-        }
+        // embed: the main part's paragraphs, and the text boxes inside it, know where they came from.
+        r.with_part(&root, &main, |r| {
+            let mut sc = StoryCtx::default();
+            let mut blocks = Blocks::new();
+            r.read_blocks(&mut sc, body, &rels, &mut blocks, 0);
+            r.flush_pending(&mut sc, &mut blocks);
+            r.doc.body = blocks;
+            if let Some(s) = body.child("w:sectPr") {
+                r.doc.last_section = r.read_section(s, &rels);
+            }
+        });
     }
 
     let core = root_rels.by_type(rt::CORE).map(|x| x.target.clone()).unwrap_or_else(|| "docProps/core.xml".into());
@@ -155,9 +140,14 @@ pub fn read_with_limits(bytes: &[u8], limits: &ReadLimits) -> Result<Document, D
     if pkg.limit_reached() {
         return Err(DocxError::Limit("a part is past the read limits (elements or nesting)".into()));
     }
-    // embed: the source package, for a writer that keeps whatever the model does not hold.
-    r.doc.passthrough.insert(crate::preserve::SOURCE_PACKAGE.into(), Arc::new(bytes.to_vec()));
-    let mut doc = r.doc;
+    // embed: the source package, for a writer that keeps whatever the model does not hold. The
+    // decompressed parts and the main tree are freed first, so the copy reuses their memory rather
+    // than adding to the read's peak.
+    let mut doc = std::mem::take(&mut r.doc);
+    drop(r);
+    drop(root);
+    drop(pkg);
+    doc.passthrough.insert(crate::preserve::SOURCE_PACKAGE.into(), Arc::new(bytes.to_vec()));
     doc.ensure_nonempty();
     Ok(doc)
 }
@@ -201,15 +191,39 @@ pub(crate) fn ui_style_name(n: &str) -> String {
     n.to_string()
 }
 
+impl<'p> Reader<'p> {
+    /// embed: a reader of `pkg` with an empty document.
+    fn new(pkg: &'p Package) -> Self {
+        let mut doc = Document::new();
+        doc.body.clear();
+        Reader {
+            pkg,
+            doc,
+            pc: PropCtx::default(),
+            revs: HashMap::new(),
+            media_by_path: HashMap::new(),
+            hf_by_path: HashMap::new(),
+            footnotes: HashMap::new(),
+            endnotes: HashMap::new(),
+            comment_map: HashMap::new(),
+            comments_ended: HashSet::new(),
+            bookmarks: HashMap::new(),
+            // embed: paragraph origins, filled part by part.
+            origins: Vec::new(),
+        }
+    }
+}
+
 impl Reader<'_> {
     fn xml(&self, path: &str) -> Result<Option<El>, DocxError> {
         self.pkg.xml(path)
     }
 
-    /// embed: start reading the story part `path`, whose tree is `root`: number its `w:p` elements
-    /// in document order, so each paragraph read from it records its origin (`origin_of`). Every
-    /// call is paired with `end_part` once the part's paragraphs are read, while `root` is alive.
-    fn begin_part(&mut self, root: &El, path: &str) {
+    /// embed: run `read` on the story part `path`, whose tree is `root`, with that part's `w:p`
+    /// elements numbered in document order, so each paragraph read from it records its origin
+    /// (`origin_of`). The numbering is dropped when `read` returns, while `root` is still alive:
+    /// its addresses mean nothing once the tree goes.
+    fn with_part<T>(&mut self, root: &El, path: &str, read: impl FnOnce(&mut Self) -> T) -> T {
         let stamped = self.pkg.part_index(path).map(|part| {
             let mut by_address = Vec::with_capacity(count_paragraphs(root, 0));
             number_paragraphs(root, &mut 0, &mut by_address, 0);
@@ -217,11 +231,9 @@ impl Reader<'_> {
             PartOrigins { part, by_address }
         });
         self.origins.push(stamped);
-    }
-
-    /// embed: the part `begin_part` started is read; its addresses mean nothing once its tree goes.
-    fn end_part(&mut self) {
+        let result = read(self);
         self.origins.pop();
+        result
     }
 
     /// embed: where the `w:p` element `e` of the part being read sits in the package.
@@ -278,6 +290,9 @@ impl Reader<'_> {
     }
 
     pub fn load_header_footer(&mut self, path: &str, footer: bool) -> Option<u32> {
+        // embed: keyed by the part's own name, however a relationship spells it, so each part is
+        // read once and no two stories share its paragraphs' origins.
+        let path = self.pkg.part_index(path).and_then(|index| self.pkg.part_name(index)).unwrap_or(path);
         if let Some(id) = self.hf_by_path.get(path) {
             return Some(*id);
         }
@@ -292,15 +307,15 @@ impl Reader<'_> {
             Ok(Some(r)) => r,
             _ => return Some(id),
         };
-        // embed: a header's paragraphs know where they came from.
-        self.begin_part(&root, path);
         let rels = self.pkg.rels(path);
-        let mut sc = StoryCtx::default();
-        let mut blocks = Blocks::new();
-        self.read_blocks(&mut sc, &root, &rels, &mut blocks, 0);
-        self.flush_pending(&mut sc, &mut blocks);
-        // embed: this part's paragraphs are read.
-        self.end_part();
+        // embed: a header's paragraphs know where they came from.
+        let blocks = self.with_part(&root, path, |reader| {
+            let mut sc = StoryCtx::default();
+            let mut blocks = Blocks::new();
+            reader.read_blocks(&mut sc, &root, &rels, &mut blocks, 0);
+            reader.flush_pending(&mut sc, &mut blocks);
+            blocks
+        });
         if let Some(p) = self.doc.parts.get_mut(&id)
             && !blocks.is_empty()
         {
@@ -558,82 +573,80 @@ impl Reader<'_> {
 
     fn read_notes(&mut self, path: &str, foot: bool) -> Result<(), DocxError> {
         let Some(root) = self.xml(path)? else { return Ok(()) };
-        // embed: a note's paragraphs know where they came from.
-        self.begin_part(&root, path);
         let rels = self.pkg.rels(path);
         let tag = if foot { "w:footnote" } else { "w:endnote" };
-        for n in root.children(tag) {
-            if n.attr("w:type").is_some_and(|t| t != "normal") {
-                continue;
+        // embed: a note's paragraphs know where they came from.
+        self.with_part(&root, path, |reader| {
+            for n in root.children(tag) {
+                if n.attr("w:type").is_some_and(|t| t != "normal") {
+                    continue;
+                }
+                let Some(fid) = n.attr("w:id").and_then(int) else { continue };
+                if reader.doc.parts.len() >= MAX_PARTS {
+                    break;
+                }
+                let mut sc = StoryCtx::default();
+                let mut blocks = Blocks::new();
+                reader.read_blocks(&mut sc, n, &rels, &mut blocks, 0);
+                reader.flush_pending(&mut sc, &mut blocks);
+                let id = reader.doc.add_part(if foot { PartKind::Footnote } else { PartKind::Endnote }, blocks);
+                if foot {
+                    reader.footnotes.insert(fid, id);
+                } else {
+                    reader.endnotes.insert(fid, id);
+                }
             }
-            let Some(fid) = n.attr("w:id").and_then(int) else { continue };
-            if self.doc.parts.len() >= MAX_PARTS {
-                break;
-            }
-            let mut sc = StoryCtx::default();
-            let mut blocks = Blocks::new();
-            self.read_blocks(&mut sc, n, &rels, &mut blocks, 0);
-            self.flush_pending(&mut sc, &mut blocks);
-            let id = self.doc.add_part(if foot { PartKind::Footnote } else { PartKind::Endnote }, blocks);
-            if foot {
-                self.footnotes.insert(fid, id);
-            } else {
-                self.endnotes.insert(fid, id);
-            }
-        }
-        // embed: this part's paragraphs are read.
-        self.end_part();
+        });
         Ok(())
     }
 
     fn read_comments(&mut self, path: &str, ext: Option<&str>) -> Result<(), DocxError> {
         let Some(root) = self.xml(path)? else { return Ok(()) };
-        // embed: a comment's paragraphs know where they came from.
-        self.begin_part(&root, path);
         let rels = self.pkg.rels(path);
         let mut by_para: HashMap<String, u32> = HashMap::new();
         let mut next_id = 0u32;
         let mut entries: BTreeMap<u32, Comment> = BTreeMap::new();
-        for c in root.children("w:comment") {
-            if self.doc.parts.len() >= MAX_PARTS {
-                break;
-            }
-            let file_id = c.attr("w:id").unwrap_or("").to_string();
-            if self.comment_map.contains_key(&file_id) {
-                continue;
-            }
-            let id = match file_id.parse::<u32>() {
-                Ok(v) if !entries.contains_key(&v) => v,
-                _ => {
-                    while entries.contains_key(&next_id) || self.comment_map.values().any(|v| *v == next_id) {
-                        next_id += 1;
-                    }
-                    next_id
+        // embed: a comment's paragraphs know where they came from.
+        self.with_part(&root, path, |reader| {
+            for c in root.children("w:comment") {
+                if reader.doc.parts.len() >= MAX_PARTS {
+                    break;
                 }
-            };
-            let mut sc = StoryCtx::default();
-            let mut blocks = Blocks::new();
-            self.read_blocks(&mut sc, c, &rels, &mut blocks, 0);
-            self.flush_pending(&mut sc, &mut blocks);
-            let part = self.doc.add_part(PartKind::Comment, blocks);
-            if let Some(pid) = c.children("w:p").last().and_then(|p| p.attr("w14:paraId")) {
-                by_para.insert(pid.to_string(), id);
+                let file_id = c.attr("w:id").unwrap_or("").to_string();
+                if reader.comment_map.contains_key(&file_id) {
+                    continue;
+                }
+                let id = match file_id.parse::<u32>() {
+                    Ok(v) if !entries.contains_key(&v) => v,
+                    _ => {
+                        while entries.contains_key(&next_id) || reader.comment_map.values().any(|v| *v == next_id) {
+                            next_id += 1;
+                        }
+                        next_id
+                    }
+                };
+                let mut sc = StoryCtx::default();
+                let mut blocks = Blocks::new();
+                reader.read_blocks(&mut sc, c, &rels, &mut blocks, 0);
+                reader.flush_pending(&mut sc, &mut blocks);
+                let part = reader.doc.add_part(PartKind::Comment, blocks);
+                if let Some(pid) = c.children("w:p").last().and_then(|p| p.attr("w14:paraId")) {
+                    by_para.insert(pid.to_string(), id);
+                }
+                entries.insert(
+                    id,
+                    Comment {
+                        author: c.attr("w:author").unwrap_or("").to_string(),
+                        initials: c.attr("w:initials").unwrap_or("").to_string(),
+                        date: c.attr("w:date").unwrap_or("").to_string(),
+                        parent: None,
+                        resolved: false,
+                        part,
+                    },
+                );
+                reader.comment_map.insert(file_id, id);
             }
-            entries.insert(
-                id,
-                Comment {
-                    author: c.attr("w:author").unwrap_or("").to_string(),
-                    initials: c.attr("w:initials").unwrap_or("").to_string(),
-                    date: c.attr("w:date").unwrap_or("").to_string(),
-                    parent: None,
-                    resolved: false,
-                    part,
-                },
-            );
-            self.comment_map.insert(file_id, id);
-        }
-        // embed: this part's paragraphs are read.
-        self.end_part();
+        });
         if let Some(ext) = ext
             && let Ok(Some(x)) = self.xml(ext)
         {
@@ -677,7 +690,7 @@ fn default_level(i: usize) -> Level {
     Level { indent: 36.0 * (i as f32 + 1.0), text: String::new(), ..Level::default() }
 }
 
-/// embed: how many `w:p` elements `el` holds, so `begin_part` reserves its list exactly.
+/// embed: how many `w:p` elements `el` holds, so `with_part` reserves its list exactly.
 fn count_paragraphs(el: &El, depth: usize) -> usize {
     if depth > crate::xml::MAX_DEPTH {
         return 0;
@@ -685,7 +698,7 @@ fn count_paragraphs(el: &El, depth: usize) -> usize {
     el.els().fold(0usize, |count, child| count.saturating_add(usize::from(child.name == "w:p")).saturating_add(count_paragraphs(child, depth + 1)))
 }
 
-/// embed: `begin_part`'s walk, pre-order: a paragraph before the paragraphs of text boxes inside it,
+/// embed: `with_part`'s walk, pre-order: a paragraph before the paragraphs of text boxes inside it,
 /// every alternative-content branch included, so the numbering does not depend on which branch the
 /// reader takes.
 fn number_paragraphs(el: &El, next: &mut u32, by_address: &mut Vec<(usize, u32)>, depth: usize) {
@@ -698,5 +711,34 @@ fn number_paragraphs(el: &El, next: &mut u32, by_address: &mut Vec<(usize, u32)>
             *next = next.saturating_add(1);
         }
         number_paragraphs(child, next, by_address, depth + 1);
+    }
+}
+
+// embed: the origin numbering's scoping.
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::package::zip_entries;
+
+    const HEADER: &str = r#"<w:hdr xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:p/></w:hdr>"#;
+
+    /// A part's numbering is asked only while that part is read, and only by the innermost part.
+    #[test]
+    fn origins_are_scoped_to_the_part_being_read() {
+        let package = zip_entries(&[("a.xml".to_string(), HEADER.as_bytes().to_vec()), ("b.xml".to_string(), HEADER.as_bytes().to_vec())]).unwrap();
+        let pkg = Package::open(&package).unwrap();
+        let (a, b) = (pkg.xml("a.xml").unwrap().unwrap(), pkg.xml("b.xml").unwrap().unwrap());
+        let (a_p, b_p) = (a.child("w:p").unwrap(), b.child("w:p").unwrap());
+        let (in_a, in_b) = (Some(Origin { part: 0, index: 0 }), Some(Origin { part: 1, index: 0 }));
+        let mut reader = Reader::new(&pkg);
+        assert_eq!(reader.origin_of(a_p), None, "nothing is being read");
+        assert_eq!(reader.with_part(&a, "a.xml", |reader| reader.origin_of(a_p)), in_a);
+        assert_eq!(reader.origin_of(a_p), None, "the part's reading has ended");
+        reader.with_part(&a, "a.xml", |reader| {
+            let inner = reader.with_part(&b, "b.xml", |reader| (reader.origin_of(b_p), reader.origin_of(a_p)));
+            assert_eq!(inner, (in_b, None), "only the innermost part is asked");
+            assert_eq!((reader.origin_of(a_p), reader.origin_of(b_p)), (in_a, None), "the outer part again");
+        });
+        assert!(reader.origins.is_empty());
     }
 }

@@ -7,7 +7,7 @@ use std::io::Write;
 use wordcraft_doc::{Document, Origin, PartKind, StoryRef};
 use wordcraft_docx::{DocxError, ReadLimits, SOURCE_PACKAGE, read, read_with_limits};
 
-const W: &str = r#"xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships" xmlns:wp="http://schemas.openxmlformats.org/drawingml/2006/wordprocessingDrawing" xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main" xmlns:wps="http://schemas.microsoft.com/office/word/2010/wordprocessingShape""#;
+const W: &str = r#"xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships" xmlns:wp="http://schemas.openxmlformats.org/drawingml/2006/wordprocessingDrawing" xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main" xmlns:wps="http://schemas.microsoft.com/office/word/2010/wordprocessingShape" xmlns:mc="http://schemas.openxmlformats.org/markup-compatibility/2006""#;
 const REL: &str = "http://schemas.openxmlformats.org/officeDocument/2006/relationships";
 const CONTENT_TYPES: &str = r#"<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"/>"#;
 
@@ -185,4 +185,135 @@ fn refuses_to_keep_an_archive_past_the_total_limit() {
     assert!(matches!(read_with_limits(&bytes, &limits(parts)), Err(DocxError::Limit(_))));
     let doc = read_with_limits(&bytes, &limits(bytes.len() as u64)).unwrap();
     assert_eq!(doc.passthrough.get(SOURCE_PACKAGE).map(|kept| kept.len()), Some(bytes.len()));
+}
+
+/// A text box shape holding `paragraphs`, as a `w:drawing` a run carries.
+fn drawing(paragraphs: &str) -> String {
+    format!(
+        r#"<w:drawing><wp:inline><wp:extent cx="914400" cy="914400"/><wp:docPr id="1" name="Box"/><a:graphic><a:graphicData uri="http://schemas.microsoft.com/office/word/2010/wordprocessingShape"><wps:wsp><wps:txbx><w:txbxContent>{paragraphs}</w:txbxContent></wps:txbx></wps:wsp></a:graphicData></a:graphic></wp:inline></w:drawing>"#
+    )
+}
+
+/// A package of `word/document.xml` with `body`, and `extra` parts the document's relationships
+/// (`rels`, inner XML) point at.
+fn package(body: &str, rels: &str, extra: &[(&'static str, String)]) -> (Vec<u8>, Vec<&'static str>) {
+    package_with(body, rels, extra, zip::write::SimpleFileOptions::default())
+}
+
+fn package_with(body: &str, rels: &str, extra: &[(&'static str, String)], options: zip::write::SimpleFileOptions) -> (Vec<u8>, Vec<&'static str>) {
+    let mut entries = vec![
+        ("[Content_Types].xml", CONTENT_TYPES.to_string()),
+        ("_rels/.rels", root_rels()),
+        (
+            "word/_rels/document.xml.rels",
+            format!(r#"<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">{rels}</Relationships>"#),
+        ),
+        ("word/document.xml", format!(r#"<w:document {W}><w:body>{body}</w:body></w:document>"#)),
+    ];
+    entries.extend(extra.iter().cloned());
+    let names = entries.iter().map(|(name, _)| *name).collect();
+    (zip_with(&entries, options), names)
+}
+
+/// A drop cap merges into the paragraph it starts. The merged paragraph is neither `w:p` alone, so
+/// it has no origin: with an empty paragraph after the letter, its text would equal the frame's,
+/// and an edit could otherwise be written into the drop-cap frame.
+#[test]
+fn a_merged_drop_cap_has_no_origin() {
+    let frame = r#"<w:p><w:pPr><w:framePr w:dropCap="drop" w:lines="3"/></w:pPr><w:r><w:t>A</w:t></w:r></w:p>"#;
+    let (bytes, _) = package(&format!("{frame}<w:p/>"), "", &[]);
+    let doc = read(&bytes).unwrap();
+    let paragraphs: Vec<_> = doc.body.iter().filter_map(|block| block.as_para()).collect();
+    assert_eq!(paragraphs.len(), 1, "the drop cap merges into the empty paragraph");
+    assert_eq!((paragraphs[0].plain_text(), paragraphs[0].origin), ("A".to_string(), None));
+}
+
+/// Run-level alternative content: the reader takes the Fallback when it does not understand the
+/// Choice, but the numbering counts the Choice's paragraphs first.
+#[test]
+fn a_fallback_paragraph_is_numbered_after_the_choice() {
+    let content = format!(
+        r#"<w:p><w:r><mc:AlternateContent><mc:Choice Requires="x99">{}</mc:Choice><mc:Fallback>{}</mc:Fallback></mc:AlternateContent></w:r></w:p>"#,
+        drawing(&format!("{}{}", para("Choice one"), para("Choice two"))),
+        drawing(&para("From the fallback"))
+    );
+    let (bytes, names) = package(&content, "", &[]);
+    let doc = read(&bytes).unwrap();
+    let story = story_of(&doc, "From the fallback");
+    assert_eq!(origin_of(&doc, story, "From the fallback"), Some(Origin { part: part(&names, "word/document.xml"), index: 3 }));
+}
+
+#[test]
+fn numbers_nested_cells_controls_comments_and_endnotes() {
+    let body = format!(
+        r#"{}<w:tbl><w:tr><w:tc>{}<w:tbl><w:tr><w:tc>{}</w:tc></w:tr></w:tbl><w:p/></w:tc></w:tr></w:tbl><w:sdt><w:sdtPr/><w:sdtContent>{}</w:sdtContent></w:sdt>{}"#,
+        para("Start"),
+        para("Outer cell"),
+        para("Inner cell"),
+        para("In a control"),
+        para("End")
+    );
+    let rels = format!(
+        r#"<Relationship Id="rId1" Type="{REL}/comments" Target="comments.xml"/><Relationship Id="rId2" Type="{REL}/endnotes" Target="endnotes.xml"/>"#
+    );
+    let comments = format!(
+        r#"<w:comments {W}><w:comment w:id="0" w:author="A">{}{}</w:comment><w:comment w:id="1" w:author="B">{}</w:comment></w:comments>"#,
+        para("First comment"),
+        para("First comment, more"),
+        para("Second comment")
+    );
+    let endnotes = format!(
+        r#"<w:endnotes {W}><w:endnote w:type="separator" w:id="-1"><w:p><w:r><w:separator/></w:r></w:p></w:endnote><w:endnote w:type="continuationSeparator" w:id="0"><w:p><w:r><w:continuationSeparator/></w:r></w:p></w:endnote><w:endnote w:id="1">{}</w:endnote></w:endnotes>"#,
+        para("An endnote")
+    );
+    let (bytes, names) = package(&body, &rels, &[("word/comments.xml", comments), ("word/endnotes.xml", endnotes)]);
+    let doc = read(&bytes).unwrap();
+    let document = part(&names, "word/document.xml");
+    for (text, index) in [("Start", 0), ("Outer cell", 1), ("Inner cell", 2), ("In a control", 4), ("End", 5)] {
+        assert_eq!(origin_of(&doc, story_of(&doc, text), text), Some(Origin { part: document, index }), "{text}");
+    }
+    let comments = part(&names, "word/comments.xml");
+    assert_eq!(origin_of(&doc, story_of(&doc, "Second comment"), "Second comment"), Some(Origin { part: comments, index: 2 }));
+    assert_eq!(origin_of(&doc, story_of(&doc, "An endnote"), "An endnote"), Some(Origin { part: part(&names, "word/endnotes.xml"), index: 2 }));
+}
+
+/// Two relationships whose targets differ only in case reach one part: it is read once, so no two
+/// stories share its paragraphs' origins.
+#[test]
+fn a_part_reached_under_two_spellings_is_read_once() {
+    let body = format!(
+        r#"<w:p><w:pPr><w:sectPr><w:headerReference w:type="default" r:id="rId1"/></w:sectPr></w:pPr></w:p>{}<w:sectPr><w:headerReference w:type="default" r:id="rId2"/></w:sectPr>"#,
+        para("Body")
+    );
+    let rels = format!(
+        r#"<Relationship Id="rId1" Type="{REL}/header" Target="header1.xml"/><Relationship Id="rId2" Type="{REL}/header" Target="HEADER1.xml"/>"#
+    );
+    let (bytes, _) = package(&body, &rels, &[("word/header1.xml", format!(r#"<w:hdr {W}>{}</w:hdr>"#, para("The header")))]);
+    let doc = read(&bytes).unwrap();
+    assert_eq!(doc.parts.values().filter(|p| p.kind == PartKind::Header).count(), 1);
+}
+
+/// Printing a read document names the kept archive's length, never its bytes.
+#[test]
+fn debug_output_of_a_read_document_stays_short() {
+    let padding = "x".repeat(1 << 20);
+    // Stored, so the archive itself is over a megabyte.
+    let stored = zip::write::SimpleFileOptions::default().compression_method(zip::CompressionMethod::Stored);
+    let (bytes, _) = package_with(&para("Short"), "", &[("customXml/item1.xml", padding)], stored);
+    let doc = read(&bytes).unwrap();
+    let printed = format!("{doc:?}");
+    assert!(printed.len() < 100_000, "{} characters", printed.len());
+    assert!(printed.contains(&bytes.len().to_string()), "the length is shown");
+}
+
+/// The kept archive compares equal between clones and between reads of equal bytes, and unequal
+/// once its bytes differ.
+#[test]
+fn documents_compare_by_their_kept_archive() {
+    let (bytes, _) = package(&para("Same"), "", &[]);
+    let (other, _) = package(&para("Same"), "", &[("customXml/item1.xml", "<x/>".into())]);
+    let doc = read(&bytes).unwrap();
+    assert_eq!(doc.clone(), doc);
+    assert_eq!(read(&bytes).unwrap(), doc);
+    assert_ne!(read(&other).unwrap(), doc);
 }

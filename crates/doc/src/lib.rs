@@ -13,6 +13,8 @@
 pub mod edit;
 pub mod numbering;
 pub mod para;
+// embed: kept parts that never print their bytes.
+pub mod passthrough;
 pub mod props;
 pub mod resolve;
 pub mod section;
@@ -27,6 +29,8 @@ use serde::{Deserialize, Serialize};
 pub use numbering::{ListKind, Numbering};
 // embed: Origin, for a writer that keeps the source package.
 pub use para::{InlineObject, Origin, Paragraph, Run};
+// embed: the kept parts' map.
+pub use passthrough::Passthrough;
 pub use props::{Align, CharProps, ParaProps, Rgb, TextColor};
 pub use section::SectionProps;
 pub use styles::{Style, StyleKind, StyleSheet};
@@ -329,8 +333,10 @@ pub struct Document {
     #[serde(skip)]
     pub media: BTreeMap<String, Arc<Vec<u8>>>,
     /// Source-format parts we keep verbatim for round-trip (e.g. custom XML), by part name.
+    // embed: a map that prints lengths and compares shared bytes without reading them, since a
+    // document read from a package keeps the whole package here.
     #[serde(skip)]
-    pub passthrough: BTreeMap<String, Arc<Vec<u8>>>,
+    pub passthrough: Passthrough,
 }
 
 impl Default for Document {
@@ -354,7 +360,8 @@ impl Document {
             core: CoreProps::default(),
             sources: Vec::new(),
             media: BTreeMap::new(),
-            passthrough: BTreeMap::new(),
+            // embed: see the field.
+            passthrough: Passthrough::new(),
         }
     }
 
