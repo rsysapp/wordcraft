@@ -2940,8 +2940,10 @@ mod tests {
             let comments = format!(r#"<w:comments {W}><w:comment w:id="1">{}</w:comment><w:comment w:id="0">{}</w:comment></w:comments>"#, second.concat(), comment.concat());
             let header = format!(r#"<w:hdr {W}>{}</w:hdr>"#, header.concat());
             let second_header = format!(r#"<w:hdr {W}>{}</w:hdr>"#, second.concat());
-            // Ends with a paragraph, so that some paragraph has an origin whatever was generated.
-            let body = format!(r#"{}<w:p><w:r><w:t>end</w:t></w:r></w:p><w:sectPr><w:headerReference w:type="default" r:id="rId4"/></w:sectPr>"#, body.concat());
+            // Ends with two paragraphs, so that some paragraph has an origin whatever was generated:
+            // a drop cap generated last merges with the first (which then has none, 6C-32), and
+            // with the next while what it holds is short, so the first is long.
+            let body = format!(r#"{}<w:p><w:r><w:t>the paragraph that ends the body</w:t></w:r></w:p><w:p><w:r><w:t>last</w:t></w:r></w:p><w:sectPr><w:headerReference w:type="default" r:id="rId4"/></w:sectPr>"#, body.concat());
             let document = written_as(&format!(r#"<w:document {W}><w:body>{body}</w:body></w:document>"#), form);
             // Notes and comments name their own headers through their own relationships.
             let own_header = |target: &str| format!(r#"<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId4" Type="{REL}/header" Target="{target}"/><Relationship Id="rId9" Type="{REL}/image" Target="media/image1.png"/></Relationships>"#).into_bytes();

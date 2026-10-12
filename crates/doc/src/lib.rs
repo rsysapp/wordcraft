@@ -196,12 +196,28 @@ pub enum RevisionKind {
     Format,
 }
 
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize, Default)]
+// embed: `PartialEq` by hand, without `read` (see below).
+#[derive(Clone, Debug, Serialize, Deserialize, Default)]
 #[serde(default)]
 pub struct Revision {
     pub kind: RevisionKind,
     pub author: String,
     pub date: String,
+    /// embed: read from the file the document was opened from. A watermark, as an edit session's
+    /// floor is: every record made since (by an edit session, or by any edit after the records were
+    /// cleared) has `false`, so a save that keeps the file tells its own tracked changes from the
+    /// file's by the record, never by its position or by its name and date. Not serialised: a
+    /// document from elsewhere holds no record of this read.
+    #[serde(skip)]
+    pub read: bool,
+}
+
+// embed: a record equals another that records the same change; where it was read from is not part
+// of it, as `Paragraph::origin` is not part of a paragraph.
+impl PartialEq for Revision {
+    fn eq(&self, other: &Self) -> bool {
+        self.kind == other.kind && self.author == other.author && self.date == other.date
+    }
 }
 
 /// A bibliography source.

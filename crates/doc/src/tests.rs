@@ -74,3 +74,16 @@ fn ensure_nonempty_repairs() {
     d.ensure_nonempty();
     assert!(matches!(d.body.last().map(|b| &**b), Some(Block::Para(_))));
 }
+
+// embed: a record's watermark says where it came from, not what it records.
+#[test]
+fn a_records_watermark_is_not_part_of_equality_or_of_the_serialised_record() {
+    let made = Revision { kind: RevisionKind::Insert, author: "Ana".into(), date: "2026-10-01T09:00:00Z".into(), read: false };
+    let read = Revision { read: true, ..made.clone() };
+    assert_eq!(read, made);
+    assert_ne!(Revision { author: "Sari".into(), ..read.clone() }, made);
+    let json = serde_json::to_string(&read).unwrap();
+    assert!(!json.contains("read"));
+    assert!(!serde_json::from_str::<Revision>(&json).unwrap().read);
+    assert!(!Revision::default().read);
+}

@@ -451,8 +451,8 @@ fn notes_round_trip() {
 #[test]
 fn tracked_changes_round_trip() {
     let mut d = Document::new();
-    d.revisions.push(Revision { kind: RevisionKind::Insert, author: "Alice".into(), date: "2026-05-01T10:00:00Z".into() });
-    d.revisions.push(Revision { kind: RevisionKind::Delete, author: "Bob".into(), date: "2026-05-02T10:00:00Z".into() });
+    d.revisions.push(Revision { kind: RevisionKind::Insert, author: "Alice".into(), date: "2026-05-01T10:00:00Z".into(), read: false });
+    d.revisions.push(Revision { kind: RevisionKind::Delete, author: "Bob".into(), date: "2026-05-02T10:00:00Z".into(), read: false });
     d.settings.track_changes = true;
     let ins = CharProps { ins: Some(0), ..Default::default() };
     let del = CharProps { del: Some(1), bold: Some(true), ..Default::default() };
@@ -589,7 +589,7 @@ fn kitchen_sink() -> Document {
     let f = d.add_part(PartKind::Footnote, vec![para_block(Paragraph::with_text("Note", CharProps::default()))]);
     let c = d.add_part(PartKind::Comment, vec![para_block(Paragraph::with_text("Comment", CharProps::default()))]);
     d.comments.insert(3, Comment { author: "X".into(), part: c, ..Default::default() });
-    d.revisions.push(Revision { kind: RevisionKind::Insert, author: "A".into(), date: String::new() });
+    d.revisions.push(Revision { kind: RevisionKind::Insert, author: "A".into(), date: String::new(), read: false });
     d.last_section.headers.default = Some(h);
     let mut blocks: Blocks = Vec::new();
     let mut p = para_runs(&[

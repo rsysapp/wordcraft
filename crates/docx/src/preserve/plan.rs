@@ -6,16 +6,21 @@
 //! paragraph marks taken out, what is left must be the source paragraph, character for character,
 //! except where a tracked change of the source was decided.
 //!
-//! Two diffs (the inspector's bounded Myers) find that. The first compares characters with their
-//! formatting, object and tracked changes, a deletion made in this session left out. The second runs
-//! on each stretch the first could not match and compares characters alone: what it matches there
-//! is a decision (an insertion accepted, a deletion rejected) or this session's deletion of deleted
-//! text; a source character it leaves out went with its decided change (an insertion rejected, a
-//! deletion accepted). Anything else changed without a tracked change, and is refused.
+//! A diff (the inspector's bounded Myers) finds that. It pairs a source character with an edited one
+//! when they are the same character, formatting and object and the edited one's tracked changes are
+//! the source's, decided (an insertion accepted, a deletion rejected) or followed by this session's
+//! deletion; a decision is no difference, so a long accepted insertion costs no more than an
+//! unchanged paragraph. A source character left out went with its decided change (an insertion
+//! rejected, a deletion accepted). Where several pairings are as short, the diff's suffix-first
+//! rule chooses (an accepted insertion beside a rejected deletion of the same letters); the text and
+//! tracked changes written are the same either way. Where its choice leaves out a character that
+//! cannot go (a plain one beside an equal decided one), the pairs around it are paired again
+//! (`realign`). On each stretch it could not pair on either side, a second diff on characters alone
+//! tells an altered tracked change from text changed without one; both are refused.
 //!
-//! This session's revisions are the records made after the read: an index at or past the source's
-//! record count, once the records before it are the source's own (F21). A record in the session's
-//! name and date read from the file stays the file's.
+//! This session's revisions are the records not read from the file (`Revision::read`, a watermark
+//! on each record, 6C-45); a record read from the file is the file's by what it records (kind,
+//! author, date), wherever it stands, and never the session's even in its name and date.
 //!
 //! Everything the planner holds is charged to the save's budget before it is allocated; what it
 //! gives back (the steps) stays charged, [`held_by`] says how much.
@@ -24,11 +29,11 @@ use std::collections::HashMap;
 use std::hash::{DefaultHasher, Hash, Hasher};
 
 use wordcraft_doc::para::OBJ;
-use wordcraft_doc::{CharProps, Document, InlineObject, Paragraph};
+use wordcraft_doc::{CharProps, Document, InlineObject, Paragraph, RevisionKind};
 
 use super::Unpreservable;
 use crate::inspect::MAX_CHANGES;
-use crate::inspect::budget::{Budget, table_room, table_slot, units, vector_room, vector_slot};
+use crate::inspect::budget::{Budget, table_room, table_sized, table_slot, units, vector_room, vector_slot};
 use crate::inspect::diff::{self, script, script_bytes};
 
 /// A tracked change's identity, as the inspector knows it.
@@ -48,6 +53,12 @@ pub(crate) enum Change {
     Rejected,
     /// Deleted in this session.
     Deleted(Revision),
+    /// Another author's insertion accepted, then deleted in this session (6C-43): the `w:ins` around
+    /// it goes and the session's `w:del` wraps it.
+    AcceptedThenDeleted(Revision),
+    /// Another author's deletion rejected, then deleted again in this session (6C-44): the deletion
+    /// is the session's, so the source's `w:del` gives way to the session's.
+    RejectedThenDeleted(Revision),
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -75,8 +86,7 @@ pub(crate) fn plan(
     after: &Document,
     budget: &mut Budget,
 ) -> Result<Vec<Step>, Unpreservable> {
-    let mut planner =
-        Planner { before, after, prefix: None, formats: Formats::default(), objects: Objects::default(), ledger: Ledger { budget, held: 0 } };
+    let mut planner = Planner::new(before, after, budget);
     let result = planner.plan(original, edited);
     let Planner { formats, objects, mut ledger, .. } = planner;
     drop((formats, objects));
@@ -116,7 +126,8 @@ const fn size<T>() -> u64 {
     std::mem::size_of::<T>() as u64
 }
 
-/// A tracked change on a character: the index of its record in its document's revisions.
+/// A tracked change on a character: a source record by its index in `before` (the first one that
+/// records the same change), or this session's record `i` of `after` as `before`'s count + `i`.
 type Record = Option<u32>;
 
 /// Bytes of a string or a formatting compared or hashed per unit of work.
@@ -153,9 +164,11 @@ enum Decided {
     Accepted,
     Rejected,
     Deleted(u32),
+    AcceptedThenDeleted(u32),
+    RejectedThenDeleted(u32),
 }
 
-/// Which records are this session's: those past the source's records.
+/// Which records are this session's: those numbered past the source's records.
 #[derive(Clone, Copy)]
 struct Era {
     source: usize,
@@ -221,10 +234,16 @@ fn props_heap(props: &CharProps) -> u64 {
     [&props.style, &props.font, &props.lang, &props.link].into_iter().flatten().fold(0u64, |total, text| total.saturating_add(units(text.capacity())))
 }
 
-/// A hash of the formatting's fields that are not numbers (equal formats hash alike; numbers are
-/// compared when hashes meet).
+/// A number's bits for a hash, 0.0 and -0.0 alike (they are equal formats).
+fn bits(number: Option<f32>) -> Option<u32> {
+    number.map(|number| if number == 0.0 { 0 } else { number.to_bits() })
+}
+
+/// A hash of the formatting (equal formats hash alike, so formats differing in a size or a spacing
+/// do not meet in one chain).
 fn format_hash(props: &CharProps) -> u64 {
     let mut hasher = DefaultHasher::new();
+    (bits(props.size), bits(props.spacing), bits(props.scale), bits(props.position), bits(props.kern)).hash(&mut hasher);
     (&props.style, &props.font, props.bold, props.italic, props.underline, props.underline_color, props.strike, props.double_strike)
         .hash(&mut hasher);
     (props.color, props.highlight, props.shading, props.vert_align, props.caps, props.small_caps, props.hidden).hash(&mut hasher);
@@ -270,56 +289,98 @@ enum Side {
     Edited,
 }
 
+/// The file's records: each one's first index in `before` by what it records.
+struct Sources<'a> {
+    by_record: HashMap<(RevisionKind, &'a str, &'a str), u32>,
+    /// For each record of `before`, the first index recording the same change.
+    first: Vec<u32>,
+}
+
+/// Text typed in this session, waiting for its place among the decided removals around it.
+struct Typed {
+    text: String,
+    record: u32,
+    anchor: Option<usize>,
+}
+
 struct Planner<'a, 'b> {
     before: &'a Document,
     after: &'a Document,
-    /// Whether `after`'s first records are `before`'s, checked when an edited record is first read.
-    prefix: Option<bool>,
+    /// The file's records, read when a record is first named.
+    sources: Option<Sources<'a>>,
     formats: Formats,
     objects: Objects<'a>,
     ledger: Ledger<'b>,
 }
 
-impl<'a> Planner<'a, '_> {
+impl<'a, 'b> Planner<'a, 'b> {
+    fn new(before: &'a Document, after: &'a Document, budget: &'b mut Budget) -> Planner<'a, 'b> {
+        Planner { before, after, sources: None, formats: Formats::default(), objects: Objects::default(), ledger: Ledger { budget, held: 0 } }
+    }
+
+    /// An edit script between `n` and `m` characters, its steps' room held (given back by the
+    /// caller with the amount answered once it is done with them).
+    fn diff(&mut self, n: usize, m: usize, same: &dyn Fn(usize, usize) -> bool) -> Result<(Vec<diff::Step>, u64), Unpreservable> {
+        let held = script_bytes(n, m, MAX_CHANGES);
+        self.ledger.hold(held)?;
+        match script(n, m, same, MAX_CHANGES, self.ledger.budget) {
+            Some(steps) => Ok((steps, held)),
+            None => {
+                self.ledger.release(held);
+                Err(Unpreservable::TooManyChanges)
+            }
+        }
+    }
+
     fn era(&self) -> Era {
         Era { source: self.before.revisions.len() }
     }
 
-    /// A source character's record: one of `before`'s.
-    fn source_record(&self, record: Record) -> Result<Record, Unpreservable> {
-        match record {
-            Some(index) if !usize::try_from(index).is_ok_and(|index| index < self.before.revisions.len()) => Err(Unpreservable::Altered),
-            _ => Ok(record),
+    /// The file's records by what they record, made once per plan.
+    fn sources(&mut self) -> Result<&Sources<'a>, Unpreservable> {
+        if self.sources.is_none() {
+            let records = &self.before.revisions;
+            self.ledger.hold(
+                table_sized::<((RevisionKind, &str, &str), u32)>(records.len()).saturating_add(units(records.len()).saturating_mul(size::<u32>())),
+            )?;
+            let mut by_record = HashMap::with_capacity(records.len());
+            let mut first = Vec::with_capacity(records.len());
+            for (index, record) in records.iter().enumerate() {
+                self.ledger.work(1u64.saturating_add(units(record.author.len().saturating_add(record.date.len())) / BYTES_PER_UNIT))?;
+                let index = u32::try_from(index).map_err(|_| Unpreservable::TooManyChanges)?;
+                first.push(*by_record.entry((record.kind, record.author.as_str(), record.date.as_str())).or_insert(index));
+            }
+            self.sources = Some(Sources { by_record, first });
         }
+        self.sources.as_ref().ok_or(Unpreservable::Altered)
     }
 
-    /// An edited character's record: one of `after`'s, read by index only while `after`'s records
-    /// begin with `before`'s (a full application's accept all clears them, and later ones reuse the
-    /// indices).
+    /// A source character's record: one of `before`'s.
+    fn source_record(&mut self, record: Record) -> Result<Record, Unpreservable> {
+        let Some(index) = record else { return Ok(None) };
+        let first = usize::try_from(index).ok().and_then(|index| self.sources().ok()?.first.get(index).copied());
+        first.map(Some).ok_or(Unpreservable::Altered)
+    }
+
+    /// An edited character's record: a record read from the file is the file's record that records
+    /// the same change (refused when the file holds none); any other is this session's.
     fn edited_record(&mut self, record: Record) -> Result<Record, Unpreservable> {
         let Some(index) = record else { return Ok(None) };
-        let prefix = match self.prefix {
-            Some(prefix) => prefix,
-            None => {
-                let source = &self.before.revisions;
-                let bytes = source.iter().fold(units(source.len()), |total, found| {
-                    total.saturating_add(units(found.author.len().saturating_add(found.date.len())) / BYTES_PER_UNIT)
-                });
-                self.ledger.work(bytes)?;
-                let prefix = self.after.revisions.get(..source.len()).is_some_and(|records| records == source.as_slice());
-                self.prefix = Some(prefix);
-                prefix
-            }
-        };
-        if !prefix || !usize::try_from(index).is_ok_and(|index| index < self.after.revisions.len()) {
-            return Err(Unpreservable::Altered);
+        let after: &'a Document = self.after;
+        let found = usize::try_from(index).ok().and_then(|index| after.revisions.get(index)).ok_or(Unpreservable::Altered)?;
+        if found.read {
+            self.ledger.work(1u64.saturating_add(units(found.author.len().saturating_add(found.date.len())) / BYTES_PER_UNIT))?;
+            let key = (found.kind, found.author.as_str(), found.date.as_str());
+            return self.sources()?.by_record.get(&key).copied().map(Some).ok_or(Unpreservable::Altered);
         }
-        Ok(Some(index))
+        let source = u32::try_from(self.before.revisions.len()).map_err(|_| Unpreservable::TooManyChanges)?;
+        source.checked_add(index).map(Some).ok_or(Unpreservable::TooManyChanges)
     }
 
-    /// The revision an edited record names, its strings charged before they are copied.
-    fn revision(&mut self, index: u32) -> Result<Revision, Unpreservable> {
-        let found = usize::try_from(index).ok().and_then(|index| self.after.revisions.get(index)).ok_or(Unpreservable::Altered)?;
+    /// The revision this session's record names, its strings charged before they are copied.
+    fn revision(&mut self, record: u32) -> Result<Revision, Unpreservable> {
+        let index = usize::try_from(record).ok().and_then(|record| record.checked_sub(self.before.revisions.len()));
+        let found = index.and_then(|index| self.after.revisions.get(index)).ok_or(Unpreservable::Altered)?;
         self.ledger.hold(units(found.author.len()).saturating_add(units(found.date.len())))?;
         Ok(Revision { author: found.author.clone(), date: found.date.clone() })
     }
@@ -432,10 +493,16 @@ impl<'a> Planner<'a, '_> {
         if last.section != original.section || heads.iter().any(|paragraph| paragraph.section.is_some()) {
             return Err(Unpreservable::Formatting);
         }
+        // Every half ends with the source's mark properties in the file, so each mark in the model
+        // must be formatted as the source's (I4).
+        let mark_format = self.format(&original.mark)?;
+        for paragraph in edited {
+            if self.format(&paragraph.mark)? != mark_format {
+                return Err(Unpreservable::Formatting);
+            }
+        }
         // The source's own mark ends the last paragraph, as it was; every earlier one ends with a mark
-        // inserted now. The marks' formatting is the model's guess for typing into an empty
-        // paragraph (a split gives the later half the character before it); the file keeps the
-        // source's mark properties for every half, and typing is checked against those (anchor None).
+        // inserted now.
         let (last_ins, last_del) = (self.edited_record(last.mark.ins)?, self.edited_record(last.mark.del)?);
         if (last_ins, last_del) != (self.source_record(original.mark.ins)?, self.source_record(original.mark.del)?) {
             return Err(Unpreservable::Structure);
@@ -443,7 +510,7 @@ impl<'a> Planner<'a, '_> {
         let mut marks = self.ledger.vector::<u32>(heads.len())?;
         for head in heads {
             match (self.edited_record(head.mark.ins)?, self.edited_record(head.mark.del)?) {
-                (Some(index), None) if era.is_new(Some(index)) => marks.push(index),
+                (Some(record), None) if era.is_new(Some(record)) => marks.push(record),
                 _ => return Err(Unpreservable::Structure),
             }
         }
@@ -482,36 +549,27 @@ impl<'a> Planner<'a, '_> {
         let mut left = self.ledger.vector::<usize>(old.len())?;
         let mut right = self.ledger.vector::<usize>(projected.len())?;
 
+        // A decision, or this session's deletion after one, is no difference (I2).
         let same = |i: usize, j: usize| match (old.get(i), at(&items, &projected, j)) {
-            (Some(o), Some(n)) => {
-                // A deletion made now is the only change a character may have here.
-                let deleted_before = if era.is_new(n.del) { None } else { n.del };
-                o.ch == n.ch && o.format == n.format && o.object == n.object && o.ins == n.ins && o.del == deleted_before
-            }
+            (Some(o), Some(n)) => o.ch == n.ch && o.format == n.format && o.object == n.object && transition(o, &n, era).is_ok(),
             _ => false,
         };
-        let held = script_bytes(old.len(), projected.len(), MAX_CHANGES);
-        self.ledger.hold(held)?;
-        let Some(steps) = script(old.len(), projected.len(), &same, MAX_CHANGES, self.ledger.budget) else {
-            // Compared with their tracked changes, every decided character is two differences, so
-            // accepting a long insertion runs out of changes here. Compared by characters alone (the
-            // second diff, on the whole paragraph) only what went counts; it is checked as strictly,
-            // and where several readings fit it may take another source character of the same
-            // formatting for one (the text and its tracked changes written are the same).
-            self.ledger.release(held);
-            self.ledger.work(units(old.len()).saturating_add(units(projected.len())))?;
-            left.extend(0..old.len());
-            right.extend(0..projected.len());
-            self.stretch(&old, &items, &projected, &left, &right, &mut matched, &mut removed)?;
-            drop((left, right));
-            return self.steps(original, &old, &items, &projected, &mark_at, &matched, &removed);
-        };
+        let (steps, held) = self.diff(old.len(), projected.len(), &same)?;
+        // Stretches of source characters only, gone: checked once every pair is known (`slide`).
+        let mut gone: Vec<(usize, usize)> = Vec::new();
+        self.ledger.hold(vector_room::<(usize, usize)>())?;
         for step in steps.into_iter().map(Some).chain(std::iter::once(None)) {
             match step {
                 Some(diff::Step::Delete(i)) => left.push(i),
                 Some(diff::Step::Insert(j)) => right.push(j),
                 other => {
-                    self.stretch(&old, &items, &projected, &left, &right, &mut matched, &mut removed)?;
+                    match (left.first(), left.last(), right.is_empty()) {
+                        (Some(first), Some(last), true) => {
+                            self.ledger.hold(vector_slot::<(usize, usize)>())?;
+                            gone.push((*first, last.saturating_add(1)));
+                        }
+                        _ => self.stretch(&old, &items, &projected, &left, &right, &mut matched, &mut removed)?,
+                    }
                     left.clear();
                     right.clear();
                     if let Some(diff::Step::Same { left: from, right: to, len }) = other {
@@ -519,10 +577,7 @@ impl<'a> Planner<'a, '_> {
                         for offset in 0..len {
                             let (i, j) = (from.saturating_add(offset), to.saturating_add(offset));
                             let (Some(o), Some(n)) = (old.get(i), at(&items, &projected, j)) else { return Err(Unpreservable::Untracked) };
-                            let decided = match n.del {
-                                Some(index) if o.del.is_none() && era.is_new(n.del) => Decided::Deleted(index),
-                                _ => Decided::Same,
-                            };
+                            let decided = transition(o, &n, era)?;
                             if let Some(slot) = matched.get_mut(j) {
                                 *slot = Some((i, decided));
                             }
@@ -533,11 +588,156 @@ impl<'a> Planner<'a, '_> {
         }
         self.ledger.release(held);
         drop((left, right));
-        self.steps(original, &old, &items, &projected, &mark_at, &matched, &removed)
+        let mut pair = self.ledger.vector::<Option<usize>>(old.len())?;
+        pair.resize(old.len(), None);
+        for (j, slot) in matched.iter().enumerate() {
+            if let Some((i, _)) = slot
+                && let Some(entry) = pair.get_mut(*i)
+            {
+                *entry = Some(j);
+            }
+        }
+        let edited = |j: usize| at(&items, &projected, j);
+        for (start, end) in gone {
+            self.realign(&old, &edited, &mut pair, &mut matched, &mut removed, start, end)?;
+        }
+        drop(pair);
+        self.steps(&old, &items, &projected, &mark_at, &matched, &removed, mark_format)
     }
 
-    /// A stretch the first diff could not match: the same characters there are decisions or this
-    /// session's deletions; a source character gone must have gone with its tracked change.
+    /// Source characters `start..end` the diff left out, which must have gone with their decided
+    /// changes. Where one of them cannot (it had no tracked change), the diff may have paired a
+    /// neighbour instead where both pairings were as short: an accepted space beside a plain one, a
+    /// deleted "a" rejected beside a plain "a" deleted now. Around the stretch, a window of the pairs
+    /// beside it is paired again so that only characters with a tracked change are left out (a
+    /// search in a band as wide as the stretch); the window grows until that is possible, or holds
+    /// every pair it can, when it is refused.
+    #[allow(clippy::too_many_arguments)]
+    fn realign(
+        &mut self,
+        old: &[Char],
+        edited: &dyn Fn(usize) -> Option<Char>,
+        pair: &mut [Option<usize>],
+        matched: &mut [Option<(usize, Decided)>],
+        removed: &mut [bool],
+        start: usize,
+        end: usize,
+    ) -> Result<(), Unpreservable> {
+        let era = self.era();
+        let can_go = |i: usize| old.get(i).is_some_and(|o| o.ins.is_some() || o.del.is_some());
+        let relates = |i: usize, j: usize| match (old.get(i), edited(j)) {
+            (Some(o), Some(n)) => o.ch == n.ch && o.format == n.format && o.object == n.object && transition(o, &n, era).is_ok(),
+            _ => false,
+        };
+        let partner = |pair: &[Option<usize>], i: usize| pair.get(i).copied().flatten();
+        self.ledger.work(units(end.saturating_sub(start)))?;
+        let (lo, hi) = if (start..end).all(can_go) {
+            (start, end)
+        } else {
+            // The edited characters around the stretch are next to each other (it holds no edited one).
+            let middle = match start.checked_sub(1).and_then(|before| partner(pair, before)) {
+                Some(j) => j.saturating_add(1),
+                None => partner(pair, end).unwrap_or(0),
+            };
+            let gone = end - start;
+            let mut reach = 1usize;
+            loop {
+                let (mut lo, mut jlo) = (start, middle);
+                while start - lo < reach && lo > 0 && jlo > 0 && partner(pair, lo - 1) == Some(jlo - 1) {
+                    (lo, jlo) = (lo - 1, jlo - 1);
+                }
+                let (mut hi, mut jhi) = (end, middle);
+                while hi - end < reach && partner(pair, hi) == Some(jhi) {
+                    (hi, jhi) = (hi + 1, jhi + 1);
+                }
+                if let Some(paired) = self.band(lo, hi, jlo, gone, &can_go, &relates)? {
+                    for (offset, partner) in paired.into_iter().enumerate() {
+                        if let Some(entry) = pair.get_mut(lo + offset) {
+                            *entry = partner;
+                        }
+                    }
+                    break (lo, hi);
+                }
+                // Grown as far as the pairs beside it go: refused.
+                if start - lo < reach && hi - end < reach {
+                    return Err(Unpreservable::Untracked);
+                }
+                reach = reach.saturating_mul(2);
+            }
+        };
+        for i in lo..hi {
+            match partner(pair, i) {
+                Some(j) => {
+                    let (Some(o), Some(n)) = (old.get(i), edited(j)) else { return Err(Unpreservable::Untracked) };
+                    if let Some(slot) = matched.get_mut(j) {
+                        *slot = Some((i, transition(o, &n, era)?));
+                    }
+                }
+                None if can_go(i) => {
+                    if let Some(slot) = removed.get_mut(i) {
+                        *slot = true;
+                    }
+                }
+                None => return Err(Unpreservable::Untracked),
+            }
+        }
+        Ok(())
+    }
+
+    /// Source characters `lo..hi` paired in order with the edited ones from `jlo`, all but `gone` of
+    /// them, leaving out only those that `can_go`: each one's partner, or `None` when there is no
+    /// such pairing. A table of whether the rest can still be paired, by place and by how many were
+    /// left out so far (never more than `gone`), filled from the end.
+    fn band(
+        &mut self,
+        lo: usize,
+        hi: usize,
+        jlo: usize,
+        gone: usize,
+        can_go: &dyn Fn(usize) -> bool,
+        relates: &dyn Fn(usize, usize) -> bool,
+    ) -> Result<Option<Vec<Option<usize>>>, Unpreservable> {
+        let width = gone.saturating_add(1);
+        let length = hi.saturating_sub(lo);
+        let cells = length.saturating_add(1).saturating_mul(width);
+        self.ledger.work(units(cells).saturating_mul(2))?;
+        let mut table = self.ledger.vector::<bool>(cells)?;
+        table.resize(cells, false);
+        let cell = |i: usize, skipped: usize| i.saturating_mul(width).saturating_add(skipped);
+        // Edited character `i - skipped` of the window, while there is one.
+        let pairs = |i: usize, skipped: usize| i - skipped < length - gone && relates(lo + i, jlo + i - skipped);
+        if let Some(done) = table.get_mut(cell(length, gone)) {
+            *done = true;
+        }
+        for i in (0..length).rev() {
+            for skipped in 0..width.min(i.saturating_add(1)) {
+                let leave = skipped < gone && can_go(lo + i) && table.get(cell(i + 1, skipped + 1)).copied().unwrap_or(false);
+                let take = pairs(i, skipped) && table.get(cell(i + 1, skipped)).copied().unwrap_or(false);
+                if let Some(slot) = table.get_mut(cell(i, skipped)) {
+                    *slot = leave || take;
+                }
+            }
+        }
+        if !table.first().copied().unwrap_or(false) {
+            self.ledger.release(units(cells));
+            return Ok(None);
+        }
+        let mut paired = self.ledger.vector::<Option<usize>>(length)?;
+        let mut skipped = 0usize;
+        for i in 0..length {
+            if pairs(i, skipped) && table.get(cell(i + 1, skipped)).copied().unwrap_or(false) {
+                paired.push(Some(jlo + i - skipped));
+            } else {
+                paired.push(None);
+                skipped += 1;
+            }
+        }
+        Ok(Some(paired))
+    }
+
+    /// A stretch the diff could not pair: a source character there gone must have gone with its
+    /// tracked change; the same character on both sides is a tracked change altered, anything else
+    /// a change without one.
     fn stretch(
         &mut self,
         old: &[Char],
@@ -561,9 +761,7 @@ impl<'a> Planner<'a, '_> {
             (Some((_, o)), Some((_, n))) => o.ch == n.ch && o.format == n.format && o.object == n.object,
             _ => false,
         };
-        let held = script_bytes(left.len(), right.len(), MAX_CHANGES);
-        self.ledger.hold(held)?;
-        let steps = script(left.len(), right.len(), &same, MAX_CHANGES, self.ledger.budget).ok_or(Unpreservable::TooManyChanges)?;
+        let (steps, held) = self.diff(left.len(), right.len(), &same)?;
         for step in steps {
             match step {
                 diff::Step::Same { left: from, right: to, len } => {
@@ -594,101 +792,179 @@ impl<'a> Planner<'a, '_> {
         Ok(())
     }
 
-    /// The steps, in the order of the edited paragraphs: decided characters before the next kept
-    /// one, then what was typed before it, then that one.
+    /// The steps, in the order of the edited paragraphs: around each kept character, the decided
+    /// removals before it and what was typed there, the typing beside the character it continued.
     fn steps(
         &mut self,
-        original: &Paragraph,
         old: &[Char],
         items: &[Item],
         projected: &[usize],
         mark_at: &[usize],
         matched: &[Option<(usize, Decided)>],
         removed: &[bool],
+        mark_format: u32,
     ) -> Result<Vec<Step>, Unpreservable> {
         let era = self.era();
-        let mark_format = self.format(&original.mark)?;
         let mut steps: Vec<Step> = Vec::new();
-        self.ledger.hold(vector_room::<Step>())?;
-        let mut typed: Option<(String, u32, Option<usize>)> = None;
-        let mut next_old = 0usize;
-        let mut last_kept: Option<usize> = None;
-        let mut kept_in_paragraph = false;
-        // Projected characters passed, and marks passed.
-        let mut seen = 0usize;
-        let mut marks = 0usize;
+        self.ledger.hold(vector_room::<Step>().saturating_add(vector_room::<Typed>()))?;
+        let mut pending: Vec<Typed> = Vec::new();
+        let mut at = Place { next_old: 0, last_kept: None, kept_in_paragraph: false, seen: 0, marks: 0 };
+        // The anchor last chosen, for the formatting and place it was chosen for.
+        let mut chosen: Option<((u32, usize, usize, usize), Option<usize>)> = None;
         for item in items {
             self.ledger.work(1)?;
             match item {
                 Item::Mark(record) => {
-                    self.flush(&mut steps, &mut typed)?;
+                    let gap_end = next_kept(matched, at.seen).unwrap_or(old.len());
+                    self.settle(&mut steps, &mut pending, removed, &mut at.next_old, gap_end, false)?;
                     let revision = self.revision(*record)?;
                     self.push(&mut steps, Step::Break { revision })?;
-                    kept_in_paragraph = false;
-                    marks = marks.saturating_add(1);
+                    at.kept_in_paragraph = false;
+                    at.marks = at.marks.saturating_add(1);
                 }
                 Item::Char(c) if era.is_new(c.ins) => {
                     if c.ch == OBJ {
                         return Err(Unpreservable::InsertedObject);
                     }
                     let (Some(record), None) = (c.ins, c.del) else { return Err(Unpreservable::Altered) };
-                    // The source character kept next, and whether it is in this paragraph.
-                    let next = matched.get(seen).copied().flatten().map(|(unit, _)| unit);
-                    let next_here = next.filter(|_| match (projected.get(seen), mark_at.get(marks)) {
-                        (Some(position), Some(mark)) => position < mark,
-                        _ => true,
-                    });
-                    let next_later = next.filter(|_| next_here.is_none());
-                    let before_here = last_kept.filter(|_| kept_in_paragraph);
-                    let before_earlier = last_kept.filter(|_| !kept_in_paragraph);
-                    // What typing continued from: the character before it in its paragraph, else the
-                    // first after it there (a paragraph's start, a selection typed over), else the
-                    // mark (an empty paragraph), else a character of an earlier or later half (a
-                    // paste of several paragraphs takes the formatting where it was pasted).
-                    let candidates = [before_here.map(Some), next_here.map(Some), Some(None), before_earlier.map(Some), next_later.map(Some)];
-                    let format_of = |anchor: Option<usize>| match anchor {
-                        Some(unit) => old.get(unit).map(|o| o.format),
-                        None => Some(mark_format),
+                    let key = (c.format, at.next_old, at.seen, at.marks);
+                    let anchor = match chosen {
+                        Some((chosen_key, anchor)) if chosen_key == key => anchor,
+                        _ => {
+                            let anchor = self.anchor(c.format, &at, old, projected, mark_at, matched, removed, mark_format)?;
+                            chosen = Some((key, anchor));
+                            anchor
+                        }
                     };
-                    let anchor =
-                        candidates.into_iter().flatten().find(|anchor| format_of(*anchor) == Some(c.format)).ok_or(Unpreservable::Formatting)?;
-                    match &mut typed {
-                        Some((text, key, at)) if *key == record && *at == anchor => {
-                            self.ledger.hold(vector_slot::<u8>().saturating_mul(units(c.ch.len_utf8())))?;
-                            text.push(c.ch);
+                    let bytes = vector_slot::<u8>().saturating_mul(units(c.ch.len_utf8()));
+                    match pending.last_mut() {
+                        Some(group) if group.record == record && group.anchor == anchor => {
+                            self.ledger.hold(bytes)?;
+                            group.text.push(c.ch);
                         }
                         _ => {
-                            self.flush(&mut steps, &mut typed)?;
-                            self.ledger.hold(8u64.saturating_add(vector_slot::<u8>().saturating_mul(units(c.ch.len_utf8()))))?;
-                            typed = Some((c.ch.to_string(), record, anchor));
+                            self.ledger.hold(vector_slot::<Typed>().saturating_add(8).saturating_add(bytes))?;
+                            pending.push(Typed { text: c.ch.to_string(), record, anchor });
                         }
                     }
                 }
                 Item::Char(_) => {
-                    let Some(Some((unit, decided))) = matched.get(seen).copied() else { return Err(Unpreservable::Untracked) };
-                    seen = seen.saturating_add(1);
-                    if unit < next_old {
+                    let Some(Some((unit, decided))) = matched.get(at.seen).copied() else { return Err(Unpreservable::Untracked) };
+                    at.seen = at.seen.saturating_add(1);
+                    if unit < at.next_old {
                         return Err(Unpreservable::Untracked);
                     }
-                    self.removals(&mut steps, removed, next_old, unit)?;
-                    self.flush(&mut steps, &mut typed)?;
+                    self.settle(&mut steps, &mut pending, removed, &mut at.next_old, unit, true)?;
                     let change = match decided {
                         Decided::Same => Change::Same,
                         Decided::Accepted => Change::Accepted,
                         Decided::Rejected => Change::Rejected,
                         Decided::Deleted(record) => Change::Deleted(self.revision(record)?),
+                        Decided::AcceptedThenDeleted(record) => Change::AcceptedThenDeleted(self.revision(record)?),
+                        Decided::RejectedThenDeleted(record) => Change::RejectedThenDeleted(self.revision(record)?),
                     };
                     self.push(&mut steps, Step::Keep { unit, change })?;
-                    next_old = unit.saturating_add(1);
-                    last_kept = Some(unit);
-                    kept_in_paragraph = true;
+                    at.next_old = unit.saturating_add(1);
+                    at.last_kept = Some(unit);
+                    at.kept_in_paragraph = true;
                 }
             }
         }
-        self.removals(&mut steps, removed, next_old, old.len())?;
-        self.flush(&mut steps, &mut typed)?;
+        self.settle(&mut steps, &mut pending, removed, &mut at.next_old, old.len(), true)?;
         steps.shrink_to_fit();
         Ok(steps)
+    }
+
+    /// The source character whose formatting typing continued, formatted `format`: the character
+    /// before it in its paragraph; the first after it there (a paragraph's start, a selection typed
+    /// over); a character a decision removed there (typing inside a change rejected later); a
+    /// character of an earlier half (Enter, then typing; a paste of several paragraphs); the mark
+    /// (an empty paragraph); a character of a later half (a paste at a paragraph's start). The
+    /// engine types with the formatting before the caret, so this is its order (M3, M4).
+    fn anchor(
+        &mut self,
+        format: u32,
+        at: &Place,
+        old: &[Char],
+        projected: &[usize],
+        mark_at: &[usize],
+        matched: &[Option<(usize, Decided)>],
+        removed: &[bool],
+        mark_format: u32,
+    ) -> Result<Option<usize>, Unpreservable> {
+        let next = next_kept(matched, at.seen);
+        let in_paragraph = match (projected.get(at.seen), mark_at.get(at.marks)) {
+            (Some(position), Some(mark)) => position < mark,
+            _ => true,
+        };
+        let (next_here, next_later) = if in_paragraph { (next, None) } else { (None, next) };
+        let (before_here, before_earlier) = if at.kept_in_paragraph { (at.last_kept, None) } else { (None, at.last_kept) };
+        let formatted = |unit: usize| old.get(unit).is_some_and(|o| o.format == format);
+        for unit in [before_here, next_here].into_iter().flatten() {
+            if formatted(unit) {
+                return Ok(Some(unit));
+            }
+        }
+        for unit in at.next_old..next.unwrap_or(old.len()) {
+            self.ledger.work(1)?;
+            if removed.get(unit).copied().unwrap_or(false) && formatted(unit) {
+                return Ok(Some(unit));
+            }
+        }
+        if before_earlier.is_some_and(formatted) {
+            return Ok(before_earlier);
+        }
+        if mark_format == format {
+            return Ok(None);
+        }
+        match next_later {
+            Some(unit) if formatted(unit) => Ok(Some(unit)),
+            _ => Err(Unpreservable::Formatting),
+        }
+    }
+
+    /// The decided removals from `next_old` to `gap_end` (all of them when `through`, else as many
+    /// as the typing's places need), with the typing waiting in `pending` placed by its anchor:
+    /// after the character it continued when that is before or among them, else after them; typed
+    /// text keeps its order.
+    fn settle(
+        &mut self,
+        steps: &mut Vec<Step>,
+        pending: &mut Vec<Typed>,
+        removed: &[bool],
+        next_old: &mut usize,
+        gap_end: usize,
+        through: bool,
+    ) -> Result<(), Unpreservable> {
+        let start = *next_old;
+        let gap = gap_end.saturating_sub(start);
+        let mut emitted = 0usize;
+        let mut floor = 0usize;
+        for group in pending.drain(..) {
+            let place = match group.anchor {
+                Some(unit) if unit < start => 0,
+                Some(unit) if unit < gap_end => unit - start + 1,
+                _ if through => gap,
+                _ => 0,
+            };
+            floor = floor.max(place);
+            while emitted < floor {
+                self.remove(steps, removed, start.saturating_add(emitted))?;
+                emitted += 1;
+            }
+            let Typed { mut text, record, anchor } = group;
+            text.shrink_to_fit();
+            let revision = self.revision(record)?;
+            self.push(steps, Step::Insert { text, revision, anchor })?;
+        }
+        if through {
+            while emitted < gap {
+                self.remove(steps, removed, start.saturating_add(emitted))?;
+                emitted += 1;
+            }
+        }
+        *next_old = start.saturating_add(emitted);
+        Ok(())
     }
 
     /// A step into the list, its room charged first (its strings were charged as they were made).
@@ -698,26 +974,34 @@ impl<'a> Planner<'a, '_> {
         Ok(())
     }
 
-    fn flush(&mut self, steps: &mut Vec<Step>, typed: &mut Option<(String, u32, Option<usize>)>) -> Result<(), Unpreservable> {
-        let Some((mut text, record, anchor)) = typed.take() else { return Ok(()) };
-        text.shrink_to_fit();
-        let revision = self.revision(record)?;
-        self.push(steps, Step::Insert { text, revision, anchor })
-    }
-
-    /// Source characters `from..to`, each gone with its decided change.
-    fn removals(&mut self, steps: &mut Vec<Step>, removed: &[bool], from: usize, to: usize) -> Result<(), Unpreservable> {
-        for unit in from..to {
-            if !removed.get(unit).copied().unwrap_or(false) {
-                return Err(Unpreservable::Untracked);
-            }
-            self.push(steps, Step::Remove { unit })?;
+    /// Source character `unit`, gone with its decided change.
+    fn remove(&mut self, steps: &mut Vec<Step>, removed: &[bool], unit: usize) -> Result<(), Unpreservable> {
+        if !removed.get(unit).copied().unwrap_or(false) {
+            return Err(Unpreservable::Untracked);
         }
-        Ok(())
+        self.push(steps, Step::Remove { unit })
     }
 }
 
-/// A source character kept with other tracked changes: which decision or new deletion that is.
+/// Where the steps stand in the edited paragraphs.
+struct Place {
+    /// The first source character with no step yet.
+    next_old: usize,
+    last_kept: Option<usize>,
+    /// Whether a source character was kept in this paragraph (since the last mark).
+    kept_in_paragraph: bool,
+    /// Source characters kept so far, and marks passed.
+    seen: usize,
+    marks: usize,
+}
+
+/// The source character kept next, after `seen` were.
+fn next_kept(matched: &[Option<(usize, Decided)>], seen: usize) -> Option<usize> {
+    matched.get(seen).copied().flatten().map(|(unit, _)| unit)
+}
+
+/// A source character `o` that an edited one `n` stands for: the decision on its tracked changes,
+/// and this session's deletion after it (6C-43, 6C-44).
 fn transition(o: &Char, n: &Char, era: Era) -> Result<Decided, Unpreservable> {
     let accepted = if o.ins == n.ins {
         false
@@ -730,11 +1014,12 @@ fn transition(o: &Char, n: &Char, era: Era) -> Result<Decided, Unpreservable> {
         Decided::Same
     } else if o.del.is_some() && n.del.is_none() {
         Decided::Rejected
-    } else if let (true, Some(index)) = (era.is_new(n.del), n.del) {
+    } else if let (true, Some(record)) = (era.is_new(n.del), n.del) {
         match o.del {
-            None => Decided::Deleted(index),
-            // Deleting text already deleted changes nothing in the file, as in Word.
-            Some(_) => Decided::Same,
+            None => Decided::Deleted(record),
+            // The engine never marks deleted text again: the source's deletion was rejected, then
+            // the text deleted by this session, which Word records as this session's.
+            Some(_) => Decided::RejectedThenDeleted(record),
         }
     } else {
         return Err(Unpreservable::Altered);
@@ -742,6 +1027,7 @@ fn transition(o: &Char, n: &Char, era: Era) -> Result<Decided, Unpreservable> {
     match (accepted, deletion) {
         (false, change) => Ok(change),
         (true, Decided::Same) => Ok(Decided::Accepted),
+        (true, Decided::Deleted(record)) => Ok(Decided::AcceptedThenDeleted(record)),
         _ => Err(Unpreservable::Altered),
     }
 }
@@ -761,9 +1047,21 @@ mod tests {
 
     fn doc(revisions: &[(&str, &str)]) -> Document {
         let mut d = Document::new();
-        d.revisions =
-            revisions.iter().map(|(author, date)| Recorded { kind: RevisionKind::Insert, author: (*author).into(), date: (*date).into() }).collect();
+        d.revisions = revisions
+            .iter()
+            .map(|(author, date)| Recorded { kind: RevisionKind::Insert, author: (*author).into(), date: (*date).into(), read: false })
+            .collect();
         d
+    }
+
+    /// The documents as a save sees them: `before` read from the file (every record read), `after`
+    /// read from the same file and edited (its first records read, as `before`'s, the rest made since).
+    fn as_read(before: &Document, after: &Document) -> (Document, Document) {
+        let (mut before, mut after) = (before.clone(), after.clone());
+        let count = before.revisions.len();
+        before.revisions.iter_mut().for_each(|record| record.read = true);
+        after.revisions.iter_mut().enumerate().for_each(|(index, record)| record.read = index < count);
+        (before, after)
     }
 
     /// A paragraph from (text, inserted by revision, deleted by revision, bold) pieces.
@@ -791,6 +1089,12 @@ mod tests {
     /// `plan` with a save's budget of its own; what stays held afterwards is exactly what the steps
     /// hold, and nothing once it refuses.
     fn planned(original: &Paragraph, before: &Document, edited: &[&Paragraph], after: &Document) -> Result<Vec<Step>, Unpreservable> {
+        let (before, after) = as_read(before, after);
+        planned_exactly(original, &before, edited, &after)
+    }
+
+    /// [`planned`] with the documents' records as given.
+    fn planned_exactly(original: &Paragraph, before: &Document, edited: &[&Paragraph], after: &Document) -> Result<Vec<Step>, Unpreservable> {
         let mut budget = Budget::new(MAX_WORK, MAX_MEMORY);
         let result = plan(original, before, edited, after, &mut budget);
         match &result {
@@ -867,11 +1171,110 @@ mod tests {
     }
 
     #[test]
-    fn leaves_deleted_text_deleted_again_as_it_was() {
+    fn writes_a_deletion_rejected_and_made_again_as_this_sessions() {
+        // 6C-44 (amends the brief's `leaves_deleted_text_deleted_again_as_it_was`): the engine never
+        // marks deleted text again, so Ana's deletion now in Sari's name was rejected, then deleted by
+        // Sari; Word records that deletion as Sari's.
         let original = para(&[("Rent ", None, None, false), ("monthly", None, Some(0), false)]);
         let edited = para(&[("Rent ", None, None, false), ("monthly", None, Some(1), false)]);
         let steps = planned(&original, &doc(&[ANA]), &[&edited], &doc(&[ANA, SARI])).unwrap();
-        assert_eq!(steps, [keep(0..5, Change::Same), keep(5..12, Change::Same)].concat());
+        assert_eq!(steps, [keep(0..5, Change::Same), keep(5..12, Change::RejectedThenDeleted(key(SARI)))].concat());
+    }
+
+    /// The revision a step deletes its character with now, if any.
+    fn deleted_now(step: &Step) -> Option<&Revision> {
+        match step {
+            Step::Keep { change: Change::Deleted(key) | Change::AcceptedThenDeleted(key) | Change::RejectedThenDeleted(key), .. } => Some(key),
+            _ => None,
+        }
+    }
+
+    #[test]
+    fn credits_every_deletion_after_accepting_everything_to_this_session() {
+        // C1 (P01): Ana inserted "Tenant ", Bob deleted "Tenant ". Accept all, then Sari deletes
+        // "Tenant ". Either reading of which "Tenant " stays writes it deleted by Sari; never Bob's
+        // deletion kept as it was.
+        const BOB: (&str, &str) = ("Bob Hartono", "2026-10-02T10:00:00Z");
+        let original =
+            para(&[("the ", None, None, false), ("Tenant ", Some(0), None, false), ("Tenant ", None, Some(1), false), ("shall", None, None, false)]);
+        let edited = para(&[("the ", None, None, false), ("Tenant ", None, Some(2), false), ("shall", None, None, false)]);
+        let steps = planned(&original, &doc(&[ANA, BOB]), &[&edited], &doc(&[ANA, BOB, SARI])).unwrap();
+        assert!(steps.iter().filter_map(deleted_now).all(|found| *found == key(SARI)));
+        assert_eq!(steps.iter().filter_map(deleted_now).count(), "Tenant ".len());
+        assert_eq!(steps.iter().filter(|step| matches!(step, Step::Keep { change: Change::Same, .. })).count(), "the shall".len());
+        // Suffix first (diff::script): Bob's "Tenant " stays, deleted now by Sari; Ana's goes.
+        let removed: Vec<Step> = (4..11).map(|unit| Step::Remove { unit }).collect();
+        assert_eq!(
+            steps,
+            [keep(0..4, Change::Same), removed, keep(11..18, Change::RejectedThenDeleted(key(SARI))), keep(18..23, Change::Same)].concat()
+        );
+        // P01b, the smallest form.
+        let original = para(&[("a", Some(0), None, false), ("a", None, Some(1), false)]);
+        let edited = para(&[("a", None, Some(2), false)]);
+        let steps = planned(&original, &doc(&[ANA, BOB]), &[&edited], &doc(&[ANA, BOB, SARI])).unwrap();
+        assert_eq!(steps, vec![Step::Remove { unit: 0 }, Step::Keep { unit: 1, change: Change::RejectedThenDeleted(key(SARI)) }]);
+    }
+
+    #[test]
+    fn pairs_again_where_the_diff_left_out_a_character_that_cannot_go() {
+        const BOB: (&str, &str) = ("Bob Hartono", "2026-10-02T10:00:00Z");
+        // M2 (P03): accept all, then Sari deletes the plain "a" beside Bob's deleted "a". The diff
+        // pairs Bob's "a" (as short a script): the plain one is paired again, Bob's goes.
+        let long: String = (0..1_500).map(|index| char::from(b'a' + u8::try_from(index % 26).unwrap())).collect();
+        let original = para(&[
+            ("Rent", None, None, false),
+            (&long, Some(0), None, false),
+            ("z", None, None, false),
+            ("a", None, None, false),
+            ("a", None, Some(1), false),
+        ]);
+        let edited = para(&[("Rent", None, None, false), (&long, None, None, false), ("z", None, None, false), ("a", None, Some(2), false)]);
+        let steps = planned(&original, &doc(&[ANA, BOB]), &[&edited], &doc(&[ANA, BOB, SARI])).unwrap();
+        let expected = [
+            keep(0..4, Change::Same),
+            keep(4..1_504, Change::Accepted),
+            keep(1_504..1_505, Change::Same),
+            keep(1_505..1_506, Change::Deleted(key(SARI))),
+            vec![Step::Remove { unit: 1_506 }],
+        ]
+        .concat();
+        assert_eq!(steps, expected);
+        // Where what must go is not one stretch: Bob's "a" and Ana's "z" go, the plain "a" is
+        // deleted now.
+        let original = para(&[("q", None, None, false), ("a", None, Some(1), false), ("a", None, None, false), ("z", Some(0), None, false)]);
+        let edited = para(&[("q", None, None, false), ("a", None, Some(2), false)]);
+        let steps = planned(&original, &doc(&[ANA, BOB]), &[&edited], &doc(&[ANA, BOB, SARI])).unwrap();
+        let expected =
+            [keep(0..1, Change::Same), vec![Step::Remove { unit: 1 }], keep(2..3, Change::Deleted(key(SARI))), vec![Step::Remove { unit: 3 }]]
+                .concat();
+        assert_eq!(steps, expected);
+        // Paired again two pairs away: Bob's "ab" goes, the plain "ab" is deleted now.
+        let original = para(&[("x", None, None, false), ("ab", None, None, false), ("ab", None, Some(1), false)]);
+        let edited = para(&[("x", None, None, false), ("ab", None, Some(2), false)]);
+        let steps = planned(&original, &doc(&[ANA, BOB]), &[&edited], &doc(&[ANA, BOB, SARI])).unwrap();
+        let expected =
+            [keep(0..1, Change::Same), keep(1..3, Change::Deleted(key(SARI))), vec![Step::Remove { unit: 3 }, Step::Remove { unit: 4 }]].concat();
+        assert_eq!(steps, expected);
+        // No pairing leaves out only what can go: refused.
+        let original = para(&[("q", None, None, false), ("a", None, None, false), ("b", None, None, false)]);
+        let edited = para(&[("q", None, None, false), ("b", None, Some(0), false)]);
+        assert_eq!(planned(&original, &doc(&[]), &[&edited], &doc(&[SARI])), Err(Unpreservable::Untracked));
+    }
+
+    #[test]
+    fn reads_an_ambiguous_decision_by_the_suffix_first() {
+        // M1 (P02, P02b): accept all, where an insertion and a deletion hold the same letter. The text
+        // written is the same either way; which source run survives is the diff's suffix-first rule,
+        // pinned here so that changing it is a decision.
+        const BOB: (&str, &str) = ("Bob Hartono", "2026-10-02T10:00:00Z");
+        let original = para(&[("ab", Some(0), None, false), ("b", None, Some(1), false)]);
+        let accepted = para(&[("ab", None, None, false)]);
+        let steps = planned(&original, &doc(&[ANA, BOB]), &[&accepted], &doc(&[ANA, BOB])).unwrap();
+        assert_eq!(steps, [keep(0..1, Change::Accepted), vec![Step::Remove { unit: 1 }], keep(2..3, Change::Rejected)].concat());
+        let original = para(&[("a", Some(0), None, false), ("a", None, Some(1), false)]);
+        let accepted = para(&[("a", None, None, false)]);
+        let steps = planned(&original, &doc(&[ANA, BOB]), &[&accepted], &doc(&[ANA, BOB])).unwrap();
+        assert_eq!(steps, vec![Step::Remove { unit: 0 }, Step::Keep { unit: 1, change: Change::Rejected }]);
     }
 
     #[test]
@@ -1069,12 +1472,25 @@ mod tests {
     }
 
     #[test]
-    fn refuses_revisions_it_cannot_tell_when_the_records_were_replaced() {
+    fn knows_this_sessions_records_by_their_watermark_not_their_place() {
+        // 6C-45: a full application's accept all clears every record (as Task 9's `decide_all`
+        // does); typing afterwards makes a record at 0, not read from the file.
+        let (before, _) = as_read(&doc(&[ANA]), &doc(&[]));
         let original = para(&[("Rent", None, None, false), (" is", Some(0), None, false)]);
-        // Every record was cleared (a full application's accept all), then typing made one at 0.
         let edited = para(&[("Rent is", None, None, false), (" due", Some(0), None, false)]);
-        assert_eq!(planned(&original, &doc(&[ANA]), &[&edited], &doc(&[SARI])), Err(Unpreservable::Altered));
-        // A record the document does not hold.
+        let steps = planned_exactly(&original, &before, &[&edited], &doc(&[SARI])).unwrap();
+        assert_eq!(steps, [keep(0..4, Change::Same), keep(4..7, Change::Accepted), vec![typed(" due", SARI, Some(6))]].concat());
+        // The file's records in another order: still the file's, by what they record.
+        let mut after = doc(&[SARI, SARI, ANA]);
+        after.revisions[2].read = true;
+        let edited = para(&[("Rent", None, None, false), (" is", Some(2), None, false), (" due", Some(0), None, false)]);
+        let steps = planned_exactly(&original, &before, &[&edited], &after).unwrap();
+        assert_eq!(steps, [keep(0..7, Change::Same), vec![typed(" due", SARI, Some(6))]].concat());
+        // A record read from the file that the file does not hold, or no record at all: refused.
+        let mut after = doc(&[SARI]);
+        after.revisions[0].read = true;
+        let edited = para(&[("Rent", None, None, false), (" is", Some(0), None, false)]);
+        assert_eq!(planned_exactly(&original, &before, &[&edited], &after), Err(Unpreservable::Altered));
         let edited = para(&[("Rent", None, None, false), (" is", Some(0), None, false), (" due", Some(5), None, false)]);
         assert_eq!(planned(&original, &doc(&[ANA]), &[&edited], &doc(&[ANA, SARI])), Err(Unpreservable::Altered));
     }
@@ -1122,11 +1538,20 @@ mod tests {
     }
 
     #[test]
-    fn refuses_a_decided_change_it_cannot_write_as_one() {
-        // Ana's insertion accepted and then deleted: the writer has no step for both.
+    fn writes_an_insertion_accepted_then_deleted_as_this_sessions_deletion() {
+        // 6C-43 (P06): Ana's insertion accepted, then deleted by Sari.
         let original = para(&[("Rent", None, None, false), (" is due", Some(0), None, false)]);
         let edited = para(&[("Rent", None, None, false), (" is due", None, Some(1), false)]);
-        assert_eq!(planned(&original, &doc(&[ANA]), &[&edited], &doc(&[ANA, SARI])), Err(Unpreservable::Altered));
+        let steps = planned(&original, &doc(&[ANA]), &[&edited], &doc(&[ANA, SARI])).unwrap();
+        assert_eq!(steps, [keep(0..4, Change::Same), keep(4..11, Change::AcceptedThenDeleted(key(SARI)))].concat());
+    }
+
+    #[test]
+    fn refuses_a_decided_change_it_cannot_write_as_one() {
+        let original = para(&[("Rent", None, None, false), (" is due", Some(0), None, false)]);
+        // Ana's insertion now in Bob's name: an earlier change altered.
+        let edited = para(&[("Rent", None, None, false), (" is due", Some(1), None, false)]);
+        assert_eq!(planned(&original, &doc(&[ANA, SARI]), &[&edited], &doc(&[ANA, SARI])), Err(Unpreservable::Altered));
         // Typed and deleted in this session at once: the engine removes such text instead.
         let typed_deleted = para(&[("Rent", None, None, false), (" is due", Some(0), None, false), ("!", Some(1), Some(1), false)]);
         assert_eq!(planned(&original, &doc(&[ANA]), &[&typed_deleted], &doc(&[ANA, SARI])), Err(Unpreservable::Altered));
@@ -1169,8 +1594,8 @@ mod tests {
 
     #[test]
     fn accepts_an_insertion_longer_than_one_diff_compares_with_its_tracked_changes() {
-        // 1,500 inserted characters accepted are 3,000 differences with their tracked changes, past
-        // MAX_CHANGES; by characters alone there are none.
+        // 1,500 inserted characters accepted: decisions are no differences (I2), so MAX_CHANGES counts
+        // only what goes.
         let inserted: String = (0..1_500).map(|index| char::from(b'a' + u8::try_from(index % 26).unwrap())).collect();
         let original = para(&[("Rent", None, None, false), (&inserted, Some(0), None, false), (" now", None, Some(0), false)]);
         let accepted = para(&[("Rent", None, None, false), (&inserted, None, None, false)]);
@@ -1266,10 +1691,10 @@ mod tests {
     #[test]
     fn holds_no_more_than_it_charges() {
         if std::env::var_os(MEASURING).is_some() {
-            let (before, after) = (doc(&[ANA, BOB]), doc(&[ANA, BOB, SARI]));
+            let (before, after) = as_read(&doc(&[ANA, BOB]), &doc(&[ANA, BOB, SARI]));
             let some: &dyn Fn(usize) -> bool = &|piece| piece < 100;
             let all: &dyn Fn(usize) -> bool = &|_| true;
-            for (name, case) in [("first diff", long_case(some)), ("characters alone", long_case(all)), ("steps", deleted_case())] {
+            for (name, case) in [("first diff", long_case(some)), ("every decision taken", long_case(all)), ("steps", deleted_case())] {
                 let (original, edited) = case;
                 let group: Vec<&Paragraph> = edited.iter().collect();
                 let mut budget = Budget::new(MAX_WORK, MAX_MEMORY);
@@ -1296,5 +1721,153 @@ mod tests {
             .status()
             .unwrap();
         assert!(status.success());
+    }
+
+    #[test]
+    fn places_typing_beside_the_character_it_continued_before_decided_removals() {
+        // I1 (P14): "!" typed after "terms" (in its link), then Ana's "XY" after it rejected. The
+        // typing stays next to "terms", so the writer keeps it in the hyperlink.
+        let link = CharProps { link: Some("https://example.com/terms".into()), ..CharProps::default() };
+        let mut original = Paragraph::new();
+        original.insert_text(0, "terms", &link).unwrap();
+        original.insert_text(5, "XY", &CharProps { ins: Some(0), ..CharProps::default() }).unwrap();
+        original.insert_text(7, " now", &CharProps::default()).unwrap();
+        let mut edited = Paragraph::new();
+        edited.insert_text(0, "terms", &link).unwrap();
+        edited.insert_text(5, "!", &CharProps { ins: Some(1), ..link.clone() }).unwrap();
+        edited.insert_text(6, " now", &CharProps::default()).unwrap();
+        let steps = planned(&original, &doc(&[ANA]), &[&edited], &doc(&[ANA, SARI])).unwrap();
+        let removed: Vec<Step> = (5..7).map(|unit| Step::Remove { unit }).collect();
+        assert_eq!(steps, [keep(0..5, Change::Same), vec![typed("!", SARI, Some(4))], removed, keep(7..11, Change::Same)].concat());
+    }
+
+    #[test]
+    fn continues_a_character_its_decision_removed() {
+        // M4 (P08): "Z" typed after Ana's bold "Q", then only Q rejected: the typing continued Q.
+        let original = para(&[("a", None, None, false), ("Q", Some(0), None, true), ("b", None, None, false)]);
+        let edited = para(&[("a", None, None, false), ("Z", Some(1), None, true), ("b", None, None, false)]);
+        let steps = planned(&original, &doc(&[ANA]), &[&edited], &doc(&[ANA, SARI])).unwrap();
+        assert_eq!(steps, [keep(0..1, Change::Same), vec![Step::Remove { unit: 1 }, typed("Z", SARI, Some(1))], keep(2..3, Change::Same)].concat());
+    }
+
+    #[test]
+    fn continues_an_earlier_half_before_the_mark() {
+        // M3 (P07): Enter at the end, then typing: the engine continued the last character.
+        let original = para(&[("Rent.", None, None, false)]);
+        let mut head = original.clone();
+        head.mark.ins = Some(0);
+        let tail = para(&[("New", Some(0), None, false)]);
+        let steps = planned(&original, &doc(&[]), &[&head, &tail], &doc(&[SARI])).unwrap();
+        assert_eq!(steps, [keep(0..5, Change::Same), vec![Step::Break { revision: key(SARI) }, typed("New", SARI, Some(4))]].concat());
+        // A pasted middle paragraph took the caret's formatting, which the mark has too.
+        let original = para(&[("xy", None, None, false)]);
+        let mut head = para(&[("x", None, None, false), ("A", Some(0), None, false)]);
+        head.mark.ins = Some(0);
+        let mut middle = para(&[("B", Some(0), None, false)]);
+        middle.mark.ins = Some(0);
+        let tail = para(&[("C", Some(0), None, false), ("y", None, None, false)]);
+        let steps = planned(&original, &doc(&[]), &[&head, &middle, &tail], &doc(&[SARI])).unwrap();
+        assert_eq!(steps[3], typed("B", SARI, Some(0)));
+    }
+
+    #[test]
+    fn refuses_a_mark_formatted_otherwise_than_the_sources() {
+        // I4 (P12): bold applied to an empty paragraph's mark (the desktop formats the mark there).
+        let original = Paragraph::new();
+        let mut bolder = original.clone();
+        bolder.mark.bold = Some(true);
+        assert_eq!(planned(&original, &doc(&[]), &[&bolder], &doc(&[])), Err(Unpreservable::Formatting));
+        // A half's mark: each half gets the source's mark in the file.
+        let original = para(&[("One. Two.", None, None, false)]);
+        let mut first = para(&[("One.", None, None, false)]);
+        first.mark.ins = Some(0);
+        let mut second = para(&[(" Two.", None, None, false)]);
+        second.mark.italic = Some(true);
+        assert_eq!(planned(&original, &doc(&[]), &[&first, &second], &doc(&[SARI])), Err(Unpreservable::Formatting));
+    }
+
+    #[test]
+    fn refuses_a_mark_that_carries_typing_deleted_from_an_empty_paragraph() {
+        // I3 (P11): typing into an empty paragraph and deleting it leaves the session's insertion on
+        // the mark (`Paragraph::delete` copies the character's formatting into it). Refused until the
+        // engine stops copying tracked changes into a mark (Task 10).
+        let original = Paragraph::new();
+        let mut edited = original.clone();
+        edited.insert_text(0, "x", &CharProps { ins: Some(0), ..CharProps::default() }).unwrap();
+        edited.delete(0, 1).unwrap();
+        assert_eq!(edited.mark.ins, Some(0));
+        assert_eq!(planned(&original, &doc(&[]), &[&edited], &doc(&[SARI])), Err(Unpreservable::Structure));
+    }
+
+    #[test]
+    fn plans_two_thousand_decided_paragraphs_in_one_saves_work() {
+        // I2: decisions cost no diff work. 2,000 paragraphs of 600 characters each, accepted, then
+        // rejected (an insertion, and a deletion), each under one save's budget; every plan's steps
+        // stay charged, as a save holds them.
+        let text = "abcdefghijklmnopqrstuvwxy ".repeat(24);
+        let plain = para(&[(&text, None, None, false)]);
+        let inserted = para(&[(&text, Some(0), None, false)]);
+        let deleted = para(&[(&text, None, Some(0), false)]);
+        let empty = Paragraph::new();
+        let (before, after) = as_read(&doc(&[ANA]), &doc(&[ANA]));
+        for (name, original, edited) in
+            [("accepted", &inserted, &plain), ("rejected insertion", &inserted, &empty), ("rejected deletion", &deleted, &plain)]
+        {
+            let mut budget = Budget::new(MAX_WORK, MAX_MEMORY);
+            for _ in 0..2_000 {
+                let steps = plan(original, &before, &[edited], &after, &mut budget);
+                assert!(steps.is_ok(), "{name}: {steps:?} after {} work", MAX_WORK - budget.work_left());
+            }
+            assert!(MAX_WORK - budget.work_left() < MAX_WORK / 4, "{name}: {}", MAX_WORK - budget.work_left());
+        }
+    }
+
+    #[test]
+    fn keeps_formats_apart_by_their_numbers_too() {
+        // M5 (P13): formats differing only in size hash apart, so 10,000 of them cost little.
+        let mut original = Paragraph::new();
+        for index in 0..10_000u16 {
+            let off = original.len();
+            original.insert_text(off, "a", &CharProps { size: Some(8.0 + f32::from(index) * 0.5), ..CharProps::default() }).unwrap();
+        }
+        let mut budget = Budget::new(MAX_WORK, MAX_MEMORY);
+        assert!(plan(&original, &doc(&[]), &[&original], &doc(&[]), &mut budget).is_ok());
+        assert!(MAX_WORK - budget.work_left() < 500_000, "{}", MAX_WORK - budget.work_left());
+        // Equal formats hash alike, -0.0 and 0.0 included.
+        let zero = |size: f32| CharProps { size: Some(size), spacing: Some(size), ..CharProps::default() };
+        assert_eq!(format_hash(&zero(0.0)), format_hash(&zero(-0.0)));
+        assert_ne!(format_hash(&zero(0.0)), format_hash(&zero(1.0)));
+    }
+
+    #[test]
+    fn charges_a_diff_its_steps_exactly() {
+        let (before, after) = (doc(&[]), doc(&[]));
+        let mut budget = Budget::new(MAX_WORK, MAX_MEMORY);
+        let mut planner = Planner::new(&before, &after, &mut budget);
+        let (left, right) = (b"abcdef", b"abXdf");
+        let (steps, held) = planner.diff(left.len(), right.len(), &|i, j| left.get(i) == right.get(j)).unwrap();
+        assert!(!steps.is_empty());
+        assert_eq!(held, script_bytes(left.len(), right.len(), MAX_CHANGES));
+        assert_eq!(planner.ledger.held, held);
+        planner.ledger.release(held);
+        assert_eq!(planner.ledger.held, 0);
+    }
+
+    #[test]
+    fn charges_a_format_its_room_exactly() {
+        let (before, after) = (doc(&[]), doc(&[]));
+        let mut budget = Budget::new(MAX_WORK, MAX_MEMORY);
+        let mut planner = Planner::new(&before, &after, &mut budget);
+        let font = CharProps { font: Some("Serif".into()), ins: Some(3), ..CharProps::default() };
+        let kept = size::<CharProps>() + 5;
+        let slot = vector_slot::<CharProps>() + vector_slot::<u32>() + table_slot::<(u64, u32)>();
+        let room = vector_room::<CharProps>() + vector_room::<u32>() + table_room::<(u64, u32)>();
+        assert_eq!(planner.format(&font).unwrap(), 0);
+        assert_eq!(planner.ledger.held, kept + room + slot);
+        // The same format without its tracked change: found, nothing more held.
+        assert_eq!(planner.format(&CharProps { ins: None, ..font.clone() }).unwrap(), 0);
+        assert_eq!(planner.ledger.held, kept + room + slot);
+        assert_eq!(planner.format(&CharProps::default()).unwrap(), 1);
+        assert_eq!(planner.ledger.held, kept + room + 2 * slot + size::<CharProps>());
     }
 }

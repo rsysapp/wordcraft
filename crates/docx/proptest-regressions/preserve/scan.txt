@@ -1,0 +1,7 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc 1796429ee53a4cd38d9723569e11956d9560692a18ba146a118ccbfa2540c967 # shrinks to body = ["<w:sdt><w:sdtContent><w:p><w:pPr><w:framePr w:dropCap=\"drop\" w:lines=\"2\"/></w:pPr></w:p></w:sdtContent></w:sdt>"], note = ["<w:ins w:id=\"9\" w:author=\"A\"></w:ins><w:del w:id=\"10\" w:author=\"A\"></w:del>"], comment = ["<w:sdt><w:sdtContent></w:sdtContent></w:sdt>"], header = ["<mc:AlternateContent><mc:Choice Requires=\"w14\"></mc:Choice><mc:Fallback></mc:Fallback></mc:AlternateContent>"], second = ["<w:bookmarkStart w:id=\"1\" w:name=\"one\"/>"], form = 0

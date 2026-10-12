@@ -259,7 +259,8 @@ impl Reader<'_> {
             return *i;
         }
         let i = self.doc.revisions.len() as u32;
-        self.doc.revisions.push(Revision { kind, author, date });
+        // embed: the watermark that tells the file's records from those made later (Revision::read).
+        self.doc.revisions.push(Revision { kind, author, date, read: true });
         self.revs.insert(key, i);
         i
     }

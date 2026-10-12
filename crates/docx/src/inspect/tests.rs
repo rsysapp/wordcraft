@@ -195,6 +195,26 @@ fn diff_finds_the_shortest_script() {
     assert_eq!(diff(&['a'], &['b'], 1), None);
 }
 
+/// embed: what is left on one side only, once the common ends are matched, is the script itself:
+/// found in work that grows with its length (a search grows with its square), within the bound.
+#[test]
+fn diff_takes_what_one_side_holds_alone_without_searching() {
+    let long: Vec<u32> = std::iter::once(u32::MAX).chain(0..1_500).chain(std::iter::once(u32::MAX - 1)).collect();
+    let ends = [u32::MAX, u32::MAX - 1];
+    for (left, right) in [(&long[..], &ends[..]), (&ends[..], &long[..])] {
+        let mut work = budget::Budget::new(4_000, u64::MAX);
+        let steps = diff::script(left.len(), right.len(), &|i, j| left.get(i) == right.get(j), 1_500, &mut work).unwrap();
+        assert_eq!(steps.len(), 1_502);
+        assert_eq!(steps.first(), Some(&diff::Step::Same { left: 0, right: 0, len: 1 }));
+        assert_eq!(steps.last(), Some(&diff::Step::Same { left: left.len() - 1, right: right.len() - 1, len: 1 }));
+        assert!(steps.iter().skip(1).take(1_500).enumerate().all(|(index, step)| {
+            if left.len() > right.len() { *step == diff::Step::Delete(index + 1) } else { *step == diff::Step::Insert(index + 1) }
+        }));
+        let mut work = budget::Budget::new(4_000, u64::MAX);
+        assert!(diff::script(left.len(), right.len(), &|i, j| left.get(i) == right.get(j), 1_499, &mut work).is_none());
+    }
+}
+
 // ---- Packages with relationships, content types and comments ----------------------------------
 
 const MAIN_TYPE: &str = "application/vnd.openxmlformats-officedocument.wordprocessingml.document.main+xml";

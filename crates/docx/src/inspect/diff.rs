@@ -44,7 +44,16 @@ pub(crate) fn script(n: usize, m: usize, same: &dyn Fn(usize, usize) -> bool, ma
         }
     }
     let (inner_n, inner_m) = (n - prefix - suffix, m - prefix - suffix);
-    let inner = myers(inner_n, inner_m, &|i, j| same(prefix + i, prefix + j), max_changes, work)?;
+    // embed: what is left on one side only is the script itself; the search would find it after a
+    // number of rows that grows with its square (a rejected paragraph-long insertion).
+    let inner = if inner_n == 0 || inner_m == 0 {
+        if inner_n + inner_m > max_changes || !work.spend(units(inner_n + inner_m)) {
+            return None;
+        }
+        (0..inner_n).map(Step::Delete).chain((0..inner_m).map(Step::Insert)).collect()
+    } else {
+        myers(inner_n, inner_m, &|i, j| same(prefix + i, prefix + j), max_changes, work)?
+    };
     let mut steps = Vec::with_capacity(inner.len() + 2);
     if prefix > 0 {
         steps.push(Step::Same { left: 0, right: 0, len: prefix });

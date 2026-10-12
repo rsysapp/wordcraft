@@ -88,7 +88,8 @@ pub fn new_revision(s: &mut Session, kind: RevisionKind) -> u32 {
     {
         return i as u32;
     }
-    s.doc.revisions.push(Revision { kind, author: s.author.clone(), date });
+    // embed: a record made here, not read from the file (Revision::read).
+    s.doc.revisions.push(Revision { kind, author: s.author.clone(), date, read: false });
     (s.doc.revisions.len() - 1) as u32
 }
 
