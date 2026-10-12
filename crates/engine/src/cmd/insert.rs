@@ -101,7 +101,8 @@ pub fn specs() -> Vec<CommandSpec> {
         CommandSpec::new("insert.textFromFile", "Text from File", "Insert › Text › Object", |s, v| {
             let path = p::req_str(v, "path")?;
             let doc = crate::io::open_path(std::path::Path::new(path)).map_err(CmdError::Failed)?;
-            let frag = wordcraft_doc::edit::Fragment { blocks: doc.body.iter().map(|b| (**b).clone()).collect() };
+            // embed: the other file's paragraphs claim no origin here (Ruling 6C-33).
+            let frag = wordcraft_doc::edit::Fragment { blocks: doc.body.iter().map(|b| (**b).clone()).collect() }.detached();
             let at = delete_selection(s)?;
             let end = s.doc.insert_fragment(&at, &frag)?;
             s.sel = Selection::caret(end);

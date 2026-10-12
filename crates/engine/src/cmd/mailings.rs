@@ -390,7 +390,8 @@ fn finish(s: &mut Session, v: &Value) -> CmdResult {
     let mut record = from;
     while record < to {
         for b in &s.doc.body {
-            let mut blk = (**b).clone();
+            // embed: each record's copy is new content, not the paragraph it was made from (Ruling 6C-33).
+            let mut blk = (**b).clone().detached();
             merge_block(s, &mut blk, record);
             out.body.push(std::sync::Arc::new(blk));
         }

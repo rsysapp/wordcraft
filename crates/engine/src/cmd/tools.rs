@@ -501,17 +501,8 @@ fn compare(s: &mut Session, v: &Value) -> CmdResult {
         return Err(CmdError::Params("`path` or `text` of the revised document is required".into()));
     };
     let old: Vec<Paragraph> = s.doc.body.iter().filter_map(|b| b.as_para().cloned()).collect();
-    // embed: an origin is a position in the package its document was read from, so a paragraph
-    // brought in from the revised file claims none here.
-    let new: Vec<Paragraph> = revised
-        .body
-        .iter()
-        .filter_map(|b| b.as_para().cloned())
-        .map(|mut paragraph| {
-            paragraph.origin = None;
-            paragraph
-        })
-        .collect();
+    // embed: a paragraph brought in from the revised file claims no origin here (Ruling 6C-33).
+    let new: Vec<Paragraph> = revised.body.iter().filter_map(|b| b.as_para().cloned()).map(Paragraph::detached).collect();
     let author = "Compare".to_string();
     let date = super::now_iso();
     s.doc.revisions.push(wordcraft_doc::Revision { kind: RevisionKind::Insert, author: author.clone(), date: date.clone() });
@@ -760,7 +751,8 @@ fn quick_parts(s: &mut Session, v: &Value) -> CmdResult {
         s.building_blocks.remove(name);
     }
     if let Some(name) = p::str(v, "insert") {
-        let frag = s.building_blocks.get(name).cloned().ok_or_else(|| CmdError::Params(format!("no Quick Part `{name}`")))?;
+        // embed: a stored Quick Part is new content wherever it goes in (Ruling 6C-33).
+        let frag = s.building_blocks.get(name).cloned().ok_or_else(|| CmdError::Params(format!("no Quick Part `{name}`")))?.detached();
         let at = delete_selection(s)?;
         let end = s.doc.insert_fragment(&at, &frag)?;
         s.sel = Selection::caret(end);

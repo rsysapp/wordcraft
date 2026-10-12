@@ -10,6 +10,8 @@
 //! compare in document order.
 #![deny(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unimplemented, clippy::todo, clippy::unreachable)]
 
+// embed: content brought in from elsewhere claims no origin.
+mod detach;
 pub mod edit;
 pub mod numbering;
 pub mod para;

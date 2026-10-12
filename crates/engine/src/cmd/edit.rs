@@ -85,7 +85,8 @@ fn paste(s: &mut Session, v: &Value) -> CmdResult {
         let _ = images;
     }
     let at = delete_selection(s)?;
-    let mut frag = frag;
+    // embed: pasted paragraphs are new content, even when copied from this document (Ruling 6C-33).
+    let mut frag = frag.detached();
     if s.doc.settings.track_changes {
         let rid = super::new_revision(s, wordcraft_doc::RevisionKind::Insert);
         for b in &mut frag.blocks {
