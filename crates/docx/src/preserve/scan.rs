@@ -280,8 +280,12 @@ pub(crate) fn scan_package(
     budget: &mut Budget,
 ) -> Result<BTreeMap<String, ScannedPart>, DocxError> {
     // The budget is lent to the walk and given back whatever it answers.
-    let memory = Memory { budget: RefCell::new(std::mem::replace(budget, Budget::new(0, 0))), refused: Cell::new(false) };
+    let memory = Memory { budget: RefCell::new(std::mem::replace(budget, Budget::new(0, 0))), refused: Cell::new(false), net: Cell::new(0) };
     let scanned = scan_with(pkg, wanted, &memory);
+    // A refused scan has dropped everything it kept: all it held is given back.
+    if scanned.is_err() {
+        memory.release(memory.net.get());
+    }
     *budget = memory.budget.into_inner();
     scanned
 }
@@ -343,6 +347,8 @@ struct Memory {
     budget: RefCell<Budget>,
     /// A charge was refused: the walk stops and the scan is refused.
     refused: Cell<bool>,
+    /// What the scan holds now, all told.
+    net: Cell<u64>,
 }
 
 impl Memory {
@@ -352,16 +358,28 @@ impl Memory {
             return false;
         }
         let held = self.budget.try_borrow_mut().is_ok_and(|mut budget| budget.hold(bytes).is_ok());
-        if !held {
+        if held {
+            self.net.set(self.net.get().saturating_add(bytes));
+        } else {
             self.refused.set(true);
         }
         held
     }
 
     fn release(&self, bytes: u64) {
+        let bytes = bytes.min(self.net.get());
         if let Ok(mut budget) = self.budget.try_borrow_mut() {
             budget.release(bytes);
+            self.net.set(self.net.get() - bytes);
         }
+    }
+
+    /// What may still be held.
+    fn room(&self) -> u64 {
+        if self.refused.get() {
+            return 0;
+        }
+        self.budget.try_borrow().map_or(0, |budget| budget.room())
     }
 }
 
@@ -491,6 +509,8 @@ struct Builder<'m> {
     makers: HashMap<usize, usize>,
     /// The spans of fields that became objects.
     fields: HashSet<(usize, usize)>,
+    /// The equations (by node) that hold no WordprocessingML but run properties and text.
+    equations: HashSet<usize>,
     /// What an object may own among the children recorded whole, by (node, child), from their
     /// canonical names.
     owned: HashMap<(usize, usize), Owned>,
@@ -527,7 +547,46 @@ impl<'m> Builder<'m> {
             reusable: true,
             makers: HashMap::new(),
             fields: HashSet::new(),
+            equations: HashSet::new(),
             owned: HashMap::new(),
+        }
+    }
+
+    /// Record that the equation at `node` is plain: it holds no WordprocessingML but run properties
+    /// and text (and what is inside them). The reader keeps only an equation's linear text, so a
+    /// bookmark, comment range, permission range or tracked change inside one is markup the model
+    /// does not hold, and the equation is not whole. Walked with a stack of one entry per level,
+    /// charged while it is held.
+    fn plain_equation(&mut self, node: Option<usize>, equation: &PEl) {
+        let Some(node) = node else { return };
+        let level = units(std::mem::size_of::<std::slice::Iter<'_, PKid>>());
+        let mut levels = vec![equation.els()];
+        let mut charged = 0u64;
+        let mut plain = true;
+        while let Some(at) = levels.last_mut() {
+            match at.next() {
+                Some(child) if child.name == "w:rPr" || child.name == "w:t" => {}
+                Some(child) if child.name.starts_with("w:") => {
+                    plain = false;
+                    break;
+                }
+                Some(child) => {
+                    if !self.memory.hold(level.saturating_mul(2)) {
+                        plain = false;
+                        break;
+                    }
+                    charged = charged.saturating_add(level.saturating_mul(2));
+                    levels.push(child.els());
+                }
+                None => {
+                    levels.pop();
+                }
+            }
+        }
+        drop(levels);
+        self.memory.release(charged);
+        if plain && self.hold(table_slot::<usize>()) {
+            self.equations.insert(node);
         }
     }
 
@@ -791,15 +850,32 @@ impl Scanner<'_> {
     /// for the walk, charged while they do. `Ok(false)`: the part is absent. A part that cannot be
     /// parsed gave the model no paragraphs, so it gives none here either; its error is the caller's.
     fn with_part(&mut self, name: &str, walk: impl FnOnce(&mut Self, &Ctx<'_>, &PEl)) -> Result<bool, DocxError> {
+        // Nothing more is parsed once the scan has stopped.
+        if self.stopped() {
+            return Ok(true);
+        }
         let pkg = self.pkg;
         let Some(key) = pkg.part_index(name).and_then(|index| pkg.part_name(index)) else { return Ok(false) };
         let Some(bytes) = pkg.get(key) else { return Ok(false) };
-        let Some(root) = pkg.tree(name)? else { return Ok(false) };
+        // The parse charges the tree as it builds it, within what the budget has room for; what
+        // the tree then holds stays charged while it is walked.
+        let parsed = match pkg.tree(name, self.memory.room()) {
+            Ok(Some(parsed)) => parsed,
+            Ok(None) => return Ok(false),
+            // Past the room the budget had: the scan is refused for memory, as any charge is.
+            Err(DocxError::Limit(reason)) if reason == super::tree::TOO_MUCH_MEMORY => {
+                self.memory.refused.set(true);
+                return Ok(true);
+            }
+            Err(error) => return Err(error),
+        };
+        let root = parsed.root;
         let count = count_paragraphs(&root, 0);
         let walked = tree_bytes(&root).saturating_add(table_sized::<(usize, u32)>(count));
-        if !self.memory.hold(walked) {
+        if !self.memory.hold(parsed.charged.max(walked)) {
             return Ok(true);
         }
+        self.memory.release(parsed.charged.max(walked) - walked);
         let ordinals = number_paragraphs(&root, count);
         let rels = pkg.rels(name);
         if self.wanted.contains_key(key)
@@ -1196,10 +1272,12 @@ impl Scanner<'_> {
             }
             "m:oMath" => {
                 let node = node_of(b);
+                b.plain_equation(node, element);
                 emit(story, b, object(whole(node, lock)));
             }
             "m:oMathPara" => {
                 let node = node_of(b);
+                b.plain_equation(node, element);
                 for _ in element.els().filter(|child| child.name == "m:oMath") {
                     emit(story, b, object(whole(node, lock)));
                 }
@@ -1614,7 +1692,7 @@ fn settle_objects(b: &mut Builder<'_>) {
         total += running;
         prefix.push(total);
     }
-    let (nodes, makers, fields, owned) = (&b.nodes, &b.makers, &b.fields, &b.owned);
+    let (nodes, makers, fields, owned, equations) = (&b.nodes, &b.makers, &b.fields, &b.owned, &b.equations);
     // The children of node `at` an object owns, given which it may own whole.
     let holds_only = |at: usize, run: &RunNode, may: &dyn Fn(usize, Option<Owned>) -> bool| {
         run.children.iter().enumerate().all(|(index, child)| match child.kind {
@@ -1634,11 +1712,7 @@ fn settle_objects(b: &mut Builder<'_>) {
         let made = match (fields.contains(&(first, last)), (first == last).then(|| makers.get(&first)).flatten()) {
             (true, None) => Some(Made::Field),
             (false, Some(child)) => Some(Made::By(*child)),
-            (false, None)
-                if first == last && matches!(span.first(), Some(Node::Other { name, .. }) if name == "m:oMath" || name == "m:oMathPara") =>
-            {
-                Some(Made::Equation)
-            }
+            (false, None) if first == last && equations.contains(&first) => Some(Made::Equation),
             _ => None,
         };
         // A field owns its field characters, instructions, result text and characters and page
@@ -1703,7 +1777,7 @@ mod tests {
 
     /// The prefix the part's root is written with.
     fn written_prefix(bytes: &[u8]) -> String {
-        let text = String::from_utf8_lossy(bytes);
+        let text = String::from_utf8_lossy(bytes.strip_prefix(b"\xef\xbb\xbf").unwrap_or(bytes)).into_owned();
         let root = text.split('<').find(|tag| !tag.is_empty() && !tag.starts_with('?') && !tag.starts_with('!')).unwrap_or_default();
         let name = root.split(|c: char| c.is_whitespace() || c == '>' || c == '/').next().unwrap_or_default();
         name.split_once(':').map(|(prefix, _)| prefix.to_string()).unwrap_or_default()
@@ -1829,10 +1903,44 @@ mod tests {
         }
     }
 
+    /// Where the tag starting at `from` ends (just past its `>`), reading quoted values whole.
+    fn tag_end(bytes: &[u8], from: usize) -> usize {
+        let mut quote = None;
+        for (offset, byte) in bytes[from..].iter().enumerate() {
+            match (quote, *byte) {
+                (Some(open), byte) if byte == open => quote = None,
+                (None, b'"' | b'\'') => quote = Some(*byte),
+                (None, b'>') => return from + offset + 1,
+                _ => {}
+            }
+        }
+        bytes.len()
+    }
+
+    /// `range` is one whole element whose local name is `local`: its start tag, and either nothing
+    /// more (written empty) or everything up to its own end tag.
+    fn is_element(bytes: &[u8], range: &Range<usize>, local_name: &str) -> bool {
+        if !bytes[range.clone()].starts_with(b"<") || bytes[range.clone()].starts_with(b"</") {
+            return false;
+        }
+        let start = range.start..tag_end(bytes, range.start);
+        let written = tag_name(bytes, &start);
+        if local(&written) != local_name {
+            return false;
+        }
+        if bytes[start.clone()].ends_with(b"/>") {
+            return range.end == start.end;
+        }
+        let tail = String::from_utf8_lossy(&bytes[range.clone()]).into_owned();
+        let Some(close) = tail.rfind("</") else { return false };
+        let end = range.start + close..range.end;
+        range.end > start.end && tag_name(bytes, &end) == written && tail[close..].trim_end_matches('>').trim_end() == format!("</{written}")
+    }
+
     fn check_props(bytes: &[u8], props: &Props) {
         assert!(is_start(bytes, &props.start, &props.raw_name) && closes(bytes, &props.start, &props.end));
         for (name, range) in &props.children {
-            assert!(range.start >= props.start.end && bytes[range.clone()].starts_with(b"<") && !name.is_empty());
+            assert!(range.start >= props.start.end && is_element(bytes, range, local(name)), "properties child {name} at {range:?}");
         }
         if let Some(rpr) = &props.rpr {
             check_props(bytes, rpr);
@@ -1870,6 +1978,49 @@ mod tests {
         }
     }
 
+    /// N2: an equation's WordprocessingML (its part's own prefix, or no prefix in a part written in
+    /// the default namespace) is only run properties and text and what is inside them.
+    fn plain_equation(bytes: &[u8], span: &Range<usize>) -> bool {
+        let prefix = written_prefix(bytes);
+        let text = String::from_utf8_lossy(&bytes[span.clone()]).into_owned();
+        let mut skipping: Option<(String, usize)> = None;
+        for piece in text.split('<').skip(1) {
+            let tag = piece.split('>').next().unwrap_or_default();
+            if tag.starts_with('?') || tag.starts_with('!') {
+                continue;
+            }
+            let closing = tag.starts_with('/');
+            let empty = tag.ends_with('/');
+            let name = tag.trim_start_matches('/').split(|c: char| c.is_whitespace() || c == '/').next().unwrap_or_default();
+            if let Some((skipped, depth)) = &mut skipping {
+                if name == skipped.as_str() && !empty {
+                    if closing {
+                        *depth -= 1;
+                    } else {
+                        *depth += 1;
+                    }
+                }
+                if *depth == 0 {
+                    skipping = None;
+                }
+                continue;
+            }
+            let wordprocessing =
+                if prefix.is_empty() { !name.contains(':') } else { name.strip_prefix(prefix.as_str()).is_some_and(|rest| rest.starts_with(':')) };
+            if closing || !wordprocessing {
+                continue;
+            }
+            if matches!(local(name), "rPr" | "t") {
+                if !empty {
+                    skipping = Some((name.to_string(), 1));
+                }
+                continue;
+            }
+            return false;
+        }
+        true
+    }
+
     /// The span a wrapper covers.
     fn covers(wrapper: &Wrapper) -> Range<usize> {
         wrapper.start.start..wrapper.end.as_ref().map_or(wrapper.start.end, |end| end.end)
@@ -1885,10 +2036,10 @@ mod tests {
     /// I1: an object's nodes hold only what it owns. A picture or note owns the child that made
     /// it, alone in its run; a field owns runs of field characters, instructions, result text and
     /// characters; an equation its element; and every one of them rendered page breaks.
-    fn atomic_is_whole(paragraph: &ScannedPara, first: usize, last: usize) -> bool {
+    fn atomic_is_whole(bytes: &[u8], paragraph: &ScannedPara, first: usize, last: usize) -> bool {
         let span = &paragraph.nodes[first..=last];
-        if let [Node::Other { name, .. }] = span {
-            return name == "m:oMath" || name == "m:oMathPara";
+        if let [Node::Other { name, span, .. }] = span {
+            return (name == "m:oMath" || name == "m:oMathPara") && plain_equation(bytes, span);
         }
         let children: Vec<(&str, bool)> = span
             .iter()
@@ -1949,6 +2100,9 @@ mod tests {
         for node in &paragraph.nodes {
             let node_span = node_span(node);
             assert!(node_span.start >= at && node_span.end <= span.end, "nodes in order inside the paragraph");
+            if let Node::Other { name, span, .. } = node {
+                assert!(is_element(bytes, span, local(name)), "node {name} at {span:?}");
+            }
             at = node_span.end;
             // A wrapper covers a node exactly when the node names it, itself or through its parents.
             let chain = paragraph.chain(node.wrapper());
@@ -1958,7 +2112,8 @@ mod tests {
             }
             if let Node::Run(run) = node {
                 assert!(is_start(bytes, &run.start, &run.raw_name) && closes(bytes, &run.start, &run.end));
-                assert!(run.rpr.as_ref().is_none_or(|rpr| local(&tag_name(bytes, rpr)) == "rPr" && rpr.start >= run.start.end));
+                assert!(run.rpr.as_ref().is_none_or(|rpr| is_element(bytes, rpr, "rPr") && rpr.start >= run.start.end));
+                assert!(run.rpr_change.as_ref().is_none_or(|change| is_element(bytes, change, "rPrChange")));
                 // The first `w:rPr` is the run's; any later one is a child.
                 assert!(run.children.iter().all(|child| run.rpr.as_ref().is_some_and(|rpr| rpr.end <= child.span.start) || local(&tag_name(bytes, &child.span)) != "rPr"));
                 assert!(
@@ -1968,11 +2123,20 @@ mod tests {
                     assert!(child.span.start >= run.start.end && child.span.end <= run.span().end);
                     match &child.kind {
                         ChildKind::Text { start, end, raw_name, chars, .. } => {
+                            assert_eq!(child.span, start.start..end.as_ref().map_or(start.end, |end| end.end));
+                            assert!(is_element(bytes, &child.span, local(raw_name)));
                             assert!(is_start(bytes, start, raw_name) && closes(bytes, start, end));
                             assert!(chars.iter().all(|raw| raw.bytes.start >= start.end));
                         }
-                        ChildKind::Other { start, end, raw_name } => assert!(is_start(bytes, start, raw_name) && closes(bytes, start, end)),
-                        ChildKind::Single { .. } => assert!(single_char(bytes, &child.span).is_some()),
+                        ChildKind::Other { start, end, raw_name } => {
+                            assert!(is_start(bytes, start, raw_name) && closes(bytes, start, end));
+                            assert_eq!(child.span, start.start..end.as_ref().map_or(start.end, |end| end.end));
+                            assert!(is_element(bytes, &child.span, local(raw_name)));
+                        }
+                        ChildKind::Single { .. } => {
+                            assert!(single_char(bytes, &child.span).is_some());
+                            assert!(is_element(bytes, &child.span, local(&tag_name(bytes, &child.span))));
+                        }
                     }
                 }
             }
@@ -1996,7 +2160,7 @@ mod tests {
                 }
                 Loc::Atomic { first, last } => {
                     assert!(first <= last && last < paragraph.nodes.len() && unit.ch == OBJ);
-                    assert!(atomic_is_whole(paragraph, first, last), "Atomic {{ {first}, {last} }} holds what it does not own");
+                    assert!(atomic_is_whole(bytes, paragraph, first, last), "Atomic {{ {first}, {last} }} holds what it does not own");
                     let wrapper = paragraph.nodes[first].wrapper();
                     assert!(paragraph.nodes[first..=last].iter().all(|node| node.wrapper() == wrapper));
                     // No other unit stands in its nodes.
@@ -2578,9 +2742,9 @@ mod tests {
         assert!(matches!(scan_package(&Package::open_with(&bytes, &shallow).unwrap(), &wanted, &mut budget()), Err(DocxError::Limit(_))));
         // The tree spends what it counts: a second reading of the part finds less left.
         let pkg = Package::open_with(&bytes, &ReadLimits { max_elements: 30, ..ReadLimits::default() }).unwrap();
-        assert!(pkg.tree("word/document.xml").unwrap().is_some());
-        assert!(pkg.tree("word/document.xml").is_err() && pkg.limit_reached());
-        assert!(pkg.tree("word/missing.xml").unwrap().is_none());
+        assert!(pkg.tree("word/document.xml", u64::MAX).unwrap().is_some());
+        assert!(pkg.tree("word/document.xml", u64::MAX).is_err() && pkg.limit_reached());
+        assert!(pkg.tree("word/missing.xml", u64::MAX).unwrap().is_none());
         // No main part, or one that is not a document.
         let entries = vec![("_rels/.rels".to_string(), b"<Relationships/>".to_vec())];
         let pkg = Package::open_with(&zip_entries(&entries).unwrap(), &ReadLimits::default()).unwrap();
@@ -2861,11 +3025,24 @@ mod tests {
     fn refuses_when_a_secondary_part_is_past_a_limit() {
         let declarations: String = (0..=crate::xml::MAX_BINDINGS).map(|index| format!(r#" xmlns:p{index}="u""#)).collect();
         let footnotes = format!(r#"<w:footnotes {W}{declarations}><w:footnote w:id="1"><w:p/></w:footnote></w:footnotes>"#);
+        let endnotes = format!(r#"<w:endnotes {W}{declarations}><w:endnote w:id="1"><w:p/></w:endnote></w:endnotes>"#);
+        let comments = format!(r#"<w:comments {W}{declarations}><w:comment w:id="0"><w:p/></w:comment></w:comments>"#);
         let header = format!(r#"<w:hdr {W}{declarations}><w:p/></w:hdr>"#);
+        let footer = format!(r#"<w:ftr {W}{declarations}><w:p/></w:ftr>"#);
         let wanted = BTreeMap::from([("word/document.xml".to_string(), BTreeSet::from([0]))]);
         let note = r#"<w:p><w:r><w:footnoteReference w:id="1"/></w:r></w:p>"#;
+        let end_note = r#"<w:p><w:r><w:endnoteReference w:id="1"/></w:r></w:p>"#;
+        let commented = r#"<w:p><w:commentRangeStart w:id="0"/><w:r><w:t>a</w:t></w:r><w:commentRangeEnd w:id="0"/></w:p>"#;
         let named = r#"<w:p/><w:sectPr><w:headerReference w:type="default" r:id="rId1"/></w:sectPr>"#;
-        for (kind, name, part, body) in [("footnotes", "word/footnotes.xml", footnotes, note), ("header", "word/header1.xml", header, named)] {
+        let footed = r#"<w:p><w:pPr><w:sectPr><w:footerReference w:type="default" r:id="rId1"/></w:sectPr></w:pPr></w:p>"#;
+        let cases = [
+            ("footnotes", "word/footnotes.xml", footnotes, note),
+            ("endnotes", "word/endnotes.xml", endnotes, end_note),
+            ("comments", "word/comments.xml", comments, commented),
+            ("header", "word/header1.xml", header, named),
+            ("footer", "word/footer1.xml", footer, footed),
+        ];
+        for (kind, name, part, body) in cases {
             let target = name.trim_start_matches("word/");
             let bytes = package(body, &[("rId1", kind, target)], &[(name, part.into_bytes())]);
             // The reader skips the part; the scan refuses.
@@ -2924,5 +3101,106 @@ mod tests {
         let mut small = Budget::new(crate::inspect::MAX_WORK, 4 << 20);
         assert!(matches!(scan_package(&pkg, &wanted, &mut small), Err(DocxError::Limit(message)) if message == SCAN_TOO_LARGE));
         assert!(small.peak() <= 4 << 20);
+    }
+
+    /// N3: a field whose only extra is a run holding a reference that made nothing (a spent comment
+    /// reference, a reference to a note that does not exist) is locked: the run child is not one a
+    /// field owns.
+    #[test]
+    fn locks_a_field_holding_a_reference_that_made_nothing() {
+        let comments = format!(r#"<w:comments {W}><w:comment w:id="0"><w:p/></w:comment></w:comments>"#);
+        let field = |extra: &str| {
+            format!(
+                r#"<w:p><w:r><w:fldChar w:fldCharType="begin"/></w:r><w:r><w:instrText> PAGE </w:instrText></w:r><w:r><w:fldChar w:fldCharType="separate"/></w:r><w:r>{extra}</w:r><w:r><w:fldChar w:fldCharType="end"/></w:r></w:p>"#
+            )
+        };
+        let body = format!(
+            r#"<w:p><w:commentRangeStart w:id="0"/><w:r><w:t>a</w:t></w:r><w:commentRangeEnd w:id="0"/></w:p>{}{}{}"#,
+            field(r#"<w:commentReference w:id="0"/>"#),
+            field(r#"<w:footnoteReference w:id="7"/>"#),
+            field("<w:t>1</w:t>")
+        );
+        let bytes = package(&body, &[("rId1", "comments", "comments.xml")], &[("word/comments.xml", comments.into_bytes())]);
+        let scanned = scans_as_read(&bytes);
+        assert_eq!(objects(body_paragraph(&scanned, 1)), vec![&Loc::Locked { node: Some(0), child: None }]);
+        assert_eq!(objects(body_paragraph(&scanned, 2)), vec![&Loc::Locked { node: Some(0), child: None }]);
+        assert_eq!(objects(body_paragraph(&scanned, 3)), vec![&Loc::Atomic { first: 0, last: 4 }]);
+    }
+
+    /// N2: an equation is whole only when it holds no WordprocessingML but run properties and text:
+    /// a bookmark, a comment range, a permission range or a tracked change inside it is markup the
+    /// model does not hold (it keeps the equation's linear text), so the equation is locked.
+    #[test]
+    fn locks_an_equation_holding_wordprocessing_markup() {
+        let comments = format!(r#"<w:comments {W}><w:comment w:id="0"><w:p/></w:comment></w:comments>"#);
+        let math = |inside: &str| format!(r#"<w:p><m:oMath>{inside}<m:r><w:rPr><w:b/></w:rPr><m:t>x</m:t></m:r></m:oMath></w:p>"#);
+        let body = [
+            math(r#"<w:bookmarkStart w:id="30" w:name="eq"/>"#),
+            r#"<w:p><w:bookmarkEnd w:id="30"/></w:p>"#.to_string(),
+            math(r#"<w:commentRangeStart w:id="0"/>"#),
+            r#"<w:p><w:commentRangeEnd w:id="0"/><w:r><w:commentReference w:id="0"/></w:r></w:p>"#.to_string(),
+            math(r#"<w:permStart w:id="1" w:edGrp="everyone"/>"#),
+            math(r#"<w:ins w:id="5" w:author="A"><m:r><m:t>y</m:t></m:r></w:ins>"#),
+            math(""),
+            r#"<w:p><m:oMathPara><m:oMath><m:r><w:rPr><w:i/></w:rPr><w:t>z</w:t></m:r></m:oMath></m:oMathPara></w:p>"#.to_string(),
+        ]
+        .concat();
+        let bytes = package(&body, &[("rId1", "comments", "comments.xml")], &[("word/comments.xml", comments.into_bytes())]);
+        let scanned = scans_as_read(&bytes);
+        for index in [0, 2, 4, 5] {
+            assert_eq!(objects(body_paragraph(&scanned, index)), vec![&Loc::Locked { node: Some(0), child: None }], "paragraph {index}");
+        }
+        assert_eq!(objects(body_paragraph(&scanned, 6)), vec![&Loc::Atomic { first: 0, last: 0 }]);
+        assert_eq!(objects(body_paragraph(&scanned, 7)), vec![&Loc::Atomic { first: 0, last: 0 }]);
+    }
+
+    /// N5: a refused scan gives back everything it held, the paragraphs it had kept included.
+    #[test]
+    fn gives_back_what_it_held_when_it_refuses() {
+        let declarations: String = (0..=crate::xml::MAX_BINDINGS).map(|index| format!(r#" xmlns:p{index}="u""#)).collect();
+        let header = format!(r#"<w:hdr {W}{declarations}><w:p/></w:hdr>"#);
+        let body = format!(r#"{}<w:sectPr><w:headerReference w:type="default" r:id="rId1"/></w:sectPr>"#, para("kept").repeat(2_000));
+        let bytes = package(&body, &[("rId1", "header", "header1.xml")], &[("word/header1.xml", header.into_bytes())]);
+        let wanted = BTreeMap::from([("word/document.xml".to_string(), (0..2_000).collect::<BTreeSet<u32>>())]);
+        let pkg = Package::open_with(&bytes, &ReadLimits::default()).unwrap();
+        let mut budget = budget();
+        budget.hold(1_000).unwrap();
+        assert!(matches!(scan_package(&pkg, &wanted, &mut budget), Err(DocxError::Limit(_))));
+        assert_eq!(budget.held(), 1_000);
+        assert!(budget.peak() > 1_000_000, "the paragraphs were kept, then given back");
+    }
+
+    #[global_allocator]
+    static ALLOCATOR: wordcraft_testkit::counting::Counting = wordcraft_testkit::counting::Counting;
+
+    /// Set in the process `parses_no_further_than_the_budget_allows` starts to measure in.
+    const MEASURING: &str = "WORDCRAFT_SCAN_MEASURE";
+
+    /// N1: a part's tree is charged as it is parsed, so a part far past the budget is refused
+    /// before the scan allocates more than the budget: 1,000,000 paragraphs (7 MB of XML, a small
+    /// zip) under a 1 MiB budget. Measured by the counting allocator in a process of its own, since
+    /// its counts are the whole process's.
+    #[test]
+    fn parses_no_further_than_the_budget_allows() {
+        if std::env::var_os(MEASURING).is_some() {
+            let bytes = package(&"<w:p/>".repeat(1_000_000), &[], &[]);
+            let wanted = BTreeMap::from([("word/document.xml".to_string(), BTreeSet::from([0]))]);
+            let pkg = Package::open_with(&bytes, &ReadLimits::default()).unwrap();
+            let limit: u64 = 1 << 20;
+            let mut budget = Budget::new(crate::inspect::MAX_WORK, limit);
+            let before = wordcraft_testkit::counting::reset_peak();
+            let scanned = scan_package(&pkg, &wanted, &mut budget);
+            let allocated = units(wordcraft_testkit::counting::peak().saturating_sub(before));
+            eprintln!("allocated {allocated} under a budget of {limit}");
+            assert!(matches!(scanned, Err(DocxError::Limit(_))));
+            assert!(allocated <= limit, "allocated {allocated} under a budget of {limit}");
+            return;
+        }
+        let status = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "preserve::scan::tests::parses_no_further_than_the_budget_allows", "--test-threads=1", "--nocapture"])
+            .env(MEASURING, "1")
+            .status()
+            .unwrap();
+        assert!(status.success());
     }
 }

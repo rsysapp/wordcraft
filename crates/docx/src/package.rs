@@ -163,10 +163,10 @@ impl Package {
     }
 
     /// embed: a part's positional tree (the preserving writer's scan), parsed within the same limits
-    /// and the same element budget as [`Package::xml`]: what it counts is spent, and a limit reached is
-    /// recorded.
-    pub(crate) fn tree(&self, name: &str) -> Result<Option<crate::preserve::tree::PEl>, DocxError> {
-        self.parse_within(name, crate::preserve::tree::parse_limited)
+    /// and the same element budget as [`Package::xml`] (what it counts is spent, and a limit reached is
+    /// recorded), and within `max_bytes` of memory, charged as the tree is built.
+    pub(crate) fn tree(&self, name: &str, max_bytes: u64) -> Result<Option<crate::preserve::tree::Parsed>, DocxError> {
+        self.parse_within(name, |bytes, records, depth| crate::preserve::tree::parse_charged(bytes, records, depth, max_bytes))
     }
 
     /// embed: parse part `name` with `parse` (given the bytes, the elements it may count and the

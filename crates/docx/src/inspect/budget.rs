@@ -118,6 +118,11 @@ impl Budget {
         self.held
     }
 
+    /// embed: what may still be held (the preserving writer's scan gives it to a part's parse).
+    pub(crate) fn room(&self) -> u64 {
+        self.limit.saturating_sub(self.held)
+    }
+
     /// Start measuring the peak again from what is held now.
     pub(crate) fn reset_peak(&mut self) {
         self.peak = self.held;

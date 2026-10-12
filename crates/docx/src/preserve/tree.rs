@@ -9,13 +9,15 @@
 //! CDATA section), and every namespace declaration written, counts as one element against the
 //! caller's limit, because the tree keeps one record for each reference and piece of text where the
 //! desktop parser merges them (the desktop parser counts elements only); elements nest no deeper
-//! than the caller's depth limit (`ReadLimits::max_depth`, at most [`MAX_DEPTH`]). Parsing
+//! than the caller's depth limit (`ReadLimits::max_depth`, at most [`MAX_DEPTH`]); what the tree
+//! holds is charged as it is kept, against the caller's memory allowance ([`parse_charged`]). Parsing
 //! and [`PEl::find`] keep their own stacks; the derived `Clone`, `PartialEq`, `Debug` and the drop
 //! recurse once per level, so the depth limit bounds them.
 
 use std::ops::Range;
 
 use crate::DocxError;
+use crate::inspect::budget::{units, vector_slot};
 use crate::xml::{self, MAX_DEPTH, MAX_ELEMENTS, Reading, TOO_DEEP, TOO_MANY_ELEMENTS, Token};
 
 /// An element with where its tags are in the part. Names are canonical as in `xml::El` (`w:p`
@@ -110,10 +112,25 @@ impl PEl {
 }
 
 /// [`parse_limited`] within the parser's own limits. Tests only: a production caller reads within a
-/// package's read limits (`ReadLimits`), through [`parse_limited`].
+/// package's read limits (`ReadLimits`) and a memory allowance, through [`parse_charged`].
 #[cfg(test)]
 pub(crate) fn parse(bytes: &[u8]) -> Result<PEl, DocxError> {
     parse_limited(bytes, MAX_ELEMENTS, MAX_DEPTH).map(|(root, _)| root)
+}
+
+/// [`parse_charged`] with no memory allowance of its own. Tests only.
+#[cfg(test)]
+pub(crate) fn parse_limited(bytes: &[u8], max_records: usize, max_depth: usize) -> Result<(PEl, usize), DocxError> {
+    parse_charged(bytes, max_records, max_depth, u64::MAX).map(|(parsed, used)| (parsed.root, used))
+}
+
+/// The error [`parse_charged`] answers past its memory allowance.
+pub(crate) const TOO_MUCH_MEMORY: &str = "more memory than a part's tree may hold";
+
+/// A parsed part, and the most memory its parse was charged.
+pub(crate) struct Parsed {
+    pub root: PEl,
+    pub charged: u64,
 }
 
 /// Parse a part through the desktop parser's own reading (`xml::Reading`: the same configuration,
@@ -125,10 +142,16 @@ pub(crate) fn parse(bytes: &[u8]) -> Result<PEl, DocxError> {
 /// never the other way round. Elements nest at most `max_depth` deep (never deeper than
 /// [`MAX_DEPTH`]). Answers how many records it counted, so a package can spend one budget across
 /// its parts. Past either limit it refuses with the desktop parser's errors.
-pub(crate) fn parse_limited(bytes: &[u8], max_records: usize, max_depth: usize) -> Result<(PEl, usize), DocxError> {
+///
+/// What the tree holds is charged as each record is kept (its room in its parent's growing list,
+/// its names and attributes, and its place on the open elements' stack while it is open), and the
+/// parse refuses with [`TOO_MUCH_MEMORY`] before the charge passes `max_bytes`. The answer carries
+/// the most it was charged.
+pub(crate) fn parse_charged(bytes: &[u8], max_records: usize, max_depth: usize, max_bytes: u64) -> Result<(Parsed, usize), DocxError> {
     let max_depth = max_depth.min(MAX_DEPTH);
     let mut reading = Reading::new(bytes)?;
     let mut records = Records { kept: 0, limit: max_records.min(MAX_ELEMENTS) };
+    let mut memory = Charge { held: 0, peak: 0, limit: max_bytes };
     let mut stack: Vec<PEl> = Vec::new();
     let mut root: Option<PEl> = None;
     loop {
@@ -140,17 +163,20 @@ pub(crate) fn parse_limited(bytes: &[u8], max_records: usize, max_depth: usize) 
                 // Kept for the life of the tree: no room left over from growing.
                 attrs.shrink_to_fit();
                 let element = PEl { name: tag.name, raw_name, attrs, start: range, end: None, kids: Vec::new() };
+                memory.hold(vector_slot::<PKid>().saturating_add(names_bytes(&element)))?;
                 if tag.empty {
                     attach(&mut stack, &mut root, element);
                 } else {
                     if stack.len() >= max_depth {
                         return Err(DocxError::Limit(TOO_DEEP.into()));
                     }
+                    memory.hold(vector_slot::<PEl>())?;
                     stack.push(element);
                 }
             }
             Token::End => {
                 if let Some(mut element) = stack.pop() {
+                    memory.release(vector_slot::<PEl>());
                     element.end = Some(range);
                     attach(&mut stack, &mut root, element);
                 }
@@ -160,15 +186,18 @@ pub(crate) fn parse_limited(bytes: &[u8], max_records: usize, max_depth: usize) 
             Token::Text(text) if !stack.is_empty() => {
                 xml::text(&text)?;
                 records.keep()?;
+                memory.hold(vector_slot::<PKid>())?;
                 push(&mut stack, PKid::Text(range));
             }
             Token::CData(_) if !stack.is_empty() => {
                 records.keep()?;
+                memory.hold(vector_slot::<PKid>())?;
                 push(&mut stack, PKid::CData(range));
             }
             Token::Ref(reference) if !stack.is_empty() => {
                 let ch = xml::reference(&reference)?;
                 records.keep()?;
+                memory.hold(vector_slot::<PKid>())?;
                 push(&mut stack, PKid::Ref { range, ch });
             }
             Token::Eof => break,
@@ -183,7 +212,34 @@ pub(crate) fn parse_limited(bytes: &[u8], max_records: usize, max_depth: usize) 
         attach(&mut stack, &mut root, element);
     }
     let root = root.ok_or_else(|| DocxError::Xml("no root element".into()))?;
-    Ok((root, records.kept))
+    Ok((Parsed { root, charged: memory.peak }, records.kept))
+}
+
+/// What an element's names and attributes hold.
+fn names_bytes(element: &PEl) -> u64 {
+    let attributes = element.attrs.iter().fold(0usize, |sum, (key, value)| sum.saturating_add(key.capacity()).saturating_add(value.capacity()));
+    units(element.name.capacity().saturating_add(element.raw_name.capacity()).saturating_add(attributes))
+        .saturating_add(units(element.attrs.capacity()).saturating_mul(units(std::mem::size_of::<(String, String)>())))
+}
+
+/// What a parse holds, refused past its allowance.
+struct Charge {
+    held: u64,
+    peak: u64,
+    limit: u64,
+}
+
+impl Charge {
+    fn hold(&mut self, bytes: u64) -> Result<(), DocxError> {
+        let held = self.held.checked_add(bytes).filter(|held| *held <= self.limit).ok_or_else(|| DocxError::Limit(TOO_MUCH_MEMORY.into()))?;
+        self.held = held;
+        self.peak = self.peak.max(held);
+        Ok(())
+    }
+
+    fn release(&mut self, bytes: u64) {
+        self.held = self.held.saturating_sub(bytes);
+    }
 }
 
 /// The records a parse has kept, and how many it may.

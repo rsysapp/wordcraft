@@ -18,5 +18,7 @@ log = { workspace = true }
 
 [dev-dependencies]
 proptest = { workspace = true }
+# embed: the counting allocator, so a test can hold what the scan allocates against what it charges.
+wordcraft-testkit = { path = "../testkit" }
 image = { workspace = true }
 zip = { workspace = true }
