@@ -1269,6 +1269,7 @@ impl Reader {
                     "listlevel" if self.list_cur.len() < 9 => {
                         self.list_cur.push(true);
                     }
+                    "listlevel" => {}
                     "levelnfc" | "levelnfcn" => {
                         if let Some(l) = self.list_cur.last_mut() {
                             *l = !matches!(pv, 23 | 255);
@@ -1378,11 +1379,8 @@ impl Reader {
                 self.st.fmt.sub = false;
             }
             "fs" => self.st.fmt.size = if pv > 0 { Some((pv as f32 / 2.0).clamp(1.0, 1638.0)) } else { None },
-            "ansicpg" => {
-                if pv > 0 && wordcraft_doc::encoding::SINGLE_BYTE_CODE_PAGES.contains(&(pv as u16)) {
-                    self.ansicpg = pv as u16;
-                }
-            }
+            "ansicpg" if pv > 0 && wordcraft_doc::encoding::SINGLE_BYTE_CODE_PAGES.contains(&(pv as u16)) => self.ansicpg = pv as u16,
+            "ansicpg" => {}
             "deff" => self.deff = pv,
             "f" => {
                 self.st.cp = self.font_cps.get(&pv).copied();

@@ -1189,7 +1189,9 @@ impl FontDb {
                 return f;
             }
         }
-        // A localized family name (宋体 → SimSun).
+        // A localized family name (宋体 → SimSun). embed: on wasm, without the system font loading
+        // below, the two `if`s would collapse; the embed build lints for wasm too.
+        #[cfg_attr(target_arch = "wasm32", allow(clippy::collapsible_if))]
         if let Some(en) = self.english_family(family).filter(|en| !en.eq_ignore_ascii_case(family)) {
             if let Some(f) = self.find(&en, style) {
                 return f;
@@ -1506,6 +1508,8 @@ impl FontDb {
     }
 
     fn search_east_asian(&self, chars: &[char], exclude: u32, bold: bool, italic: bool) -> Option<Arc<FontFace>> {
+        // embed: only the system fallback below (not on wasm) changes it.
+        #[cfg_attr(target_arch = "wasm32", allow(unused_mut))]
         let mut base = self.loaded_covering(chars, exclude);
         #[cfg(not(target_arch = "wasm32"))]
         if base.is_none() {

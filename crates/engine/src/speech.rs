@@ -255,7 +255,9 @@ struct Shared {
     /// Bumped on every change that should stop the sentence being spoken.
     generation: u64,
     error: Option<String>,
-    /// A worker thread is running (cleared under the lock as it exits).
+    /// A worker thread is running (cleared under the lock as it exits). embed: no worker runs on
+    /// wasm, where the embed build lints too.
+    #[cfg_attr(target_arch = "wasm32", allow(dead_code))]
     running: bool,
 }
 
