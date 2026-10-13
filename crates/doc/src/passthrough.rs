@@ -94,9 +94,11 @@ mod tests {
     #[test]
     fn a_document_prints_its_media_by_name_and_length() {
         let mut doc = crate::Document::new();
+        // The empty document's own print, whatever upstream's model holds by default.
+        let baseline = format!("{doc:?}").len();
         doc.media.insert("image1.png".into(), Arc::new(vec![7; 1 << 20]));
         let printed = format!("{doc:?}");
-        assert!(printed.len() < 100_000, "{} characters", printed.len());
+        assert!(printed.len() < baseline + 100, "{} characters, {baseline} without the picture", printed.len());
         assert!(printed.contains(r#"media: {"image1.png": 1048576 bytes}"#), "{printed}");
     }
 

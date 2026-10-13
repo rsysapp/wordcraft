@@ -1476,10 +1476,6 @@ impl Session {
                     if self.edit_rules.is_none() {
                         self.doc.prune_text_boxes();
                     }
-                    // Glued connectors follow the shapes they join (the change is counted below).
-                    if crate::cmd::connectors::reroutes_after(id) {
-                        crate::cmd::connectors::reroute(self);
-                    }
                     // embed: in an edit session a command that changed nothing (Accept with nothing to
                     // accept, an empty paste) leaves no revision record, no undo step and the content
                     // version as it was, so the host is not told the document differs.
@@ -1507,6 +1503,11 @@ impl Session {
                             self.touch();
                         }
                         None => self.touch(),
+                    }
+                    // Glued connectors follow the shapes they join (after the touch above, so the
+                    // layout they are routed by is this command's).
+                    if crate::cmd::connectors::reroutes_after(id) && crate::cmd::connectors::reroute(self) {
+                        self.touch();
                     }
                 }
                 self.clamp_selection();

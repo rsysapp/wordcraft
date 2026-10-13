@@ -160,6 +160,9 @@ fn find_controls(app: &mut WordApp, ui: &mut Ui) {
         status_label(ui, match_status(app));
     }
     let field = ui.add(egui::TextEdit::singleline(&mut query).id_salt("embed_find").hint_text("Find in document").desired_width(180.0));
+    // A name for screen readers and UI tests whatever the field holds (egui gives a field only its
+    // hint, and only while it is empty).
+    ui.ctx().accesskit_node_builder(field.id, |node| node.set_label("Find in document"));
     if focus {
         field.request_focus();
     }

@@ -1359,7 +1359,6 @@ fn passages_longer_than_the_raw_cap_are_skipped_and_not_found() {
 
 // --- Selection events ---
 
-use egui::accesskit::Role;
 use egui_kittest::kittest::Queryable;
 
 fn assert_selection_at(h: &mut egui_kittest::Harness<'_, WordApp>, events: &[HostEvent], end: &Pos, expect_text: &str) {
@@ -1429,8 +1428,10 @@ fn selection_coordinates_are_points_at_double_density() {
 #[test]
 fn selection_coordinates_are_css_pixels_under_an_egui_zoom() {
     let (mut h, bridge) = embed_app();
-    h.ctx.set_zoom_factor(1.5);
+    // Since the upstream merge the app sets egui's zoom factor from its interface size every frame.
+    h.state_mut().ui.interface_size = wordcraft_ui_egui::theme::InterfaceSize::from_percent(150.0).unwrap();
     frames(&mut h, 2);
+    assert_eq!(h.ctx.zoom_factor(), 1.5);
     open_doc(&mut h, &bridge, &clauses(20));
     let (_, after) = drag_select(&mut h, &bridge, &Pos::body(0, 0), &Pos::body(0, 9));
     let [HostEvent::Selection { x, y, .. }] = after.as_slice() else { panic!("{after:?}") };
@@ -1495,9 +1496,9 @@ fn jumps_and_finds_send_no_selection_but_clear_a_reported_one() {
     let events = bridge.take_events();
     assert!(events.contains(&HostEvent::SelectionCleared), "{events:?}");
     assert!(!events.iter().any(is_selection), "{events:?}");
-    h.get_by_role(Role::TextInput).focus();
+    h.get_by(find_field()).focus();
     frames(&mut h, 2);
-    h.get_by_role(Role::TextInput).type_text("schedule 7");
+    h.get_by(find_field()).type_text("schedule 7");
     frames(&mut h, 3);
     assert_eq!(h.state().session.selected_text(), "Schedule 7");
     assert!(!bridge.take_events().iter().any(is_selection));
@@ -1514,9 +1515,9 @@ fn every_selection_the_editor_makes_clears_a_reported_one_and_is_never_reported(
             "host text jump" => bridge.send(HostCommand::JumpTo(text_target("Clause 9.", None, 0))),
             "next page button" => h.get_by_label("Next page").click(),
             "find" => {
-                h.get_by_role(Role::TextInput).focus();
+                h.get_by(find_field()).focus();
                 frames(&mut h, 2);
-                h.get_by_role(Role::TextInput).type_text("goods listed");
+                h.get_by(find_field()).type_text("goods listed");
             }
             _ => bridge.send(HostCommand::Open { name: "next.docx".into(), bytes: docx(&clauses(120)) }),
         }
@@ -1780,9 +1781,9 @@ fn a_jump_held_across_a_frame_is_not_undone_by_a_newer_one_that_finds_nothing() 
 fn a_find_that_leaves_the_selection_alone_keeps_a_reported_one() {
     let (mut h, bridge) = embed_app();
     open_doc(&mut h, &bridge, &clauses(30));
-    h.get_by_role(Role::TextInput).focus();
+    h.get_by(find_field()).focus();
     frames(&mut h, 2);
-    h.get_by_role(Role::TextInput).type_text("zzz");
+    h.get_by(find_field()).type_text("zzz");
     frames(&mut h, 3);
     select_a_visible_clause(&mut h, &bridge, 30);
     // Next and Previous find no match: nothing moved, so the host's selection stands.
@@ -1792,7 +1793,7 @@ fn a_find_that_leaves_the_selection_alone_keeps_a_reported_one() {
         assert_eq!(bridge.take_events(), vec![], "{button}");
     }
     // Escape in the field clears the search but selects nothing.
-    h.get_by_role(Role::TextInput).focus();
+    h.get_by(find_field()).focus();
     frames(&mut h, 2);
     h.key_press(egui::Key::Escape);
     frames(&mut h, 3);

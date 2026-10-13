@@ -330,7 +330,9 @@ fn paste_text(s: &mut Session, v: &Value) -> CmdResult {
         Some(t) => t.to_string(),
         None => s.clipboard.as_ref().map(Fragment::plain_text).unwrap_or_default(),
     };
-    if text.is_empty() {
+    // embed: in an edit session pasting nothing changes nothing and refuses nothing (the host is
+    // told nothing; `super::paste_text`).
+    if text.is_empty() && s.edit_rules.is_none() {
         return Err(CmdError::Failed("the clipboard is empty".into()));
     }
     super::paste_text(s, &text.replace("\r\n", "\r").replace('\n', "\r"))?;

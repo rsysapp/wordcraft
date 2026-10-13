@@ -73,8 +73,9 @@ struct Untouched {
 fn untouched(s: &Session) -> Untouched {
     let mut view_chrome = serde_json::to_value(&s.view).expect("view state serialises");
     if let Some(fields) = view_chrome.as_object_mut() {
-        // Find opens the navigation pane, and zoom commands set zoom and fit: those are the point.
-        for zoom_field in ["zoom", "fit", "multiPage", "navPane"] {
+        // Find opens the navigation pane, and zoom commands set zoom and fit (and, since the upstream
+        // merge, whether fitted pages stand in one column): those are the point.
+        for zoom_field in ["zoom", "fit", "multiPage", "singleColumn", "navPane"] {
             fields.remove(zoom_field);
         }
     }

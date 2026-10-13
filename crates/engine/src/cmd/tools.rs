@@ -1080,6 +1080,8 @@ fn compare(s: &mut Session, v: &Value) -> CmdResult {
                 // The revised block, with its formatting changes tracked.
                 if let (Some(Block::Para(pa)), Some(Block::Para(pb))) = (a.map(|x| &**x), b.map(|x| &**x)) {
                     let mut p = pb.clone();
+                    // embed: it stands where the original paragraph stood, and is its text.
+                    p.origin = pa.origin;
                     if opts.formatting && pa.text == pb.text {
                         let before = s.doc.revisions.len();
                         super::fmt_revisions::compare_formatting(pa, &mut p, &mut s.doc.revisions, &author, &date);

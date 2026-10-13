@@ -398,6 +398,10 @@ fn autosave_writes_nothing() {
         let app = h.state_mut();
         app.autosave = true;
         app.session.path = Some(path.clone());
+        // Since the upstream merge AutoSave writes only where the document was saved: saved here
+        // first (refused in view mode), then the file removed, so only AutoSave can write it again.
+        let _ = app.execute("file.save", serde_json::json!({ "path": path.to_string_lossy() }));
+        let _ = std::fs::remove_file(&path);
         app.session.dirty = true;
         app.canvas.caret_visible_since = 0.0;
         frames(h, 3);
@@ -504,9 +508,9 @@ fn the_view_bar_zooms_from_the_fitted_scale_in_wide_and_narrow_windows() {
 #[test]
 fn find_selects_matches_and_steps_through_them() {
     let (mut h, _bridge) = view_app(clauses(30), 1.0);
-    h.get_by_role(Role::TextInput).focus();
+    h.get_by(find_field()).focus();
     frames(&mut h, 2);
-    h.get_by_role(Role::TextInput).type_text("schedule 2");
+    h.get_by(find_field()).type_text("schedule 2");
     frames(&mut h, 3);
     assert_eq!(h.state().session.selected_text(), "Schedule 2");
     let first = h.state().session.sel.clone();
@@ -522,7 +526,7 @@ fn ctrl_f_focuses_the_find_field() {
     let (mut h, _bridge) = view_app(clauses(5), 1.0);
     h.key_press_modifiers(egui::Modifiers::COMMAND, egui::Key::F);
     frames(&mut h, 3);
-    assert!(h.get_by_role(Role::TextInput).is_focused());
+    assert!(h.get_by(find_field()).is_focused());
     assert!(h.state().dialog.is_none());
 }
 
@@ -556,18 +560,18 @@ fn an_empty_document_shows_a_bar_that_cannot_navigate() {
 #[test]
 fn find_reports_no_matches_and_an_empty_query_clears_the_highlight() {
     let (mut h, _bridge) = view_app(clauses(30), 1.0);
-    h.get_by_role(Role::TextInput).focus();
+    h.get_by(find_field()).focus();
     frames(&mut h, 2);
-    h.get_by_role(Role::TextInput).type_text("zzz-nothing");
+    h.get_by(find_field()).type_text("zzz-nothing");
     frames(&mut h, 3);
     assert!(drawn_text(&h).contains("No matches"), "{}", drawn_text(&h));
     assert!(!h.get_by_label("Next match").accesskit_node().is_disabled());
-    h.get_by_role(Role::TextInput).focus();
+    h.get_by(find_field()).focus();
     frames(&mut h, 1);
     h.key_press_modifiers(egui::Modifiers::COMMAND, egui::Key::A);
     h.key_press(egui::Key::Backspace);
     frames(&mut h, 1);
-    h.get_by_role(Role::TextInput).type_text("Schedule 2");
+    h.get_by(find_field()).type_text("Schedule 2");
     frames(&mut h, 3);
     assert_eq!(h.state().session.selected_text(), "Schedule 2");
     h.key_press_modifiers(egui::Modifiers::COMMAND, egui::Key::A);
@@ -582,23 +586,23 @@ fn find_reports_no_matches_and_an_empty_query_clears_the_highlight() {
 #[test]
 fn enter_shift_enter_and_escape_work_in_the_find_field() {
     let (mut h, _bridge) = view_app(clauses(30), 1.0);
-    h.get_by_role(Role::TextInput).focus();
+    h.get_by(find_field()).focus();
     frames(&mut h, 2);
-    h.get_by_role(Role::TextInput).type_text("schedule 2");
+    h.get_by(find_field()).type_text("schedule 2");
     frames(&mut h, 3);
     let first = h.state().session.sel.clone();
     h.key_press(egui::Key::Enter);
     frames(&mut h, 3);
     let second = h.state().session.sel.clone();
     assert_ne!(second, first, "Enter did not step to the next match");
-    assert!(h.get_by_role(Role::TextInput).is_focused(), "Enter left the field");
+    assert!(h.get_by(find_field()).is_focused(), "Enter left the field");
     h.key_press_modifiers(egui::Modifiers::SHIFT, egui::Key::Enter);
     frames(&mut h, 3);
     assert_eq!(h.state().session.sel, first, "Shift+Enter did not step back");
     h.key_press(egui::Key::Escape);
     frames(&mut h, 3);
-    assert!(!h.get_by_role(Role::TextInput).is_focused());
-    assert!(h.get_by_role(Role::TextInput).value().unwrap_or_default().is_empty(), "Escape left the query");
+    assert!(!h.get_by(find_field()).is_focused());
+    assert!(h.get_by(find_field()).value().unwrap_or_default().is_empty(), "Escape left the query");
     assert_eq!(h.state().session.selected_text(), "");
 }
 
@@ -613,10 +617,10 @@ fn the_view_bar_draws_no_replace_control() {
 
 /// Type `text` one character at a time into the find field, as a person does.
 fn type_into_find(h: &mut Harness<'static, WordApp>, text: &str) {
-    h.get_by_role(Role::TextInput).focus();
+    h.get_by(find_field()).focus();
     frames(h, 2);
     for letter in text.chars() {
-        h.get_by_role(Role::TextInput).type_text(&letter.to_string());
+        h.get_by(find_field()).type_text(&letter.to_string());
         frames(h, 2);
     }
 }
