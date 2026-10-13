@@ -34,16 +34,20 @@ impl Class {
 /// prefix.
 pub const TABLE: &[(&str, Class)] = &[
     ("geom", Class::Layer(0)),
+    ("control-key", Class::Standalone),
     ("doc", Class::Layer(1)),
     ("fonts", Class::Layer(1)),
+    ("metafile", Class::Layer(1)),
     ("proof", Class::Layer(1)),
     ("layout", Class::Layer(2)),
     ("docx", Class::Layer(2)),
+    ("docbin", Class::Layer(2)),
     ("formats", Class::Layer(2)),
     ("render", Class::Layer(3)),
     ("pdf", Class::Layer(3)),
     ("engine", Class::Layer(4)),
     ("mcp", Class::Layer(5)),
+    ("zotero", Class::Layer(5)),
     ("ui-egui", Class::Layer(6)),
     ("testkit", Class::Testkit),
     // apps and tooling
@@ -166,12 +170,11 @@ pub fn check(crates: &[Crate]) -> Vec<Violation> {
                     continue;
                 }
                 match classify(&d.name) {
-                    // Unregistered deps are reported on their own entry.
-                    None => {}
                     Some(Class::Testkit) if d.kind != DepKind::Dev => {
                         out.push(Violation::TestkitAsNormalDep { krate: c.name.clone() });
                     }
-                    Some(Class::Testkit) => {}
+                    // Unregistered deps are reported on their own entry; testkit dev deps are allowed.
+                    None | Some(Class::Testkit) => {}
                     Some(dc) => {
                         let to = dc.layer().unwrap_or(u8::MAX);
                         if to >= layer && !(to == layer && intra_layer_allowed(&c.name, &d.name)) {

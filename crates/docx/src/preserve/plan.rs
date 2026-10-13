@@ -252,6 +252,26 @@ fn format_hash(props: &CharProps) -> u64 {
     hasher.finish()
 }
 
+/// embed: whether the planner compares objects of this kind. The kinds the reader made when the
+/// scan and the emitter were written; any kind the reader has learnt since (a chart, a group, a
+/// content control's or a field's markers, an editing permission, ruby) refuses the paragraph
+/// until the scan maps it exactly.
+fn plannable(object: &InlineObject) -> bool {
+    matches!(
+        object,
+        InlineObject::Image { .. }
+            | InlineObject::Shape { .. }
+            | InlineObject::Field { .. }
+            | InlineObject::NoteRef { .. }
+            | InlineObject::BookmarkStart { .. }
+            | InlineObject::BookmarkEnd { .. }
+            | InlineObject::CommentStart { .. }
+            | InlineObject::CommentEnd { .. }
+            | InlineObject::Equation { .. }
+            | InlineObject::Opaque { .. }
+    )
+}
+
 /// The text an object holds, for what comparing it costs.
 fn object_weight(object: &InlineObject) -> usize {
     match object {
@@ -260,8 +280,11 @@ fn object_weight(object: &InlineObject) -> usize {
         InlineObject::Field { instr, result, .. } => instr.len().saturating_add(result.len()),
         InlineObject::NoteRef { custom, .. } => custom.len(),
         InlineObject::BookmarkStart { name } | InlineObject::BookmarkEnd { name } => name.len(),
-        InlineObject::Equation { linear, .. } => linear.len(),
+        // embed: the structured equation is compared too; its linear form is about as long.
+        InlineObject::Equation { linear, .. } => linear.len().saturating_mul(2),
         InlineObject::Opaque { format, xml, text } => format.len().saturating_add(xml.len()).saturating_add(text.len()),
+        // embed: never weighed: `Planner::object` refuses them first (`plannable`).
+        _ => 0,
     }
 }
 
@@ -272,12 +295,14 @@ fn object_hash(object: &InlineObject) -> u64 {
     match object {
         InlineObject::Image { media, alt, .. } => (media, alt).hash(&mut hasher),
         InlineObject::Shape { story, .. } => story.hash(&mut hasher),
-        InlineObject::Field { instr, result, locked } => (instr, result, locked).hash(&mut hasher),
+        InlineObject::Field { instr, result, locked, code } => (instr, result, locked, code).hash(&mut hasher),
         InlineObject::NoteRef { kind, id, custom } => (kind, id, custom).hash(&mut hasher),
         InlineObject::BookmarkStart { name } | InlineObject::BookmarkEnd { name } => name.hash(&mut hasher),
         InlineObject::CommentStart { id } | InlineObject::CommentEnd { id } => id.hash(&mut hasher),
-        InlineObject::Equation { linear, display } => (linear, display).hash(&mut hasher),
+        InlineObject::Equation { linear, display, .. } => (linear, display).hash(&mut hasher),
         InlineObject::Opaque { format, xml, text } => (format, xml, text).hash(&mut hasher),
+        // embed: the kind alone (equal objects still hash alike); `plannable` refuses them first.
+        _ => {}
     }
     hasher.finish()
 }
@@ -290,9 +315,12 @@ enum Side {
     Edited,
 }
 
+/// What a record records: kind, author, date and, for one end of a move, the move's name.
+type SourceKey<'a> = (RevisionKind, &'a str, &'a str, Option<&'a str>);
+
 /// The file's records: each one's first index in `before` by what it records.
 struct Sources<'a> {
-    by_record: HashMap<(RevisionKind, &'a str, &'a str), u32>,
+    by_record: HashMap<SourceKey<'a>, u32>,
     /// For each record of `before`, the first index recording the same change.
     first: Vec<u32>,
 }
@@ -341,15 +369,17 @@ impl<'a, 'b> Planner<'a, 'b> {
     fn sources(&mut self) -> Result<&Sources<'a>, Unpreservable> {
         if self.sources.is_none() {
             let records = &self.before.revisions;
-            self.ledger.hold(
-                table_sized::<((RevisionKind, &str, &str), u32)>(records.len()).saturating_add(units(records.len()).saturating_mul(size::<u32>())),
-            )?;
+            self.ledger
+                .hold(table_sized::<(SourceKey<'_>, u32)>(records.len()).saturating_add(units(records.len()).saturating_mul(size::<u32>())))?;
             let mut by_record = HashMap::with_capacity(records.len());
             let mut first = Vec::with_capacity(records.len());
             for (index, record) in records.iter().enumerate() {
-                self.ledger.work(1u64.saturating_add(units(record.author.len().saturating_add(record.date.len())) / BYTES_PER_UNIT))?;
+                let named = record.move_name.as_deref().map_or(0, str::len);
+                self.ledger
+                    .work(1u64.saturating_add(units(record.author.len().saturating_add(record.date.len()).saturating_add(named)) / BYTES_PER_UNIT))?;
                 let index = u32::try_from(index).map_err(|_| Unpreservable::TooManyChanges)?;
-                first.push(*by_record.entry((record.kind, record.author.as_str(), record.date.as_str())).or_insert(index));
+                let key = (record.kind, record.author.as_str(), record.date.as_str(), record.move_name.as_deref());
+                first.push(*by_record.entry(key).or_insert(index));
             }
             self.sources = Some(Sources { by_record, first });
         }
@@ -370,8 +400,10 @@ impl<'a, 'b> Planner<'a, 'b> {
         let after: &'a Document = self.after;
         let found = usize::try_from(index).ok().and_then(|index| after.revisions.get(index)).ok_or(Unpreservable::Altered)?;
         if found.read {
-            self.ledger.work(1u64.saturating_add(units(found.author.len().saturating_add(found.date.len())) / BYTES_PER_UNIT))?;
-            let key = (found.kind, found.author.as_str(), found.date.as_str());
+            let named = found.move_name.as_deref().map_or(0, str::len);
+            self.ledger
+                .work(1u64.saturating_add(units(found.author.len().saturating_add(found.date.len()).saturating_add(named)) / BYTES_PER_UNIT))?;
+            let key = (found.kind, found.author.as_str(), found.date.as_str(), found.move_name.as_deref());
             return self.sources()?.by_record.get(&key).copied().map(Some).ok_or(Unpreservable::Altered);
         }
         let source = u32::try_from(self.before.revisions.len()).map_err(|_| Unpreservable::TooManyChanges)?;
@@ -382,6 +414,11 @@ impl<'a, 'b> Planner<'a, 'b> {
     fn revision(&mut self, record: u32) -> Result<Revision, Unpreservable> {
         let index = usize::try_from(record).ok().and_then(|record| record.checked_sub(self.before.revisions.len()));
         let found = index.and_then(|index| self.after.revisions.get(index)).ok_or(Unpreservable::Altered)?;
+        // embed: the session's changes are written as insertions and deletions; a move it made
+        // would lose its pairing (edit sessions make none: `cmd::moves::cut_tracked`).
+        if found.move_name.is_some() {
+            return Err(Unpreservable::Unsupported("a moved passage"));
+        }
         self.ledger.hold(units(found.author.len()).saturating_add(units(found.date.len())))?;
         Ok(Revision { author: found.author.clone(), date: found.date.clone() })
     }
@@ -428,6 +465,9 @@ impl<'a, 'b> Planner<'a, 'b> {
         let Some(object) = object else {
             return Ok(if side == Side::Source { MISSING_OBJECT } else { NEW_OBJECT });
         };
+        if !plannable(object) {
+            return Err(Unpreservable::Unsupported("an object of a kind this writer does not rewrite"));
+        }
         let weight = units(object_weight(object)) / BYTES_PER_UNIT;
         self.ledger.work(1u64.saturating_add(weight))?;
         let hash = object_hash(object);
@@ -1053,7 +1093,13 @@ mod tests {
         let mut d = Document::new();
         d.revisions = revisions
             .iter()
-            .map(|(author, date)| Recorded { kind: RevisionKind::Insert, author: (*author).into(), date: (*date).into(), read: false })
+            .map(|(author, date)| Recorded {
+                kind: RevisionKind::Insert,
+                author: (*author).into(),
+                date: (*date).into(),
+                move_name: None,
+                read: false,
+            })
             .collect();
         d
     }
@@ -1337,7 +1383,7 @@ mod tests {
 
     #[test]
     fn anchors_typing_next_to_a_field_and_a_bookmark() {
-        let field = InlineObject::Field { instr: "PAGE".into(), result: "3".into(), locked: false };
+        let field = InlineObject::Field { instr: "PAGE".into(), result: "3".into(), locked: false, code: false };
         let original = with_object(para(&[("Page ", None, None, false), (" of", None, None, false)]), 5, field, &bold());
         // After the field, with its formatting: the field.
         let mut after_field = original.clone();
@@ -1530,7 +1576,7 @@ mod tests {
         let original = para(&[("Rent monthly.", None, None, false)]);
         let removed = para(&[("Rent .", None, None, false)]);
         assert_eq!(planned(&original, &doc(&[]), &[&removed], &doc(&[])), Err(Unpreservable::Untracked));
-        let page = |result: &str| InlineObject::Field { instr: "PAGE".into(), result: result.into(), locked: false };
+        let page = |result: &str| InlineObject::Field { instr: "PAGE".into(), result: result.into(), locked: false, code: false };
         let original = with_object(para(&[("Page ", None, None, false)]), 5, page("3"), &CharProps::default());
         let recalculated = with_object(para(&[("Page ", None, None, false)]), 5, page("4"), &CharProps::default());
         assert_eq!(planned(&original, &doc(&[]), &[&recalculated], &doc(&[])), Err(Unpreservable::Untracked));

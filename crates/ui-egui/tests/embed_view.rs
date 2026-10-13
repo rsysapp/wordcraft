@@ -368,8 +368,13 @@ fn saving_and_exporting_never_download() {
     // The web shell turns these commands into downloads before they reach the engine's gate.
     let downloads: Rc<RefCell<Vec<String>>> = Rc::default();
     let recorder = downloads.clone();
-    let services =
-        Services { download: Some(Box::new(move |name: &str, _: &[u8]| recorder.borrow_mut().push(name.to_string()))), ..Default::default() };
+    let services = Services {
+        download: Some(Box::new(move |name: &str, _: &[u8]| {
+            recorder.borrow_mut().push(name.to_string());
+            Ok(())
+        })),
+        ..Default::default()
+    };
     let mut h = view_app_with(clauses(3), services);
     for id in ["file.save", "file.saveAs", "file.exportPdf", "file.exportPng"] {
         let result = h.state_mut().run(id, json!({"path": "out.docx"}));

@@ -1928,7 +1928,7 @@ fn a_host_theme_sends_no_window_theme_command() {
 #[test]
 fn the_hosts_theme_wins_over_the_apps_own_dark_setting() {
     let (mut h, bridge) = embed_app();
-    h.state_mut().ui.dark = true;
+    h.state_mut().ui.theme = wordcraft_ui_egui::theme::Appearance::Dark;
     h.state_mut().session.view.dark_mode = true;
     frames(&mut h, 2);
     bridge.send(HostCommand::SetTheme(theme(false, "#0f766e")));
@@ -2205,7 +2205,7 @@ fn a_selected_balloon_is_readable_in_the_embed_and_in_the_full_apps_dark_mode() 
     }
     // The full app in dark mode, no host accent: the card must not take the chrome's navy.
     let mut h = full_app(commented_document());
-    h.state_mut().ui.dark = true;
+    h.state_mut().ui.theme = wordcraft_ui_egui::theme::Appearance::Dark;
     frames(&mut h, 3);
     assert!(Tokens::get(&h.ctx).dark);
     let contrasts = selected_balloon_contrasts(&mut h);

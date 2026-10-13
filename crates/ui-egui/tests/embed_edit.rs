@@ -982,7 +982,13 @@ fn with_download_service(downloads: std::rc::Rc<std::cell::Cell<usize>>) -> (Har
     use wordcraft_ui_egui::Services;
     use wordcraft_ui_egui::host::EmbedProfile;
     let bridge = HostBridge::new();
-    let services = Services { download: Some(Box::new(move |_, _| downloads.set(downloads.get() + 1))), ..Services::default() };
+    let services = Services {
+        download: Some(Box::new(move |_, _| {
+            downloads.set(downloads.get() + 1);
+            Ok(())
+        })),
+        ..Services::default()
+    };
     let app = WordApp::new(wordcraft_engine::Session::new(Document::new()), services).with_host(bridge.clone(), EmbedProfile::View);
     let mut harness = common::harness(app, 1.0);
     bridge.set_context(harness.ctx.clone());

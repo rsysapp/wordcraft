@@ -1909,7 +1909,7 @@ mod tests {
 
     /// A session record in `after`.
     fn session(after: &mut Document, kind: RevisionKind) -> u32 {
-        after.revisions.push(Recorded { kind, author: "Sari Wulan".into(), date: "2026-10-10T08:00:00Z".into(), read: false });
+        after.revisions.push(Recorded { kind, author: "Sari Wulan".into(), date: "2026-10-10T08:00:00Z".into(), move_name: None, read: false });
         u32::try_from(after.revisions.len() - 1).unwrap()
     }
 

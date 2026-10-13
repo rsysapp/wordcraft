@@ -773,7 +773,7 @@ mod tests {
     }
 
     fn field(result: &str) -> InlineObject {
-        InlineObject::Field { instr: "REF clause_five".into(), result: result.into(), locked: false }
+        InlineObject::Field { instr: "REF clause_five".into(), result: result.into(), locked: false, code: false }
     }
 
     fn found_in_paragraph(paragraph: Paragraph, passage: &str) -> (Document, Vec<(usize, usize)>) {
@@ -865,8 +865,10 @@ mod tests {
         let mut table = Table::new(1, 2, 200.0);
         table.rows[0].cells[0] = Cell::with_text("Left");
         table.rows[0].cells[1].blocks = vec![para_block(paragraph_with_hidden(&[("Right", false), (" secret", true)]))];
-        let fragment =
-            Fragment { blocks: vec![Block::Para(with_field), Block::Table(table), Block::Para(Paragraph::with_text("End", CharProps::default()))] };
+        let fragment = Fragment {
+            blocks: vec![Block::Para(with_field), Block::Table(table), Block::Para(Paragraph::with_text("End", CharProps::default()))],
+            ..Default::default()
+        };
         assert_eq!(visible_fragment_text(&fragment), "Fee 5is  due\nLeft\tRight\nEnd");
         assert_eq!(visible_fragment_text(&Fragment::default()), "");
     }
@@ -904,7 +906,8 @@ mod tests {
     fn an_object_inside_hidden_text_keeps_the_object_counter_aligned() {
         // "A " + hidden [comment anchor] + " B " + field "5": the field is objects[1].
         let mut paragraph = paragraph_with_hidden(&[("A ", false), ("\u{FFFC}", true), (" B ", false), ("\u{FFFC}", false)]);
-        paragraph.objects = vec![InlineObject::Field { instr: "REF hidden_one".into(), result: "WRONG".into(), locked: false }, field("5")];
+        paragraph.objects =
+            vec![InlineObject::Field { instr: "REF hidden_one".into(), result: "WRONG".into(), locked: false, code: false }, field("5")];
         let (_, ranges) = found_in_paragraph(paragraph.clone(), "a b 5");
         assert_eq!(ranges, vec![(0, paragraph.text.len())]);
         assert!(found_in_paragraph(paragraph.clone(), "wrong").1.is_empty(), "the hidden field's result is not shown");

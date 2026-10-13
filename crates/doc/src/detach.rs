@@ -38,9 +38,16 @@ impl Block {
 }
 
 impl Fragment {
-    /// The fragment with every block [`Block::detached`].
+    /// The fragment with every block [`Block::detached`], the text box stories it carries included.
     pub fn detached(self) -> Fragment {
-        Fragment { blocks: self.blocks.into_iter().map(Block::detached).collect() }
+        let Fragment { blocks, mut parts } = self;
+        for part in parts.values_mut() {
+            for block in &mut part.blocks {
+                let inner = Arc::make_mut(block);
+                *inner = std::mem::replace(inner, Block::Para(Paragraph::new())).detached();
+            }
+        }
+        Fragment { blocks: blocks.into_iter().map(Block::detached).collect(), parts }
     }
 }
 
@@ -62,11 +69,22 @@ mod tests {
         inner.rows[0].cells[0] = Cell { blocks: vec![para_block(read_from(2, "Inner"))], ..Cell::empty() };
         let mut outer = Table::new(1, 1, 200.0);
         outer.rows[0].cells[0] = Cell { blocks: vec![para_block(read_from(1, "Outer")), Arc::new(Block::Table(inner))], ..Cell::empty() };
-        let fragment = Fragment { blocks: vec![Block::Para(read_from(0, "Before")), Block::Table(outer)] }.detached();
+        let fragment = Fragment { blocks: vec![Block::Para(read_from(0, "Before")), Block::Table(outer)], ..Default::default() }.detached();
         let mut doc = crate::Document::new();
         doc.body = fragment.blocks.into_iter().map(Arc::new).collect();
         let paths = doc.para_paths(crate::StoryRef::Body);
         let texts: Vec<_> = paths.iter().filter_map(|path| doc.para(crate::StoryRef::Body, path)).map(|p| (p.plain_text(), p.origin)).collect();
         assert_eq!(texts, [("Before".to_string(), None), ("Outer".to_string(), None), ("Inner".to_string(), None)]);
+    }
+
+    // embed: a fragment's text box stories become new parts too.
+    #[test]
+    fn detaches_the_text_box_stories_a_fragment_carries() {
+        let story = crate::Part { kind: crate::PartKind::TextBox, blocks: vec![para_block(read_from(4, "Boxed"))], body: Default::default() };
+        let fragment = Fragment { blocks: vec![Block::Para(read_from(0, "Before"))], parts: [(7, story)].into_iter().collect() }.detached();
+        let origins: Vec<_> =
+            fragment.parts.values().flat_map(|part| part.blocks.iter()).filter_map(|block| block.as_para()).map(|p| p.origin).collect();
+        assert_eq!(origins, [None]);
+        assert_eq!(fragment.blocks.first().and_then(Block::as_para).map(|p| p.origin), Some(None));
     }
 }

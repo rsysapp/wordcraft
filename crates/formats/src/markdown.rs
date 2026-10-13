@@ -542,12 +542,16 @@ fn push_text(nodes: &mut Vec<Node>, s: &str, f: &Fmt) {
     nodes.push(Node::Text(s.to_string(), f.clone()));
 }
 
-/// The closing `]` matching the `[` at byte `open` (escapes and code spans respected).
-fn matching_bracket(s: &str, open: usize) -> Option<usize> {
+/// The closing `]` matching the `[` at byte `open` (escapes and code spans respected). Gives up
+/// after looking `max` bytes ahead.
+fn matching_bracket(s: &str, open: usize, max: usize) -> Option<usize> {
     let b = s.as_bytes();
     let mut depth = 0usize;
     let mut i = open;
     while let Some(&c) = b.get(i) {
+        if i - open > max {
+            return None;
+        }
         match c {
             b'\\' => i += 1,
             b'`' => {
@@ -687,6 +691,10 @@ fn tag_attr(tag: &str, name: &str) -> Option<String> {
 
 fn tokenize(s: &str, base: &Fmt, depth: usize) -> Vec<Node> {
     let mut nodes: Vec<Node> = Vec::new();
+    // Bytes the link and image scans below may look ahead in total. Each unmatched `[` or `![(`
+    // would otherwise rescan the rest of the text, which is quadratic on hostile input; once the
+    // budget is gone, further brackets are plain text.
+    let mut scan_budget = s.len().saturating_mul(8).saturating_add(8192);
     let b = s.as_bytes();
     let mut i = 0usize;
     let mut text_start = 0usize;
@@ -758,8 +766,12 @@ fn tokenize(s: &str, base: &Fmt, depth: usize) -> Vec<Node> {
             b'!' | b'[' if depth < MAX_NEST => {
                 let img = c == b'!';
                 let open = if img { i + 1 } else { i };
-                let parsed = if b.get(open) == Some(&b'[') {
-                    matching_bracket(s, open).and_then(|close| {
+                let parsed = if b.get(open) == Some(&b'[') && scan_budget > 0 {
+                    let found = matching_bracket(s, open, scan_budget);
+                    scan_budget = scan_budget.saturating_sub(found.map_or(scan_budget, |close| close - open));
+                    found.and_then(|close| {
+                        // A destination that does not parse may have been read to the end of the text.
+                        scan_budget = scan_budget.saturating_sub(s.len().saturating_sub(close));
                         let (dest, end) = link_dest(s, close + 1)?;
                         Some((s.get(open + 1..close)?.to_string(), dest, end))
                     })
@@ -795,7 +807,7 @@ fn tokenize(s: &str, base: &Fmt, depth: usize) -> Vec<Node> {
             }
             b'<' => {
                 let rest = s.get(i + 1..).unwrap_or("");
-                let end = rest.find('>');
+                let end = within(rest, MAX_TAG).find('>');
                 let inner = end.and_then(|e| rest.get(..e)).unwrap_or("");
                 let lower = inner.to_ascii_lowercase();
                 let is_auto = !inner.is_empty()
@@ -826,7 +838,7 @@ fn tokenize(s: &str, base: &Fmt, depth: usize) -> Vec<Node> {
             }
             b'&' => {
                 let rest = s.get(i..).unwrap_or("");
-                match rest.find(';').filter(|k| *k <= 32).and_then(|k| decode_entity(rest.get(1..k)?).map(|ch| (ch, k))) {
+                match within(rest, 33).find(';').and_then(|k| decode_entity(rest.get(1..k)?).map(|ch| (ch, k))) {
                     Some((ch, k)) => {
                         flush!();
                         push_text(&mut nodes, &ch, base);
@@ -841,6 +853,19 @@ fn tokenize(s: &str, base: &Fmt, depth: usize) -> Vec<Node> {
     }
     flush!();
     nodes
+}
+
+/// Longest `<...>` tag or autolink taken as inline HTML.
+const MAX_TAG: usize = 4096;
+
+/// The first `n` bytes of `s` (fewer if that would cut a character), so a search for a closing
+/// character stays short however long the text is.
+fn within(s: &str, n: usize) -> &str {
+    let mut end = n.min(s.len());
+    while !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    s.get(..end).unwrap_or("")
 }
 
 fn emph_index(ch: char) -> usize {
@@ -988,7 +1013,7 @@ fn emit(mut nodes: Vec<Node>) -> Vec<Inline> {
 // Export
 
 /// Escape text for Markdown (inline context).
-fn escape(s: &str) -> String {
+pub(crate) fn escape(s: &str) -> String {
     let mut out = String::with_capacity(s.len() + 8);
     for c in s.chars() {
         match c {
@@ -1056,7 +1081,8 @@ enum Mark {
 fn inlines_md(inlines: &[Inline]) -> String {
     // Split into (text, fmt) pieces with whitespace moved outside emphasis.
     let mut pieces: Vec<(String, Fmt, Option<String>)> = Vec::new();
-    for i in inlines {
+    let inlines = crate::model::equations_as_text(inlines);
+    for i in inlines.iter() {
         match i {
             Inline::Text(t, f) => {
                 let has_emph = f.bold || f.italic || f.strike;
@@ -1086,6 +1112,8 @@ fn inlines_md(inlines: &[Inline]) -> String {
                 let safe: String = a.chars().filter(|c| c.is_alphanumeric() || matches!(c, '_' | '-' | '.' | ':')).collect();
                 pieces.push((String::new(), Fmt::default(), Some(format!("<a id=\"{safe}\"></a>"))));
             }
+            Inline::Figure(alt) => pieces.push((String::new(), Fmt::default(), Some(format!("![{}]()", escape(alt))))),
+            Inline::Equation { .. } => {}
         }
     }
     let mut out = String::new();
@@ -1097,8 +1125,9 @@ fn inlines_md(inlines: &[Inline]) -> String {
         }
     };
     for (text, f, raw) in pieces {
-        // Links are the outermost construct.
-        if f.link != link || raw.is_some() {
+        // Links are the outermost construct; a script or other non-web target is plain text.
+        let f_link = f.link.clone().filter(|l| wordcraft_doc::link::is_safe_href(l));
+        if f_link != link || raw.is_some() {
             close_all(&mut out, &mut stack);
             if let Some(l) = &link {
                 out.push_str(&format!("]({})", link_target(l)));
@@ -1108,9 +1137,9 @@ fn inlines_md(inlines: &[Inline]) -> String {
                 out.push_str(&r);
                 continue;
             }
-            if let Some(l) = &f.link {
+            if let Some(l) = f_link {
                 out.push('[');
-                link = Some(l.clone());
+                link = Some(l);
             }
         }
         let want: Vec<Mark> =
@@ -1221,6 +1250,7 @@ fn write_blocks(blocks: &[FBlock], out: &mut Vec<String>) {
     let mut i = 0;
     let mut counters = [0u32; 9];
     let mut prev_list = false;
+    let mut prev_top_ordered = false;
     while let Some(b) = blocks.get(i) {
         match b {
             FBlock::Table(t) => {
@@ -1251,8 +1281,11 @@ fn write_blocks(blocks: &[FBlock], out: &mut Vec<String>) {
                 match p.list {
                     Some(li) => {
                         let lv = li.level.min(8) as usize;
-                        if !prev_list {
+                        if !prev_list || (lv == 0 && prev_top_ordered != li.ordered) {
                             counters = [0; 9];
+                        }
+                        if lv == 0 {
+                            prev_top_ordered = li.ordered;
                         }
                         let n = counters.get_mut(lv).map(|c| {
                             *c += 1;
