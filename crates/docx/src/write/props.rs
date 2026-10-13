@@ -2,7 +2,7 @@
 
 use wordcraft_doc::props::{
     Align, Border, BorderStyle, Borders, CellProps, CharProps, HeightRule, Highlight, LineSpacing, ParaProps, RowProps, TabAlign, TabLeader,
-    TableLook, TableProps, TextColor, VAlign, VMerge, VertAlign,
+    TableFloat, TableLook, TableProps, TextColor, VAlign, VMerge, VertAlign,
 };
 
 use crate::units::{n, twips};
@@ -26,11 +26,24 @@ pub fn rpr_inner(w: &mut W, c: &CharProps) {
     if let Some(s) = &c.style {
         w.val("w:rStyle", s);
     }
+    // Emit only explicit properties so absent values keep inheriting from the style chain.
+    let mut fonts: Vec<(&str, &str)> = Vec::new();
     if let Some(f) = &c.font {
-        w.empty("w:rFonts", &[("w:ascii", f), ("w:hAnsi", f), ("w:cs", f)]);
+        fonts.extend([("w:ascii", f.as_str()), ("w:hAnsi", f.as_str())]);
+    }
+    if let Some(ea) = &c.font_ea {
+        fonts.push(("w:eastAsia", ea));
+    }
+    if let Some(cs) = &c.font_cs {
+        fonts.push(("w:cs", cs));
+    }
+    if !fonts.is_empty() {
+        w.empty("w:rFonts", &fonts);
     }
     toggle(w, "w:b", c.bold);
+    toggle(w, "w:bCs", c.bold_cs);
     toggle(w, "w:i", c.italic);
+    toggle(w, "w:iCs", c.italic_cs);
     toggle(w, "w:caps", c.caps);
     toggle(w, "w:smallCaps", c.small_caps);
     toggle(w, "w:strike", c.strike);
@@ -58,10 +71,12 @@ pub fn rpr_inner(w: &mut W, c: &CharProps) {
     if let Some(p) = c.position {
         w.val("w:position", &n(wordcraft_geom::to_half_points(p.clamp(-1584.0, 1584.0))));
     }
+    let half = |s: f32| n(wordcraft_geom::to_half_points(s.clamp(1.0, 1638.0)).max(2));
     if let Some(s) = c.size {
-        let hp = n(wordcraft_geom::to_half_points(s.clamp(1.0, 1638.0)).max(2));
-        w.val("w:sz", &hp);
-        w.val("w:szCs", &hp);
+        w.val("w:sz", &half(s));
+    }
+    if let Some(s) = c.size_cs {
+        w.val("w:szCs", &half(s));
     }
     if let Some(h) = c.highlight {
         w.val("w:highlight", if h == Highlight::None { "none" } else { h.ooxml() });
@@ -71,6 +86,9 @@ pub fn rpr_inner(w: &mut W, c: &CharProps) {
             Some(col) => w.empty("w:u", &[("w:val", u.ooxml()), ("w:color", &col.hex())]),
             None => w.val("w:u", u.ooxml()),
         }
+    }
+    if let Some(b) = &c.border {
+        border_el(w, "w:bdr", b);
     }
     if let Some(s) = c.shading {
         w.empty("w:shd", &[("w:val", "clear"), ("w:color", "auto"), ("w:fill", &s.hex())]);
@@ -86,18 +104,39 @@ pub fn rpr_inner(w: &mut W, c: &CharProps) {
         );
     }
     toggle(w, "w:rtl", c.rtl);
-    if let Some(l) = &c.lang {
-        w.val("w:lang", l);
+    toggle(w, "w:cs", c.cs);
+    match (&c.lang, &c.lang_bidi) {
+        (Some(l), Some(b)) => w.empty("w:lang", &[("w:val", l), ("w:bidi", b)]),
+        (Some(l), None) => w.val("w:lang", l),
+        (None, Some(b)) => w.empty("w:lang", &[("w:bidi", b)]),
+        (None, None) => {}
+    }
+    if let Some(fx) = &c.text_effects {
+        super::wordart::rpr_effects(w, fx);
     }
 }
 
-/// Does `c` produce any `w:rPr` content?
+/// Does `c` produce any `w:rPr` content (besides a tracked change)?
 pub fn has_rpr(c: &CharProps) -> bool {
-    let mut x = c.clone();
-    x.link = None;
-    x.ins = None;
-    x.del = None;
-    !x.is_empty()
+    !c.formatting().is_empty()
+}
+
+/// Attributes of a tracked change element: `w:id`, `w:author`, `w:date`.
+pub type ChangeAttrs = Vec<(&'static str, String)>;
+
+/// Open a tracked change element (`w:rPrChange`, `w:pPrChange`, `w:tblPrChange`…).
+pub fn open_change(w: &mut W, tag: &str, a: &ChangeAttrs) {
+    let refs: Vec<(&str, &str)> = a.iter().map(|(k, v)| (*k, v.as_str())).collect();
+    w.open(tag, &refs);
+}
+
+/// A tracked change element holding the properties before the change: `<tag attrs><inner>…</inner></tag>`.
+fn change_el(w: &mut W, tag: &str, inner: &str, a: &ChangeAttrs, body: impl FnOnce(&mut W)) {
+    open_change(w, tag, a);
+    w.open(inner, &[]);
+    body(w);
+    w.close(inner);
+    w.close(tag);
 }
 
 pub fn rpr(w: &mut W, c: &CharProps) {
@@ -156,7 +195,9 @@ pub fn borders(w: &mut W, tag: &str, b: &Borders, inner: Option<&str>, extra: &[
 }
 
 /// `w:pPr` content except the paragraph mark `w:rPr` and `w:sectPr`, which the caller appends.
-pub fn ppr_inner(w: &mut W, p: &ParaProps, framed: bool) {
+/// `w:pPr` content (without the wrapper); `num_change` are the attributes of a tracked list
+/// numbering change (`w:numberingChange`, written in `w:numPr`).
+pub fn ppr_inner(w: &mut W, p: &ParaProps, framed: bool, num_change: Option<&ChangeAttrs>) {
     if let Some(s) = &p.style {
         w.val("w:pStyle", s);
     }
@@ -168,12 +209,45 @@ pub fn ppr_inner(w: &mut W, p: &ParaProps, framed: bool) {
             "w:framePr",
             &[("w:dropCap", "drop"), ("w:lines", &n(lines.min(10) as i64)), ("w:wrap", "around"), ("w:vAnchor", "text"), ("w:hAnchor", "text")],
         );
+    } else if let Some(f) = &p.frame {
+        let (fw, fh, fx, fy) = (f.w.map(twips), f.h.map(twips), twips(f.x), twips(f.y));
+        let (hs, vs) = (twips(f.h_space), twips(f.v_space));
+        let mut a: Vec<(&str, &str)> = Vec::new();
+        if let Some(v) = &fw {
+            a.push(("w:w", v));
+        }
+        if let Some(v) = &fh {
+            a.push(("w:h", v));
+            a.push(("w:hRule", if f.h_exact { "exact" } else { "atLeast" }));
+        }
+        if f.h_space > 0.0 {
+            a.push(("w:hSpace", &hs));
+        }
+        if f.v_space > 0.0 {
+            a.push(("w:vSpace", &vs));
+        }
+        a.push(("w:wrap", &f.wrap));
+        a.push(("w:vAnchor", &f.v_anchor));
+        a.push(("w:hAnchor", &f.h_anchor));
+        match &f.x_align {
+            Some(x) => a.push(("w:xAlign", x)),
+            None => a.push(("w:x", &fx)),
+        }
+        match &f.y_align {
+            Some(y) => a.push(("w:yAlign", y)),
+            None => a.push(("w:y", &fy)),
+        }
+        w.empty("w:framePr", &a);
     }
     toggle(w, "w:widowControl", p.widow_control);
     if let Some(nr) = p.numbering {
         w.open("w:numPr", &[]);
         w.val("w:ilvl", &n(nr.level.min(8) as i64));
         w.val("w:numId", &n(nr.num as i64));
+        if let Some(a) = num_change {
+            let refs: Vec<(&str, &str)> = a.iter().map(|(k, v)| (*k, v.as_str())).collect();
+            w.empty("w:numberingChange", &refs);
+        }
         w.close("w:numPr");
     }
     toggle(w, "w:suppressLineNumbers", p.suppress_line_numbers);
@@ -213,8 +287,20 @@ pub fn ppr_inner(w: &mut W, p: &ParaProps, framed: bool) {
         w.close("w:tabs");
     }
     toggle(w, "w:suppressAutoHyphens", p.suppress_hyphens);
+    toggle(w, "w:kinsoku", p.kinsoku);
+    toggle(w, "w:wordWrap", p.word_wrap);
+    toggle(w, "w:overflowPunct", p.overflow_punct);
+    toggle(w, "w:topLinePunct", p.top_line_punct);
+    toggle(w, "w:autoSpaceDE", p.auto_space_de);
+    toggle(w, "w:autoSpaceDN", p.auto_space_dn);
     toggle(w, "w:bidi", p.bidi);
-    if p.space_before.is_some() || p.space_after.is_some() || p.line_spacing.is_some() {
+    toggle(w, "w:snapToGrid", p.snap_to_grid);
+    if p.space_before.is_some()
+        || p.space_after.is_some()
+        || p.line_spacing.is_some()
+        || p.space_before_auto.is_some()
+        || p.space_after_auto.is_some()
+    {
         let before = p.space_before.map(|v| twips(v.max(0.0)));
         let after = p.space_after.map(|v| twips(v.max(0.0)));
         let line = p.line_spacing.map(|l| match l {
@@ -226,8 +312,14 @@ pub fn ppr_inner(w: &mut W, p: &ParaProps, framed: bool) {
         if let Some(b) = &before {
             a.push(("w:before", b));
         }
+        if let Some(on) = p.space_before_auto {
+            a.push(("w:beforeAutospacing", if on { "1" } else { "0" }));
+        }
         if let Some(x) = &after {
             a.push(("w:after", x));
+        }
+        if let Some(on) = p.space_after_auto {
+            a.push(("w:afterAutospacing", if on { "1" } else { "0" }));
         }
         if let Some((l, r)) = &line {
             a.push(("w:line", l));
@@ -235,16 +327,29 @@ pub fn ppr_inner(w: &mut W, p: &ParaProps, framed: bool) {
         }
         w.empty("w:spacing", &a);
     }
-    if p.indent_left.is_some() || p.indent_right.is_some() || p.indent_first.is_some() {
+    let chars = [p.indent_left_chars, p.indent_right_chars, p.indent_first_chars];
+    if p.indent_left.is_some() || p.indent_right.is_some() || p.indent_first.is_some() || chars.iter().any(Option::is_some) {
         let l = p.indent_left.map(twips);
         let r = p.indent_right.map(twips);
         let f = p.indent_first.map(|v| (v < 0.0, twips(v.abs())));
+        // Character units in hundredths of a character.
+        let hundredths = |v: f32| ((v.clamp(-1584.0, 1584.0) * 100.0).round() as i64).to_string();
+        let [lc, rc, fc] = chars.map(|c| c.map(|v| (v < 0.0, hundredths(v.abs()), hundredths(v))));
         let mut a: Vec<(&str, &str)> = Vec::new();
+        if let Some((_, _, v)) = &lc {
+            a.push(("w:leftChars", v));
+        }
         if let Some(l) = &l {
             a.push(("w:left", l));
         }
+        if let Some((_, _, v)) = &rc {
+            a.push(("w:rightChars", v));
+        }
         if let Some(r) = &r {
             a.push(("w:right", r));
+        }
+        if let Some((hang, v, _)) = &fc {
+            a.push((if *hang { "w:hangingChars" } else { "w:firstLineChars" }, v));
         }
         if let Some((hang, v)) = &f {
             a.push((if *hang { "w:hanging" } else { "w:firstLine" }, v));
@@ -252,6 +357,7 @@ pub fn ppr_inner(w: &mut W, p: &ParaProps, framed: bool) {
         w.empty("w:ind", &a);
     }
     toggle(w, "w:contextualSpacing", p.contextual_spacing);
+    toggle(w, "w:mirrorIndents", p.mirror_indents);
     if let Some(a) = p.align {
         w.val("w:jc", align_val(a));
     }
@@ -260,7 +366,7 @@ pub fn ppr_inner(w: &mut W, p: &ParaProps, framed: bool) {
     }
 }
 
-fn margins(w: &mut W, tag: &str, m: &[f32; 4]) {
+pub fn margins(w: &mut W, tag: &str, m: &[f32; 4]) {
     w.open(tag, &[]);
     for (name, v) in ["w:top", "w:left", "w:bottom", "w:right"].iter().zip(m.iter()) {
         w.empty(name, &[("w:w", &twips(v.clamp(0.0, 1584.0))), ("w:type", "dxa")]);
@@ -300,10 +406,25 @@ pub fn look_attrs(l: &TableLook) -> Vec<(&'static str, String)> {
     ]
 }
 
-pub fn tblpr(w: &mut W, t: &TableProps) {
+/// `w:tblPr`, with the properties before a tracked change last when `change` gives its attributes.
+pub fn tblpr(w: &mut W, t: &TableProps, change: Option<&ChangeAttrs>) {
     w.open("w:tblPr", &[]);
+    tblpr_inner(w, t);
+    if let (Some(a), Some(ch)) = (change, &t.fmt_change) {
+        change_el(w, "w:tblPrChange", "w:tblPr", a, |w| tblpr_inner(w, &ch.old));
+    }
+    w.close("w:tblPr");
+}
+
+fn tblpr_inner(w: &mut W, t: &TableProps) {
     if let Some(s) = &t.style {
         w.val("w:tblStyle", s);
+    }
+    if let Some(f) = &t.float {
+        table_float(w, f);
+    }
+    if t.bidi_visual {
+        w.empty("w:bidiVisual", &[]);
     }
     if let Some(p) = t.width_pct {
         w.empty("w:tblW", &[("w:w", &n(round(p.clamp(0.0, 1000.0) * 50.0))), ("w:type", "pct")]);
@@ -336,14 +457,26 @@ pub fn tblpr(w: &mut W, t: &TableProps) {
     if let Some(c) = &t.caption {
         w.val("w:tblCaption", c);
     }
-    w.close("w:tblPr");
+    if let Some(d) = &t.description {
+        w.val("w:tblDescription", d);
+    }
 }
 
-pub fn trpr(w: &mut W, r: &RowProps) {
-    if r.height.is_none() && !r.header && !r.cant_split {
+/// `w:trPr` (when the row has any), with a tracked change last as for [`tblpr`].
+pub fn trpr(w: &mut W, r: &RowProps, change: Option<&ChangeAttrs>) {
+    let change = change.zip(r.fmt_change.as_ref());
+    if r.height.is_none() && !r.header && !r.cant_split && change.is_none() {
         return;
     }
     w.open("w:trPr", &[]);
+    trpr_inner(w, r);
+    if let Some((a, ch)) = change {
+        change_el(w, "w:trPrChange", "w:trPr", a, |w| trpr_inner(w, &ch.old));
+    }
+    w.close("w:trPr");
+}
+
+fn trpr_inner(w: &mut W, r: &RowProps) {
     if r.cant_split {
         w.empty("w:cantSplit", &[]);
     }
@@ -358,14 +491,23 @@ pub fn trpr(w: &mut W, r: &RowProps) {
     if r.header {
         w.empty("w:tblHeader", &[]);
     }
-    w.close("w:trPr");
 }
 
-pub fn tcpr(w: &mut W, c: &CellProps) {
+/// `w:tcPr`, with a tracked change last as for [`tblpr`].
+pub fn tcpr(w: &mut W, c: &CellProps, change: Option<&ChangeAttrs>) {
     w.open("w:tcPr", &[]);
-    match c.width {
-        Some(v) => w.empty("w:tcW", &[("w:w", &twips(v.max(0.0))), ("w:type", "dxa")]),
-        None => w.empty("w:tcW", &[("w:w", "0"), ("w:type", "auto")]),
+    tcpr_inner(w, c);
+    if let (Some(a), Some(ch)) = (change, &c.fmt_change) {
+        change_el(w, "w:tcPrChange", "w:tcPr", a, |w| tcpr_inner(w, &ch.old));
+    }
+    w.close("w:tcPr");
+}
+
+fn tcpr_inner(w: &mut W, c: &CellProps) {
+    match (c.width, c.width_pct) {
+        (Some(v), _) => w.empty("w:tcW", &[("w:w", &twips(v.max(0.0))), ("w:type", "dxa")]),
+        (None, Some(p)) => w.empty("w:tcW", &[("w:w", &n((p.clamp(0.0, 100.0) * 50.0).round() as i64)), ("w:type", "pct")]),
+        (None, None) => w.empty("w:tcW", &[("w:w", "0"), ("w:type", "auto")]),
     }
     if c.span > 1 {
         w.val("w:gridSpan", &n(c.span.min(63) as i64));
@@ -387,13 +529,48 @@ pub fn tcpr(w: &mut W, c: &CellProps) {
     if let Some(m) = &c.margins {
         margins(w, "w:tcMar", m);
     }
-    if c.vertical_text {
-        w.val("w:textDirection", "btLr");
+    if c.text_direction.is_turned() {
+        w.val("w:textDirection", c.text_direction.ooxml());
     }
     match c.valign {
         VAlign::Top => {}
         VAlign::Center => w.val("w:vAlign", "center"),
         VAlign::Bottom => w.val("w:vAlign", "bottom"),
     }
-    w.close("w:tcPr");
+    if c.hide_mark {
+        w.empty("w:hideMark", &[]);
+    }
+}
+
+/// `w:tblpPr` and `w:tblOverlap` for a floating table.
+fn table_float(w: &mut W, f: &TableFloat) {
+    use wordcraft_doc::para::Anchor;
+    let rel = |a: Anchor, text: &'static str| match a {
+        Anchor::Page => "page",
+        Anchor::Margin => "margin",
+        _ => text,
+    };
+    let [left, top, right, bottom] = f.dist_from_text().map(twips);
+    let fin = |v: f32| twips(if v.is_finite() { v.clamp(-31_680.0, 31_680.0) } else { 0.0 });
+    let (x, y) = (fin(f.x), fin(f.y));
+    let mut a: Vec<(&str, &str)> = vec![
+        ("w:leftFromText", &left),
+        ("w:rightFromText", &right),
+        ("w:topFromText", &top),
+        ("w:bottomFromText", &bottom),
+        ("w:vertAnchor", rel(f.v_rel, "text")),
+        ("w:horzAnchor", rel(f.h_rel, "text")),
+    ];
+    match f.h_align {
+        Some(h) => a.push(("w:tblpXSpec", h.ooxml(true))),
+        None => a.push(("w:tblpX", &x)),
+    }
+    match f.v_align {
+        Some(v) => a.push(("w:tblpYSpec", v.ooxml(false))),
+        None => a.push(("w:tblpY", &y)),
+    }
+    w.empty("w:tblpPr", &a);
+    if !f.overlap {
+        w.val("w:tblOverlap", "never");
+    }
 }

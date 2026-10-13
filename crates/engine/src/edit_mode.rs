@@ -99,14 +99,17 @@ pub fn tab_params() -> Value {
     json!({ "text": "\t", "raw": true })
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct EditRules {
     pub may_decide: bool,
+    /// Every command runs, formatting included, as in the full application. Typed and deleted text
+    /// is still tracked under the session's author; formatting changes are not tracked.
+    pub full: bool,
 }
 
 /// Whether an edit session with `rules` runs `id` (`TAB` as a typed tab).
 pub fn allows(id: &str, rules: EditRules) -> bool {
-    crate::view_only::allows(id) || id == TAB || COMMANDS.contains(&id) || (rules.may_decide && DECIDE.contains(&id))
+    rules.full || crate::view_only::allows(id) || id == TAB || COMMANDS.contains(&id) || (rules.may_decide && DECIDE.contains(&id))
 }
 
 /// Why an edit session refused something. Each has a stable [`code`](Self::code) a host maps to

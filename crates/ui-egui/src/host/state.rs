@@ -259,13 +259,11 @@ fn set_theme(app: &mut WordApp, host: &mut HostState, ctx: &egui::Context, theme
         return;
     };
     crate::theme::set_accent_override(ctx, Some(crate::theme::AccentOverride { accent, content }));
-    app.ui.dark = theme.dark;
+    // `WordApp::logic` pins egui to this theme (an explicit preference: following the system, a
+    // change of the operating system's theme would swap in the other theme under the host's choice).
     host.dark = Some(theme.dark);
-    // An explicit preference: with egui's default (follow the system), a change of the operating
-    // system's theme would swap in the other, unstyled theme under the host's choice.
-    ctx.set_theme(if theme.dark { egui::Theme::Dark } else { egui::Theme::Light });
     // Re-apply the egui style this frame, even when only the accent changed.
-    app.applied_dark = None;
+    app.applied_theme = None;
 }
 
 pub(crate) fn after_frame(app: &mut WordApp, ctx: &egui::Context) {

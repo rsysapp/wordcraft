@@ -404,6 +404,10 @@ fn parse_into(
     // The namespaces in scope, kept here (not by the reader) so each declaration is charged before
     // it is kept.
     let mut resolver = NamespaceResolver::default();
+    // quick-xml 0.41 refuses more than 256 declarations on one element by itself; this reading
+    // keeps its own, charged limits (`MAX_ATTRIBUTES` an element, `MAX_BINDINGS_IN_SCOPE`), which
+    // refuse before quick-xml's would.
+    resolver.set_max_declarations_per_element(MAX_ATTRIBUTES);
     room.reserve(256, 2, budget)?;
     let mut stack: Vec<XEl> = Vec::new();
     // What each open element holds in the reader's room: its name and declarations, and records.

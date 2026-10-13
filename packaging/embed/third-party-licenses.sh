@@ -123,6 +123,33 @@ while IFS= read -r crate_dir; do
   done < <(find "$crate_dir" -maxdepth 1 -type f \( -iname 'NOTICE' -o -iname 'NOTICE.*' \) | LC_ALL=C sort)
 done < <(jq -r '.crates[].package.manifest_path' "$WORK/crates.json" | sed 's#/Cargo.toml$##' | LC_ALL=C sort -u)
 
+# Hyphenation patterns compiled into the module (crates/proof) under licences that ask for their
+# notice to travel with every copy: Polish (MIT) and Portuguese (BSD 3-clause), from hyph-utf8.
+# Each file's own header carries its copyright and licence text; it is copied up to the patterns'
+# settings (`% hyphenmins:`), without the comment marks. The English patterns and word list are
+# CC0 and public domain (NOTICE and ATTRIBUTION.md name them). A header without a copyright or a
+# licence line fails the run.
+{
+  printf '\n\n================================================================================\n'
+  printf 'HYPHENATION PATTERNS\n'
+  printf '================================================================================\n'
+} >>"$WORK/notices.txt"
+for patterns in pl pt; do
+  pattern_file="$ROOT/assets/hyphenation/$patterns.pat"
+  [ -f "$pattern_file" ] || { echo "error: $pattern_file not found" >&2; exit 1; }
+  header="$(awk '/^% hyphenmins:/ { exit } /^%/ { sub(/^% ?/, ""); print; next } { exit }' "$pattern_file")"
+  if ! printf '%s\n' "$header" | grep -q '^copyright: ' || ! printf '%s\n' "$header" | grep -q '^licence:'; then
+    echo "error: $pattern_file has no copyright or licence line in its header" >&2
+    exit 1
+  fi
+  {
+    printf '\n--------------------------------------------------------------------------------\n'
+    printf 'assets/hyphenation/%s.pat (hyph-utf8), as its header states it\n' "$patterns"
+    printf -- '--------------------------------------------------------------------------------\n\n'
+    printf '%s\n' "$header"
+  } >>"$WORK/notices.txt"
+done
+
 # The Rust standard library (core, alloc, std and what they are built from) is precompiled with
 # the toolchain and linked into the module. The toolchain ships its notices as HTML, plus the texts
 # of the licences it names; the same pinned toolchain gives the same files.

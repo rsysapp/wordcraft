@@ -302,7 +302,12 @@ fn debug_output_of_a_read_document_stays_short() {
     let (bytes, _) = package_with(&para("Short"), "", &[("customXml/item1.xml", padding)], stored);
     let doc = read(&bytes).unwrap();
     let printed = format!("{doc:?}");
-    assert!(printed.len() < 100_000, "{} characters", printed.len());
+    // The same document without the kept archive: the archive adds its name and length only.
+    let mut without = doc.clone();
+    assert!(without.passthrough.remove(wordcraft_docx::SOURCE_PACKAGE).is_some());
+    let baseline = format!("{without:?}").len();
+    assert!(printed.len() < baseline + 200, "{} characters, {baseline} without the archive", printed.len());
+    assert!(!printed.contains(&"x".repeat(64)), "no bytes are printed");
     assert!(printed.contains(&bytes.len().to_string()), "the length is shown");
 }
 

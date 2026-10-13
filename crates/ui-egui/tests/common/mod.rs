@@ -10,6 +10,12 @@ use wordcraft_ui_egui::{Services, WordApp};
 
 pub const WINDOW: egui::Vec2 = egui::vec2(1100.0, 800.0);
 
+/// The view bar's find field, by its name: since the upstream merge it is not the window's only
+/// text input.
+pub fn find_field() -> impl Fn(&egui_kittest::kittest::AccessKitNode<'_>) -> bool {
+    |node| node.role() == egui::accesskit::Role::TextInput && node.label().as_deref() == Some("Find in document")
+}
+
 /// A harness running `app` at `pixels_per_point`.
 pub fn harness(app: WordApp, pixels_per_point: f32) -> Harness<'static, WordApp> {
     Harness::builder().with_size(WINDOW).with_pixels_per_point(pixels_per_point).with_max_steps(12).build_ui_state(

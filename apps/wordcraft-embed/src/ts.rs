@@ -40,6 +40,7 @@ export interface EditorPermissions {
     redact: boolean;
     stamps: boolean;
     drawing: boolean;
+    fullEditing?: boolean;
 }
 
 export type ModeRequest =
@@ -96,7 +97,7 @@ mod tests {
             "export type JumpTarget = | { kind: 'page'; page: number } | { kind: 'text'; text: string; page: number | null; occurrence: number };",
             "export interface Mark { id: string; text: string; page: number | null; color: string; }",
             "export interface EditorAuthor { id: string; name: string; }",
-            "export interface EditorPermissions { acceptRejectChanges: boolean; organizePages: boolean; fillForms: boolean; redact: boolean; stamps: boolean; drawing: boolean; }",
+            "export interface EditorPermissions { acceptRejectChanges: boolean; organizePages: boolean; fillForms: boolean; redact: boolean; stamps: boolean; drawing: boolean; fullEditing?: boolean; }",
             "export type ModeRequest = | { mode: 'view' } | { mode: 'edit'; author: EditorAuthor; revisionDate: string; permissions: EditorPermissions };",
             "export type EditorEvent = | { type: 'opened'; pages: number } | { type: 'openFailed'; message: string } \
              | { type: 'pageChanged'; page: number } \

@@ -7,8 +7,9 @@
 use std::ops::Range;
 
 // embed: the events a shared reading hands its callers.
+use quick_xml::XmlVersion;
 use quick_xml::events::{BytesCData, BytesRef, BytesStart, BytesText, Event};
-use quick_xml::name::ResolveResult;
+use quick_xml::name::{QName, ResolveResult};
 use quick_xml::reader::NsReader;
 
 use crate::DocxError;
@@ -24,21 +25,32 @@ pub const NAMESPACES: &[(&str, &str)] = &[
     ("r", "http://schemas.openxmlformats.org/officeDocument/2006/relationships"),
     ("wp", "http://schemas.openxmlformats.org/drawingml/2006/wordprocessingDrawing"),
     ("a", "http://schemas.openxmlformats.org/drawingml/2006/main"),
+    ("c", "http://schemas.openxmlformats.org/drawingml/2006/chart"),
     ("pic", "http://schemas.openxmlformats.org/drawingml/2006/picture"),
     ("mc", "http://schemas.openxmlformats.org/markup-compatibility/2006"),
     ("w14", "http://schemas.microsoft.com/office/word/2010/wordml"),
+    ("wpi", "http://schemas.microsoft.com/office/word/2010/wordprocessingInk"),
     ("w15", "http://schemas.microsoft.com/office/word/2012/wordml"),
     ("wp14", "http://schemas.microsoft.com/office/word/2010/wordprocessingDrawing"),
     ("wps", "http://schemas.microsoft.com/office/word/2010/wordprocessingShape"),
     ("wpg", "http://schemas.microsoft.com/office/word/2010/wordprocessingGroup"),
+    ("wpc", "http://schemas.microsoft.com/office/word/2010/wordprocessingCanvas"),
+    ("dgm", "http://schemas.openxmlformats.org/drawingml/2006/diagram"),
+    ("dsp", "http://schemas.microsoft.com/office/drawing/2008/diagram"),
     ("m", "http://schemas.openxmlformats.org/officeDocument/2006/math"),
     ("v", "urn:schemas-microsoft-com:vml"),
     ("o", "urn:schemas-microsoft-com:office:office"),
     ("w10", "urn:schemas-microsoft-com:office:word"),
 ];
 
+/// The `a:ext` URI under which a drawing is marked decorative ([MS-ODRAWXML]), and the
+/// namespace of its `adec:decorative` element.
+pub const DECORATIVE_EXT: &str = "{C183D7F6-B498-43B3-948B-1728B52AA6E4}";
+pub const DECORATIVE_NS: &str = "http://schemas.microsoft.com/office/drawing/2017/decorative";
+
 /// Namespaces that only appear in non-body parts.
 const OTHER_NAMESPACES: &[(&str, &str)] = &[
+    ("b", "http://schemas.openxmlformats.org/officeDocument/2006/bibliography"),
     ("rel", "http://schemas.openxmlformats.org/package/2006/relationships"),
     ("ct", "http://schemas.openxmlformats.org/package/2006/content-types"),
     ("cp", "http://schemas.openxmlformats.org/package/2006/metadata/core-properties"),
@@ -47,6 +59,8 @@ const OTHER_NAMESPACES: &[(&str, &str)] = &[
     ("xsi", "http://www.w3.org/2001/XMLSchema-instance"),
     ("xml", "http://www.w3.org/XML/1998/namespace"),
     ("ep", "http://schemas.openxmlformats.org/officeDocument/2006/extended-properties"),
+    ("op", "http://schemas.openxmlformats.org/officeDocument/2006/custom-properties"),
+    ("vt", "http://schemas.openxmlformats.org/officeDocument/2006/docPropsVTypes"),
 ];
 
 /// ISO/IEC 29500 Strict namespaces map onto the transitional prefixes.
@@ -59,14 +73,35 @@ const STRICT: &[(&str, &str)] = &[
     ("m", "http://purl.oclc.org/ooxml/officeDocument/math"),
 ];
 
-// embed: also used by the preserving writer's positional tree.
-pub(crate) fn prefix_for(uri: &[u8]) -> &'static str {
+// embed: also used by the preserving writer's positional tree (through `Reading`).
+pub(crate) fn prefix_for(uri: &[u8], extra: &[(&'static str, &str)]) -> &'static str {
+    if let Some((p, _)) = extra.iter().find(|(_, u)| u.as_bytes() == uri) {
+        return p;
+    }
     for (p, u) in NAMESPACES.iter().chain(OTHER_NAMESPACES).chain(STRICT) {
         if u.as_bytes() == uri {
             return p;
         }
     }
     "?"
+}
+
+/// Compatibility feature namespaces whose elements are not otherwise handled by this tree.
+/// Keep the reader's existing feature set when canonicalizing `mc:Choice/@Requires` aliases.
+fn requirement_prefix(uri: &[u8]) -> &'static str {
+    let prefix = prefix_for(uri, &[]);
+    if prefix != "?" {
+        return prefix;
+    }
+    match uri {
+        b"http://schemas.microsoft.com/office/drawing/2010/main" => "a14",
+        b"http://schemas.microsoft.com/office/word/2015/wordml/symex" => "w16se",
+        b"http://schemas.microsoft.com/office/word/2016/wordml/cid" => "w16cid",
+        b"http://schemas.microsoft.com/office/word/2018/wordml" => "w16",
+        b"http://schemas.microsoft.com/office/word/2018/wordml/cex" => "w16cex",
+        b"http://schemas.microsoft.com/office/word/2020/wordml/sdtdatahash" => "w16sdtdh",
+        _ => "?",
+    }
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -158,10 +193,60 @@ impl El {
         }
         go(self, name, 0)
     }
+    /// The element as XML with canonical prefixes (for re-emitting kept content). Elements and
+    /// attributes in unknown namespaces are dropped.
+    pub fn to_xml(&self) -> String {
+        fn go(e: &El, s: &mut String, depth: usize) {
+            if depth > MAX_DEPTH || e.name.starts_with("?:") {
+                return;
+            }
+            s.push('<');
+            s.push_str(&e.name);
+            for (k, v) in &e.attrs {
+                if k.starts_with("?:") {
+                    continue;
+                }
+                s.push(' ');
+                s.push_str(k);
+                s.push_str("=\"");
+                s.push_str(&esc(v));
+                s.push('"');
+            }
+            if e.kids.is_empty() {
+                s.push_str("/>");
+                return;
+            }
+            s.push('>');
+            for n in &e.kids {
+                match n {
+                    Node::Text(t) => s.push_str(&esc(t)),
+                    Node::El(c) => go(c, s, depth + 1),
+                }
+            }
+            s.push_str("</");
+            s.push_str(&e.name);
+            s.push('>');
+        }
+        let mut s = String::new();
+        go(self, &mut s, 0);
+        s
+    }
     /// Local part of the name.
     pub fn local(&self) -> &str {
         self.name.rsplit(':').next().unwrap_or(&self.name)
     }
+}
+
+/// UTF-16 LE/BE text with a byte-order mark as UTF-8 (`None` without one). Lossy: an unpaired
+/// surrogate becomes U+FFFD and a trailing odd byte is dropped. The result is at most 1.5× the input.
+pub(crate) fn utf16_to_utf8(bytes: &[u8]) -> Option<String> {
+    let (rest, le) = match bytes.get(..2) {
+        Some([0xFF, 0xFE]) => (bytes.get(2..)?, true),
+        Some([0xFE, 0xFF]) => (bytes.get(2..)?, false),
+        _ => return None,
+    };
+    let units = rest.as_chunks::<2>().0.iter().map(|c| if le { u16::from_le_bytes(*c) } else { u16::from_be_bytes(*c) });
+    Some(char::decode_utf16(units).map(|c| c.unwrap_or(char::REPLACEMENT_CHARACTER)).collect())
 }
 
 /// The error `parse_limited` answers when a part holds more elements than it may.
@@ -178,15 +263,30 @@ pub const TOO_MANY_BINDINGS: &str = "too many XML namespace declarations in scop
 
 /// Parse XML bytes into the root element.
 pub fn parse(bytes: &[u8]) -> Result<El, DocxError> {
-    parse_limited(bytes, MAX_ELEMENTS, MAX_DEPTH).map(|(root, _)| root)
+    parse_ns(bytes, &[])
+}
+
+/// [`parse`] with `extra` namespaces (prefix, URI) mapped to canonical prefixes first, so a
+/// related vocabulary (WordprocessingML 2003) reads with the prefixes the reader knows.
+pub fn parse_ns(bytes: &[u8], extra: &[(&'static str, &str)]) -> Result<El, DocxError> {
+    parse_within(bytes, extra, MAX_ELEMENTS, MAX_DEPTH).map(|(root, _)| root)
 }
 
 /// embed: [`parse`] with at most `max_elements` elements, nested at most `max_depth` deep (never
 /// deeper than [`MAX_DEPTH`]), with at most [`MAX_BINDINGS`] namespace declarations in scope; also
 /// answers how many elements it read, so a package can spend one budget across its parts.
 pub fn parse_limited(bytes: &[u8], max_elements: usize, max_depth: usize) -> Result<(El, usize), DocxError> {
+    parse_within(bytes, &[], max_elements, max_depth)
+}
+
+fn parse_within(bytes: &[u8], extra: &[(&'static str, &str)], max_elements: usize, max_depth: usize) -> Result<(El, usize), DocxError> {
     let max_depth = max_depth.min(MAX_DEPTH);
-    let mut reading = Reading::new(bytes)?;
+    // UTF-16 (with a BOM) is transcoded to UTF-8; a UTF-8 BOM is stripped (by `Reading`). embed: only
+    // here: the preserving writer's tree reads a part's own bytes and refuses a UTF-16 one, since its
+    // offsets must be offsets into the part.
+    let transcoded = utf16_to_utf8(bytes);
+    let bytes = transcoded.as_ref().map_or(bytes, |s| s.as_bytes());
+    let mut reading = Reading::with_namespaces(bytes, extra)?;
     let mut count = 0usize;
     // embed: elements are counted, as they always were (a package's budget and its tests count
     // them); declarations are bounded by the cap in scope, attributes by the part's bytes.
@@ -293,6 +393,8 @@ pub(crate) enum Token<'a> {
 /// into the part as given, and the namespace declarations in scope.
 pub(crate) struct Reading<'a> {
     reader: NsReader<&'a [u8]>,
+    /// Namespaces (prefix, URI) given canonical prefixes before the known ones (`parse_ns`).
+    extra: &'a [(&'static str, &'a str)],
     /// The byte-order marks before the reader's first offset.
     skipped: usize,
     /// How many declarations each open element brought into scope, and their sum.
@@ -304,6 +406,11 @@ const UTF8_BOM: &[u8] = &[0xEF, 0xBB, 0xBF];
 
 impl<'a> Reading<'a> {
     pub(crate) fn new(bytes: &'a [u8]) -> Result<Reading<'a>, DocxError> {
+        Reading::with_namespaces(bytes, &[])
+    }
+
+    /// [`Reading::new`] with `extra` namespaces (see [`parse_ns`]).
+    pub(crate) fn with_namespaces(bytes: &'a [u8], extra: &'a [(&'static str, &'a str)]) -> Result<Reading<'a>, DocxError> {
         // Strip a UTF-8 BOM; UTF-16 parts are rare in OOXML and rejected.
         let body = bytes.strip_prefix(UTF8_BOM).unwrap_or(bytes);
         if body.starts_with(&[0xFF, 0xFE]) || body.starts_with(&[0xFE, 0xFF]) {
@@ -321,7 +428,11 @@ impl<'a> Reading<'a> {
             c.expand_empty_elements = false;
             c.check_end_names = false;
         }
-        Ok(Reading { reader, skipped: bytes.len().saturating_sub(body.len()).saturating_add(unseen), scopes: Vec::new(), in_scope: 0 })
+        // quick-xml 0.41 refuses more than 256 declarations on one element with its own error;
+        // `MAX_BINDINGS` in scope (`Reading::tag`) refuses first, as a limit. quick-xml's cap stays,
+        // at twice ours, as the bound on what it keeps of one tag before `tag` sees it.
+        reader.resolver_mut().set_max_declarations_per_element(MAX_BINDINGS.saturating_mul(2));
+        Ok(Reading { reader, extra, skipped: bytes.len().saturating_sub(body.len()).saturating_add(unseen), scopes: Vec::new(), in_scope: 0 })
     }
 
     /// The reader's position as an offset into the part as given.
@@ -336,7 +447,7 @@ impl<'a> Reading<'a> {
         let before = self.offset();
         let (resolved, event) = self.reader.read_resolved_event().map_err(|e| DocxError::Xml(e.to_string()))?;
         let prefix = match resolved {
-            ResolveResult::Bound(ns) => Some(prefix_for(ns.as_ref())),
+            ResolveResult::Bound(ns) => Some(prefix_for(ns.as_ref(), self.extra)),
             _ => None,
         };
         let range = before..self.offset();
@@ -391,15 +502,37 @@ impl<'a> Reading<'a> {
                 continue;
             }
             charge(Record::Attribute)?;
-            let (ares, alocal) = self.reader.resolve_attribute(key);
+            let (ares, alocal) = self.reader.resolver_mut().resolve_attribute(key);
             let alocal = String::from_utf8_lossy(alocal.as_ref()).into_owned();
             let aname = match ares {
-                ResolveResult::Bound(ns) => format!("{}:{alocal}", prefix_for(ns.as_ref())),
+                ResolveResult::Bound(ns) => format!("{}:{alocal}", prefix_for(ns.as_ref(), self.extra)),
                 _ => alocal,
             };
-            let val = match a.unescape_value() {
+            let val = match a.normalized_value(XmlVersion::Explicit1_0) {
                 Ok(v) => v.into_owned(),
                 Err(_) => String::from_utf8_lossy(&a.value).into_owned(),
+            };
+            // Requires contains namespace prefixes, not feature names. Resolve them while
+            // the namespace scope still exists; declarations are omitted from this tree.
+            let val = if name == "mc:Choice" && aname == "Requires" {
+                let requirements: Vec<_> = val.split_whitespace().take(65).collect();
+                if requirements.len() > 64 || requirements.iter().any(|prefix| prefix.len() > 128) {
+                    "?".to_string()
+                } else {
+                    requirements
+                        .into_iter()
+                        .map(|prefix| {
+                            let qualified = format!("{prefix}:requirement");
+                            match self.reader.resolver_mut().resolve_attribute(QName(qualified.as_bytes())).0 {
+                                ResolveResult::Bound(ns) => requirement_prefix(ns.as_ref()),
+                                _ => "?",
+                            }
+                        })
+                        .collect::<Vec<_>>()
+                        .join(" ")
+                }
+            } else {
+                val
             };
             attrs.push((aname, val));
         }
@@ -545,6 +678,47 @@ pub fn body_ns() -> Vec<(String, String)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn utf16_parts_parse_and_odd_ones_never_panic() {
+        let src = r#"<?xml version="1.0" encoding="UTF-16"?><r:Relationships xmlns:r="urn:x"><r:Relationship Id="rId1" Target="café😀.xml"/></r:Relationships>"#;
+        for le in [true, false] {
+            let mut b = if le { vec![0xFF, 0xFE] } else { vec![0xFE, 0xFF] };
+            b.extend(src.encode_utf16().flat_map(|u| if le { u.to_le_bytes() } else { u.to_be_bytes() }));
+            let root = parse(&b).unwrap();
+            assert_eq!(root.els().next().and_then(|e| e.attr("Target")), Some("café😀.xml"), "le {le}");
+            // embed: the preserving writer's reading needs offsets into the part itself: it refuses.
+            assert!(Reading::new(&b).is_err());
+        }
+        // Odd length, unpaired surrogates, a bare BOM: an error or a tree, never a panic.
+        for b in
+            [&[0xFF, 0xFE][..], &[0xFE, 0xFF, 0x00], &[0xFF, 0xFE, b'<', 0, 0x00, 0xD8, b'a', 0, b'/', 0, b'>', 0], &[0xFF, 0xFE, 0x00, 0xDC, 0x00]]
+        {
+            let _ = parse(b);
+        }
+        assert_eq!(utf16_to_utf8(&[0xFF, 0xFE, b'a', 0, 0x00, 0xD8, b'b']).as_deref(), Some("a\u{FFFD}"));
+        assert_eq!(utf16_to_utf8(b"<a/>"), None);
+    }
+
+    #[test]
+    fn choice_requirements_resolve_namespace_aliases_and_rebindings() {
+        let x = br#"<mc:AlternateContent xmlns:mc="http://schemas.openxmlformats.org/markup-compatibility/2006" xmlns:pen="http://schemas.microsoft.com/office/word/2010/wordprocessingInk"><mc:Choice Requires="pen"/><mc:Choice xmlns:pen="urn:future" Requires="pen"/><mc:Choice Requires="undeclared"/></mc:AlternateContent>"#;
+        let e = parse(x).unwrap();
+        let values: Vec<_> = e.children("mc:Choice").map(|c| c.attr("Requires")).collect();
+        assert_eq!(values, [Some("wpi"), Some("?"), Some("?")]);
+    }
+
+    /// A start tag with thousands of `xmlns:` declarations is refused instead of allocated
+    /// (RUSTSEC-2026-0195: unbounded namespace bindings in the resolver).
+    #[test]
+    fn too_many_namespace_declarations_is_error() {
+        let mut s = String::from("<a xmlns:a0=\"urn:a0\"");
+        for i in 1..10_000 {
+            s.push_str(&format!(" xmlns:a{i}=\"urn:a{i}\""));
+        }
+        s.push_str("><b/></a>");
+        assert!(parse(s.as_bytes()).is_err());
+    }
 
     #[test]
     fn parses_with_namespaces() {

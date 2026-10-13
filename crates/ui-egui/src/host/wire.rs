@@ -179,7 +179,7 @@ pub struct AuthorSpec {
     pub name: String,
 }
 
-/// Which tools edit mode offers; this editor reads `accept_reject_changes` only.
+/// Which tools edit mode offers; this editor reads `accept_reject_changes` and `full_editing`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct PermissionsSpec {
@@ -189,6 +189,10 @@ pub struct PermissionsSpec {
     pub redact: bool,
     pub stamps: bool,
     pub drawing: bool,
+    /// The full ribbon and every command instead of the edit strip; typing stays tracked. Missing
+    /// means `false`, as before this field existed.
+    #[serde(default)]
+    pub full_editing: bool,
 }
 
 /// Tracked changes and annotations name their author; Word refuses longer names.

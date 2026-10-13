@@ -4,26 +4,60 @@
 
 use wordcraft_doc::Document;
 
+pub use wordcraft_doc::encoding::cp1252;
+
 use crate::model::{FBlock, ListCounter, from_doc};
-
-/// Windows-1252 code points for 0x80..=0x9F.
-const CP1252: [u16; 32] = [
-    0x20AC, 0x0081, 0x201A, 0x0192, 0x201E, 0x2026, 0x2020, 0x2021, 0x02C6, 0x2030, 0x0160, 0x2039, 0x0152, 0x008D, 0x017D, 0x008F, 0x0090, 0x2018,
-    0x2019, 0x201C, 0x201D, 0x2022, 0x2013, 0x2014, 0x02DC, 0x2122, 0x0161, 0x203A, 0x0153, 0x009D, 0x017E, 0x0178,
-];
-
-/// One Windows-1252 byte as a char.
-pub fn cp1252(b: u8) -> char {
-    if (0x80..0xA0).contains(&b) {
-        CP1252.get((b - 0x80) as usize).and_then(|u| char::from_u32(u32::from(*u))).unwrap_or('\u{FFFD}')
-    } else {
-        b as char
-    }
-}
 
 fn utf16(b: &[u8], le: bool) -> String {
     let units: Vec<u16> = b.as_chunks::<2>().0.iter().map(|c| if le { u16::from_le_bytes(*c) } else { u16::from_be_bytes(*c) }).collect();
     String::from_utf16_lossy(&units)
+}
+
+/// UTF-16 without a BOM, told by its zero bytes: `Some(true)` little-endian, `Some(false)`
+/// big-endian.
+fn unmarked_utf16(b: &[u8]) -> Option<bool> {
+    if b.len() < 4 || !b.len().is_multiple_of(2) {
+        return None;
+    }
+    let sample = b.get(..b.len().min(512))?;
+    let even_zero = sample.iter().step_by(2).filter(|x| **x == 0).count();
+    let odd_zero = sample.iter().skip(1).step_by(2).filter(|x| **x == 0).count();
+    let half = sample.len() / 2;
+    if odd_zero * 10 >= half * 4 && even_zero * 10 < half {
+        return Some(true);
+    }
+    if even_zero * 10 >= half * 4 && odd_zero * 10 < half {
+        return Some(false);
+    }
+    None
+}
+
+/// Does `b` look like plain text, so a file with an extension WordCraft doesn't know (a
+/// playlist, a log, a config file…) can open as text the way Word's text import opens it?
+///
+/// Text has a BOM, or reads as UTF-16 by its zero bytes, or has no NUL byte and next to no
+/// other control characters in its first 64 KB. PDFs are refused by their signature (they
+/// start as text). An empty file is text.
+pub fn is_text(b: &[u8]) -> bool {
+    if b.starts_with(&[0xEF, 0xBB, 0xBF]) || b.starts_with(&[0xFF, 0xFE]) || b.starts_with(&[0xFE, 0xFF]) {
+        return true;
+    }
+    if b.starts_with(b"%PDF-") {
+        return false;
+    }
+    let sample = b.get(..b.len().min(64 << 10)).unwrap_or(b);
+    // Tab, line feed, form feed, carriage return, DOS end-of-file (^Z) and escape appear in text;
+    // other controls in more than 1 of 100 characters mean binary.
+    let odd = |c: u32| c == 0 || (c < 0x20 && !matches!(c, 0x09 | 0x0A | 0x0C | 0x0D | 0x1A | 0x1B)) || c == 0x7F;
+    if let Some(le) = unmarked_utf16(sample) {
+        let units = sample.as_chunks::<2>().0;
+        let n = units.iter().filter(|c| odd(u32::from(if le { u16::from_le_bytes(**c) } else { u16::from_be_bytes(**c) }))).count();
+        return n.saturating_mul(100) <= units.len();
+    }
+    if sample.contains(&0) {
+        return false;
+    }
+    sample.iter().filter(|c| odd(u32::from(**c))).count().saturating_mul(100) <= sample.len()
 }
 
 /// Decode text bytes: BOMs first, then UTF-16 without BOM (by its zero bytes), UTF-8, and
@@ -38,17 +72,8 @@ pub fn decode(b: &[u8]) -> String {
     if let Some(rest) = b.strip_prefix(&[0xFE, 0xFF]) {
         return utf16(rest, false);
     }
-    if b.len() >= 4 && b.len().is_multiple_of(2) {
-        let sample = &b[..b.len().min(512)];
-        let even_zero = sample.iter().step_by(2).filter(|x| **x == 0).count();
-        let odd_zero = sample.iter().skip(1).step_by(2).filter(|x| **x == 0).count();
-        let half = sample.len() / 2;
-        if odd_zero * 10 >= half * 4 && even_zero * 10 < half {
-            return utf16(b, true);
-        }
-        if even_zero * 10 >= half * 4 && odd_zero * 10 < half {
-            return utf16(b, false);
-        }
+    if let Some(le) = unmarked_utf16(b) {
+        return utf16(b, le);
     }
     match std::str::from_utf8(b) {
         Ok(s) => s.to_string(),
@@ -77,7 +102,7 @@ fn blocks_text(blocks: &[FBlock], out: &mut Vec<String>, lists: &mut ListCounter
                     }
                     None => lists.reset(),
                 }
-                line.push_str(&p.text().replace('\n', "\r\n").replace(['\u{000C}', '\u{000E}'], ""));
+                line.push_str(&p.shown_text().replace('\n', "\r\n").replace(['\u{000C}', '\u{000E}'], ""));
                 out.push(line);
             }
             FBlock::Table(t) => {

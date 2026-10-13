@@ -1359,7 +1359,6 @@ fn passages_longer_than_the_raw_cap_are_skipped_and_not_found() {
 
 // --- Selection events ---
 
-use egui::accesskit::Role;
 use egui_kittest::kittest::Queryable;
 
 fn assert_selection_at(h: &mut egui_kittest::Harness<'_, WordApp>, events: &[HostEvent], end: &Pos, expect_text: &str) {
@@ -1408,6 +1407,32 @@ fn selecting_the_same_passage_again_reports_it_again() {
     }
 }
 
+/// The same drag over the same passage, right after the first (a browser's frame rate, not
+/// kittest's quarter-second steps): a press that started a drag is no click, so the second press
+/// is not a double-click selecting a word, and the passage is reported again.
+#[test]
+fn dragging_over_the_same_passage_again_at_once_reports_it_again() {
+    let bridge = HostBridge::new();
+    let app = WordApp::new(Session::new(Document::new()), Services::default()).with_host(bridge.clone(), EmbedProfile::View);
+    let mut h = egui_kittest::Harness::builder().with_size(WINDOW).with_step_dt(1.0 / 60.0).with_max_steps(12).build_ui_state(
+        |ui, app: &mut WordApp| {
+            let ctx = ui.ctx().clone();
+            app.logic(&ctx);
+            app.ui(ui);
+        },
+        app,
+    );
+    bridge.set_context(h.ctx.clone());
+    wordcraft_ui_egui::host::prepare_context(&h.ctx);
+    frames(&mut h, 2);
+    open_doc(&mut h, &bridge, &clauses(20));
+    for round in 1..=3 {
+        let (_, after) = drag_select(&mut h, &bridge, &Pos::body(0, 0), &Pos::body(0, 9));
+        let [HostEvent::Selection { text, .. }] = after.as_slice() else { panic!("round {round}: {after:?}") };
+        assert_eq!(text, "Clause 1.", "round {round}");
+    }
+}
+
 #[test]
 fn a_selection_across_paragraphs_keeps_line_breaks_in_copy_text_only() {
     let (mut h, bridge) = embed_app();
@@ -1429,8 +1454,10 @@ fn selection_coordinates_are_points_at_double_density() {
 #[test]
 fn selection_coordinates_are_css_pixels_under_an_egui_zoom() {
     let (mut h, bridge) = embed_app();
-    h.ctx.set_zoom_factor(1.5);
+    // Since the upstream merge the app sets egui's zoom factor from its interface size every frame.
+    h.state_mut().ui.interface_size = wordcraft_ui_egui::theme::InterfaceSize::from_percent(150.0).unwrap();
     frames(&mut h, 2);
+    assert_eq!(h.ctx.zoom_factor(), 1.5);
     open_doc(&mut h, &bridge, &clauses(20));
     let (_, after) = drag_select(&mut h, &bridge, &Pos::body(0, 0), &Pos::body(0, 9));
     let [HostEvent::Selection { x, y, .. }] = after.as_slice() else { panic!("{after:?}") };
@@ -1495,9 +1522,9 @@ fn jumps_and_finds_send_no_selection_but_clear_a_reported_one() {
     let events = bridge.take_events();
     assert!(events.contains(&HostEvent::SelectionCleared), "{events:?}");
     assert!(!events.iter().any(is_selection), "{events:?}");
-    h.get_by_role(Role::TextInput).focus();
+    h.get_by(find_field()).focus();
     frames(&mut h, 2);
-    h.get_by_role(Role::TextInput).type_text("schedule 7");
+    h.get_by(find_field()).type_text("schedule 7");
     frames(&mut h, 3);
     assert_eq!(h.state().session.selected_text(), "Schedule 7");
     assert!(!bridge.take_events().iter().any(is_selection));
@@ -1514,9 +1541,9 @@ fn every_selection_the_editor_makes_clears_a_reported_one_and_is_never_reported(
             "host text jump" => bridge.send(HostCommand::JumpTo(text_target("Clause 9.", None, 0))),
             "next page button" => h.get_by_label("Next page").click(),
             "find" => {
-                h.get_by_role(Role::TextInput).focus();
+                h.get_by(find_field()).focus();
                 frames(&mut h, 2);
-                h.get_by_role(Role::TextInput).type_text("goods listed");
+                h.get_by(find_field()).type_text("goods listed");
             }
             _ => bridge.send(HostCommand::Open { name: "next.docx".into(), bytes: docx(&clauses(120)) }),
         }
@@ -1780,9 +1807,9 @@ fn a_jump_held_across_a_frame_is_not_undone_by_a_newer_one_that_finds_nothing() 
 fn a_find_that_leaves_the_selection_alone_keeps_a_reported_one() {
     let (mut h, bridge) = embed_app();
     open_doc(&mut h, &bridge, &clauses(30));
-    h.get_by_role(Role::TextInput).focus();
+    h.get_by(find_field()).focus();
     frames(&mut h, 2);
-    h.get_by_role(Role::TextInput).type_text("zzz");
+    h.get_by(find_field()).type_text("zzz");
     frames(&mut h, 3);
     select_a_visible_clause(&mut h, &bridge, 30);
     // Next and Previous find no match: nothing moved, so the host's selection stands.
@@ -1792,7 +1819,7 @@ fn a_find_that_leaves_the_selection_alone_keeps_a_reported_one() {
         assert_eq!(bridge.take_events(), vec![], "{button}");
     }
     // Escape in the field clears the search but selects nothing.
-    h.get_by_role(Role::TextInput).focus();
+    h.get_by(find_field()).focus();
     frames(&mut h, 2);
     h.key_press(egui::Key::Escape);
     frames(&mut h, 3);
@@ -1928,7 +1955,7 @@ fn a_host_theme_sends_no_window_theme_command() {
 #[test]
 fn the_hosts_theme_wins_over_the_apps_own_dark_setting() {
     let (mut h, bridge) = embed_app();
-    h.state_mut().ui.dark = true;
+    h.state_mut().ui.theme = wordcraft_ui_egui::theme::Appearance::Dark;
     h.state_mut().session.view.dark_mode = true;
     frames(&mut h, 2);
     bridge.send(HostCommand::SetTheme(theme(false, "#0f766e")));
@@ -2205,7 +2232,7 @@ fn a_selected_balloon_is_readable_in_the_embed_and_in_the_full_apps_dark_mode() 
     }
     // The full app in dark mode, no host accent: the card must not take the chrome's navy.
     let mut h = full_app(commented_document());
-    h.state_mut().ui.dark = true;
+    h.state_mut().ui.theme = wordcraft_ui_egui::theme::Appearance::Dark;
     frames(&mut h, 3);
     assert!(Tokens::get(&h.ctx).dark);
     let contrasts = selected_balloon_contrasts(&mut h);

@@ -30,13 +30,26 @@ pub(crate) enum Unpreservable {
     Altered,
     InsertedObject,
     TooManyChanges,
-    Unmapped { part: String },
-    Locked { part: String },
-    SplitWrapper { part: String },
+    Unmapped {
+        part: String,
+    },
+    Locked {
+        part: String,
+    },
+    SplitWrapper {
+        part: String,
+    },
     Outside(&'static str),
-    NotStory { part: String },
-    Namespace { part: String },
+    NotStory {
+        part: String,
+    },
+    Namespace {
+        part: String,
+    },
     Verification(String),
+    /// embed: something the reader now reads that this writer was not built to rewrite (an object
+    /// of a kind it does not know, a move made in the session): refused rather than guessed.
+    Unsupported(&'static str),
 }
 
 impl std::fmt::Display for Unpreservable {
@@ -56,6 +69,7 @@ impl std::fmt::Display for Unpreservable {
             Unpreservable::NotStory { part } => write!(f, "text in {part} cannot be edited here"),
             Unpreservable::Namespace { part } => write!(f, "{part} is written in a form this writer does not edit"),
             Unpreservable::Verification(detail) => write!(f, "the saved file would differ outside the tracked changes ({detail})"),
+            Unpreservable::Unsupported(what) => write!(f, "{what} cannot be saved as a tracked change yet"),
         }
     }
 }

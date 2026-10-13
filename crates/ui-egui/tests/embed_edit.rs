@@ -17,7 +17,7 @@ const DATE: &str = "2026-10-10T08:00:00Z";
 const AUTHOR: &str = "Sari Wulan";
 
 fn permissions(accept_reject_changes: bool) -> PermissionsSpec {
-    PermissionsSpec { accept_reject_changes, organize_pages: true, fill_forms: true, redact: true, stamps: true, drawing: true }
+    PermissionsSpec { accept_reject_changes, organize_pages: true, fill_forms: true, redact: true, stamps: true, drawing: true, full_editing: false }
 }
 
 fn edit_on(date: &str, accept_reject_changes: bool) -> HostCommand {
@@ -982,7 +982,13 @@ fn with_download_service(downloads: std::rc::Rc<std::cell::Cell<usize>>) -> (Har
     use wordcraft_ui_egui::Services;
     use wordcraft_ui_egui::host::EmbedProfile;
     let bridge = HostBridge::new();
-    let services = Services { download: Some(Box::new(move |_, _| downloads.set(downloads.get() + 1))), ..Services::default() };
+    let services = Services {
+        download: Some(Box::new(move |_, _| {
+            downloads.set(downloads.get() + 1);
+            Ok(())
+        })),
+        ..Services::default()
+    };
     let app = WordApp::new(wordcraft_engine::Session::new(Document::new()), services).with_host(bridge.clone(), EmbedProfile::View);
     let mut harness = common::harness(app, 1.0);
     bridge.set_context(harness.ctx.clone());
@@ -1159,4 +1165,42 @@ fn a_save_echoes_the_opened_name_verbatim_and_carries_word_bytes() {
     assert!(bytes.starts_with(b"PK"), "a Word package (a zip)");
     let reopened = wordcraft_engine::io::open_bytes("reopened.docx", bytes).unwrap();
     assert_eq!(reopened.plain_text(StoryRef::Body), "Rent is due monthly.");
+}
+
+fn edit_request(json: &str) -> HostCommand {
+    HostCommand::SetMode(wordcraft_ui_egui::host::wire::parse_mode_request(json).unwrap())
+}
+
+const EDIT_JSON: &str = r#"{"mode":"edit","author":{"id":"u-sari","name":"Sari Wulan"},"revisionDate":"2026-10-10T08:00:00Z","permissions":{"acceptRejectChanges":false,"organizePages":false,"fillForms":false,"redact":false,"stamps":false,"drawing":false"#;
+
+// Without `fullEditing` (missing or false) edit mode is as before: the edit strip, formatting refused.
+#[test]
+fn without_full_editing_shows_the_edit_strip_and_refuses_formatting() {
+    for permissions_end in ["}}", r#","fullEditing":false}}"#] {
+        let (mut harness, bridge) = opened();
+        bridge.send(edit_request(&format!("{EDIT_JSON}{permissions_end}")));
+        harness.run_steps(3);
+        assert!(harness.query_by_label("Next change").is_some(), "{permissions_end}");
+        harness.state_mut().run("select.all", json!({})).unwrap();
+        assert!(harness.state_mut().run("format.bold", json!({})).is_err(), "{permissions_end}");
+    }
+}
+
+// `fullEditing: true`: the full ribbon instead of the strip, formatting runs, typing stays tracked.
+#[test]
+fn full_editing_shows_the_ribbon_runs_formatting_and_tracks_typing() {
+    let (mut harness, bridge) = opened();
+    bridge.send(edit_request(&format!(r#"{EDIT_JSON},"fullEditing":true}}}}"#)));
+    harness.run_steps(3);
+    assert!(harness.query_by_label("Next change").is_none(), "no edit strip");
+    harness.state_mut().run("select.all", json!({})).unwrap();
+    harness.state_mut().run("format.bold", json!({})).unwrap();
+    harness.state_mut().run("caret.docEnd", json!({})).ok();
+    harness.state_mut().run("text.insert", json!({ "text": " Monthly." })).unwrap();
+    harness.run_steps(2);
+    let revision = harness.state().session.doc.revisions.last().unwrap();
+    assert_eq!((revision.kind, revision.author.as_str(), revision.date.as_str()), (RevisionKind::Insert, AUTHOR, DATE));
+    assert!(body(&harness).contains("Monthly."));
+    // The file stays the host's.
+    assert!(harness.state_mut().run("ui.backstage", json!({})).is_err());
 }
