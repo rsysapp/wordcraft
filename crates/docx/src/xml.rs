@@ -429,8 +429,9 @@ impl<'a> Reading<'a> {
             c.check_end_names = false;
         }
         // quick-xml 0.41 refuses more than 256 declarations on one element with its own error;
-        // `MAX_BINDINGS` in scope (`Reading::tag`) refuses first, as a limit.
-        reader.resolver_mut().set_max_declarations_per_element(MAX_BINDINGS.saturating_add(1));
+        // `MAX_BINDINGS` in scope (`Reading::tag`) refuses first, as a limit. quick-xml's cap stays,
+        // at twice ours, as the bound on what it keeps of one tag before `tag` sees it.
+        reader.resolver_mut().set_max_declarations_per_element(MAX_BINDINGS.saturating_mul(2));
         Ok(Reading { reader, extra, skipped: bytes.len().saturating_sub(body.len()).saturating_add(unseen), scopes: Vec::new(), in_scope: 0 })
     }
 
