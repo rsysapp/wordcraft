@@ -1929,6 +1929,16 @@ fn mouse(app: &mut WordApp, ui: &Ui, resp: &egui::Response, rects: &[Rect], layo
         let _ = app.run("select.paragraph", json!({}));
         return;
     }
+    // A press that turned into a drag is no click (as egui counts clicks): the next press starts
+    // counting again, so dragging over the same text twice selects it again rather than taking the
+    // second press for a double-click (a word). Left out of #549's press counting.
+    if app.canvas.dragging
+        && ui.input(|i| i.pointer.primary_down())
+        && let Some((_, at, _)) = app.canvas.last_press
+        && ui.input(|i| i.pointer.latest_pos()).is_some_and(|now| now.distance(at) > ui.ctx().options(|o| o.input_options.max_click_dist))
+    {
+        app.canvas.last_press = None;
+    }
     let pressed = ui.input(|i| i.pointer.primary_pressed()) && resp.contains_pointer();
     if pressed {
         let now = ui.input(|i| i.time);

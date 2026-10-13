@@ -1407,6 +1407,32 @@ fn selecting_the_same_passage_again_reports_it_again() {
     }
 }
 
+/// The same drag over the same passage, right after the first (a browser's frame rate, not
+/// kittest's quarter-second steps): a press that started a drag is no click, so the second press
+/// is not a double-click selecting a word, and the passage is reported again.
+#[test]
+fn dragging_over_the_same_passage_again_at_once_reports_it_again() {
+    let bridge = HostBridge::new();
+    let app = WordApp::new(Session::new(Document::new()), Services::default()).with_host(bridge.clone(), EmbedProfile::View);
+    let mut h = egui_kittest::Harness::builder().with_size(WINDOW).with_step_dt(1.0 / 60.0).with_max_steps(12).build_ui_state(
+        |ui, app: &mut WordApp| {
+            let ctx = ui.ctx().clone();
+            app.logic(&ctx);
+            app.ui(ui);
+        },
+        app,
+    );
+    bridge.set_context(h.ctx.clone());
+    wordcraft_ui_egui::host::prepare_context(&h.ctx);
+    frames(&mut h, 2);
+    open_doc(&mut h, &bridge, &clauses(20));
+    for round in 1..=3 {
+        let (_, after) = drag_select(&mut h, &bridge, &Pos::body(0, 0), &Pos::body(0, 9));
+        let [HostEvent::Selection { text, .. }] = after.as_slice() else { panic!("round {round}: {after:?}") };
+        assert_eq!(text, "Clause 1.", "round {round}");
+    }
+}
+
 #[test]
 fn a_selection_across_paragraphs_keeps_line_breaks_in_copy_text_only() {
     let (mut h, bridge) = embed_app();
