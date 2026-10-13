@@ -100,6 +100,27 @@ path = "LICENSE_MIT"
 checksum = "9d1eb142840c7acfd5511b4dd298cece3f0053f5809228906445cd8a3365592f"
 license = "MIT"
 
+[wordcraft-docbin.clarify]
+license = "MIT OR Apache-2.0"
+[[wordcraft-docbin.clarify.git]]
+path = "LICENSE-MIT"
+checksum = "fc257de83c44ae49e4aad1cf777b886794be3ac9c8d00c010ef55935d5bbeba5"
+license = "MIT"
+
+[wordcraft-metafile.clarify]
+license = "MIT OR Apache-2.0"
+[[wordcraft-metafile.clarify.git]]
+path = "LICENSE-MIT"
+checksum = "fc257de83c44ae49e4aad1cf777b886794be3ac9c8d00c010ef55935d5bbeba5"
+license = "MIT"
+
+[wordcraft-zotero.clarify]
+license = "MIT OR Apache-2.0"
+[[wordcraft-zotero.clarify.git]]
+path = "LICENSE-MIT"
+checksum = "fc257de83c44ae49e4aad1cf777b886794be3ac9c8d00c010ef55935d5bbeba5"
+license = "MIT"
+
 [wordcraft-doc.clarify]
 license = "MIT OR Apache-2.0"
 [[wordcraft-doc.clarify.git]]
@@ -185,6 +206,24 @@ checksum = "fc257de83c44ae49e4aad1cf777b886794be3ac9c8d00c010ef55935d5bbeba5"
 license = "MIT"
 
 
+# craft-ui, a git dependency (storytold/craft-libs, pinned in crates/ui-egui/Cargo.toml): its
+# licence files are at the repository's root, not in the crate's folder.
+[craft-ui.clarify]
+license = "MIT OR Apache-2.0"
+[[craft-ui.clarify.git]]
+path = "LICENSE-MIT"
+checksum = "2f42c0cafc8ad394d91373fe1f342aee5453850b151a51405c68cae9ada86d26"
+license = "MIT"
+
+# wuff (WOFF and WOFF2 decoding, through the fonts crate): the package has no licence file; the
+# repository's LICENSE at the published commit names its holders.
+[wuff.clarify]
+license = "MIT"
+[[wuff.clarify.git]]
+path = "LICENSE"
+checksum = "4b373ba4395e35d44ba1f41202c179b57ca3c5ba5e4a1aaafa1547aede7e1eb7"
+license = "MIT"
+
 # licence files inside the published package
 [type-map.clarify]
 license = "MIT OR Apache-2.0"
@@ -199,3 +238,12 @@ license = "MIT"
 path = "LICENSE.txt"
 checksum = "3823dda7cf046602f4b4e77ec8e227863dc4736037cc85bb33d9f19febe16bb7"
 license = "MIT"
+
+# brotli-decompressor (WOFF2's Brotli streams, through wuff): offered as "BSD-3-Clause/MIT"; the
+# package ships the BSD 3-clause text, under which the module uses it.
+[brotli-decompressor.clarify]
+license = "BSD-3-Clause"
+[[brotli-decompressor.clarify.files]]
+path = "LICENSE"
+checksum = "c0c56f26d9c051cac4d200c34c84e7ae9aaa853e01a982a1df08b09931e518ae"
+license = "BSD-3-Clause"
