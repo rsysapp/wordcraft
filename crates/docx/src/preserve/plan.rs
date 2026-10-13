@@ -1887,14 +1887,17 @@ mod tests {
 
     #[test]
     fn refuses_a_mark_that_carries_typing_deleted_from_an_empty_paragraph() {
-        // I3 (P11): typing into an empty paragraph and deleting it leaves the session's insertion on
-        // the mark (`Paragraph::delete` copies the character's formatting into it). Refused until the
-        // engine stops copying tracked changes into a mark (Task 10).
+        // I3 (P11): typing into an empty paragraph and deleting it used to leave the session's
+        // insertion on the mark (`Paragraph::delete` copied the character's formatting into it).
+        // Upstream's `delete` no longer copies a tracked change into a mark (merge of 159b84f), so
+        // nothing is left; a mark that does carry one is still refused.
         let original = Paragraph::new();
         let mut edited = original.clone();
         edited.insert_text(0, "x", &CharProps { ins: Some(0), ..CharProps::default() }).unwrap();
         edited.delete(0, 1).unwrap();
-        assert_eq!(edited.mark.ins, Some(0));
+        assert_eq!(edited.mark.ins, None);
+        assert!(planned(&original, &doc(&[]), &[&edited], &doc(&[SARI])).is_ok());
+        edited.mark.ins = Some(0);
         assert_eq!(planned(&original, &doc(&[]), &[&edited], &doc(&[SARI])), Err(Unpreservable::Structure));
     }
 

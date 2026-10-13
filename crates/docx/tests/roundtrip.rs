@@ -1350,7 +1350,11 @@ fn flat_opc_round_trip_equals_docx() {
     assert!(text.contains("pkg:name=\"/word/document.xml\"") && text.contains("<pkg:binaryData>"));
     assert_eq!(wordcraft_docx::sniff_xml(&xml), wordcraft_docx::XmlKind::FlatOpc);
     let back = wordcraft_docx::read_xml(&xml).expect("read flat");
-    assert_eq!(back, rt(&d));
+    // embed: a .docx read keeps its package for the preserving writer; a Word XML read keeps none.
+    let mut docx = rt(&d);
+    assert!(docx.passthrough.remove(wordcraft_docx::SOURCE_PACKAGE).is_some());
+    assert!(!back.passthrough.contains_key(wordcraft_docx::SOURCE_PACKAGE));
+    assert_eq!(back, docx);
     assert_eq!(back.media.len(), 1);
 }
 
