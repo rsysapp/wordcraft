@@ -66,6 +66,9 @@ const SEALED_WHOLE: &[&str] = &["mc:AlternateContent", "m:oMath", "m:oMathPara"]
 
 const SAME: &Change = &Change::Same;
 
+/// The highest tracked-change id Word reads (`w:id` is a 32-bit signed number there).
+const MAX_ID: u64 = i32::MAX as u64;
+
 /// Fresh ids for new tracked changes and paragraphs, unique in the package.
 pub(crate) struct Ids {
     next_revision: u64,
@@ -81,21 +84,25 @@ impl Ids {
         Ids { next_revision: highest_revision_id.saturating_add(1), paragraph_ids, next_paragraph: 0 }
     }
 
-    fn revision(&mut self) -> String {
+    /// A new `w:id`: Word reads ids as 32-bit signed numbers, so none past `i32::MAX` is made.
+    fn revision(&mut self) -> Result<String, Unpreservable> {
         let id = self.next_revision;
-        self.next_revision = self.next_revision.saturating_add(1);
-        id.to_string()
+        if id > MAX_ID {
+            return Err(Unpreservable::TooManyChanges);
+        }
+        self.next_revision = id.saturating_add(1);
+        Ok(id.to_string())
     }
 
     /// A `w14:paraId`/`w14:textId` value: eight hexadecimal digits below 0x80000000, unused.
-    fn paragraph(&mut self) -> String {
+    fn paragraph(&mut self) -> Result<String, Unpreservable> {
         for _ in 0..0x7FFF_FFFFu32 {
             self.next_paragraph = self.next_paragraph % 0x7FFF_FFFF + 1;
             if self.paragraph_ids.insert(self.next_paragraph) {
-                return format!("{:08X}", self.next_paragraph);
+                return Ok(format!("{:08X}", self.next_paragraph));
             }
         }
-        "7FFFFFFF".to_string()
+        Err(Unpreservable::TooManyChanges)
     }
 }
 
@@ -106,33 +113,45 @@ pub(crate) struct Source<'a> {
     pub rewritten: &'a BTreeMap<usize, (usize, Vec<u8>)>,
 }
 
+/// A copy that would cut a paragraph already rewritten.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct Straddled;
+
 impl Source<'_> {
-    pub fn copy(&self, range: Range<usize>, out: &mut Vec<u8>) {
-        self.each(range, |piece| out.extend_from_slice(piece));
+    pub fn copy(&self, range: Range<usize>, out: &mut Vec<u8>) -> Result<(), Straddled> {
+        self.each(range, |piece| out.extend_from_slice(piece))
     }
 
-    /// Each piece a copy of `range` is made of, in order.
-    fn each(&self, range: Range<usize>, mut piece: impl FnMut(&[u8])) {
+    /// Each piece a copy of `range` is made of, in order. A paragraph already rewritten that reaches
+    /// past either end of the range cannot be copied in part: refused, never copied as it was.
+    fn each(&self, range: Range<usize>, mut piece: impl FnMut(&[u8])) -> Result<(), Straddled> {
         if range.start >= range.end {
-            return;
+            return Ok(());
+        }
+        if self.rewritten.range(..range.start).next_back().is_some_and(|(_, (end, _))| *end > range.start) {
+            return Err(Straddled);
         }
         let mut at = range.start;
         for (&start, (end, bytes)) in self.rewritten.range(range.start..range.end) {
-            // One inside a span already written whole, or reaching past the range: not this copy's.
-            if start < at || *end > range.end {
+            // One inside a span already written whole is written with it.
+            if start < at {
                 continue;
+            }
+            if *end > range.end {
+                return Err(Straddled);
             }
             piece(self.bytes.get(at..start).unwrap_or_default());
             piece(bytes);
             at = *end;
         }
         piece(self.bytes.get(at..range.end).unwrap_or_default());
+        Ok(())
     }
 
-    fn length(&self, range: Range<usize>) -> usize {
+    fn length(&self, range: Range<usize>) -> Result<usize, Straddled> {
         let mut length = 0usize;
-        self.each(range, |piece| length = length.saturating_add(piece.len()));
-        length
+        self.each(range, |piece| length = length.saturating_add(piece.len()))?;
+        Ok(length)
     }
 
     /// A tag as written (the scan read it, so it is text).
@@ -191,8 +210,24 @@ enum Token {
     Props,
     Item(Item),
     /// A wrapper's start tag; it is written when the content inside needs it.
-    Open,
+    Open(usize),
     /// A wrapper's end tag; it is written when the content after needs it.
+    Close(usize),
+}
+
+/// What bytes between tags follow in the source: something written already, a start tag or an end
+/// tag that may be written later.
+#[derive(Clone, Copy, Debug)]
+enum After {
+    Written,
+    Open(usize),
+    Close(usize),
+}
+
+/// The tag a held gap is written right after.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Attach {
+    Open(usize),
     Close(usize),
 }
 
@@ -289,6 +324,31 @@ fn retag(tag: &str, changes: &[(&str, String)]) -> String {
             None => String::from_utf8_lossy(&attribute.value).replace('"', "&quot;"),
         };
         out.push_str(&format!(" {key}=\"{value}\""));
+    }
+    out.push_str(if empty { "/>" } else { ">" });
+    out
+}
+
+/// A start tag with `xml:space="preserve"`: set where it is written, added last where it is not.
+fn preserving_space(tag: &str) -> String {
+    let empty = tag.trim_end().ends_with("/>");
+    let inner = tag.trim().trim_start_matches('<').trim_end_matches('>').trim_end_matches('/').trim_end();
+    let name_length = inner.find(char::is_whitespace).unwrap_or(inner.len());
+    let start = quick_xml::events::BytesStart::from_content(inner, name_length);
+    let mut out = format!("<{}", inner.get(..name_length).unwrap_or(""));
+    let mut set = false;
+    for attribute in start.attributes().with_checks(false).flatten() {
+        let key = String::from_utf8_lossy(attribute.key.as_ref()).into_owned();
+        let value = if key == "xml:space" {
+            set = true;
+            "preserve".to_string()
+        } else {
+            String::from_utf8_lossy(&attribute.value).replace('"', "&quot;")
+        };
+        out.push_str(&format!(" {key}=\"{value}\""));
+    }
+    if !set {
+        out.push_str(" xml:space=\"preserve\"");
     }
     out.push_str(if empty { "/>" } else { ">" });
     out
@@ -482,6 +542,11 @@ enum Typed {
     Element(&'static str, Option<&'static str>),
 }
 
+/// Whether XML can hold `ch` (`esc` drops the others).
+fn xml_char(ch: char) -> bool {
+    matches!(ch, '\t' | '\n' | '\r' | '\u{20}'..='\u{D7FF}' | '\u{E000}'..='\u{FFFD}' | '\u{10000}'..='\u{10FFFF}')
+}
+
 fn typed_char(ch: char) -> Option<Typed> {
     Some(match ch {
         '\t' => Typed::Element("tab", None),
@@ -513,7 +578,10 @@ pub(crate) fn rewrite(
     budget: &mut Budget,
 ) -> Result<Vec<u8>, Unpreservable> {
     let mut ledger = Ledger { budget, held: 0 };
-    let written = write(source, prefix, part, paragraph, steps, ids, &mut ledger);
+    // Nothing changes (6C-48 M1): the paragraph as written.
+    let unchanged = steps.len() == paragraph.units.len()
+        && steps.iter().enumerate().all(|(index, step)| matches!(step, Step::Keep { unit, change: Change::Same } if *unit == index));
+    let written = if unchanged { copied(source, part, paragraph, &mut ledger) } else { write(source, prefix, part, paragraph, steps, ids, &mut ledger) };
     match written {
         Ok(out) => {
             // What it worked with is gone; the paragraph stays, charged by its room.
@@ -531,6 +599,18 @@ pub(crate) fn rewrite(
             Err(refused)
         }
     }
+}
+
+/// The paragraph's span, copied, charged as `write` charges its output.
+fn copied(source: &Source<'_>, part: &str, paragraph: &ScannedPara, ledger: &mut Ledger<'_>) -> Result<Vec<u8>, Unpreservable> {
+    let unmapped = || Unpreservable::Unmapped { part: part.to_string() };
+    let length = source.length(paragraph.span()).map_err(|_| unmapped())?;
+    ledger.work(units(length) / BYTES_PER_UNIT_COPIED + 1)?;
+    let mut out = ledger.vector::<u8>(length)?;
+    source.copy(paragraph.span(), &mut out).map_err(|_| unmapped())?;
+    // What the allocator gave beyond the room asked for is charged too.
+    ledger.hold(units(out.capacity().saturating_sub(length)))?;
+    Ok(out)
 }
 
 fn write(
@@ -684,7 +764,7 @@ fn write(
     }
     for (index, wrapper) in paragraph.wrappers.iter().enumerate() {
         if holds.get(index).copied().unwrap_or(false) {
-            tokens.push((wrapper.start.clone(), Token::Open));
+            tokens.push((wrapper.start.clone(), Token::Open(index)));
             if let Some(end) = &wrapper.end {
                 tokens.push((end.clone(), Token::Close(index)));
             }
@@ -709,6 +789,10 @@ fn write(
         }
     }
     let inserted = placing.len();
+    // An element written empty stays so while nothing is put in it.
+    if inserted == 0 && paragraph.end.is_none() {
+        return copied(source, part, paragraph, ledger);
+    }
     let mut insertions: BTreeMap<At, Vec<Insertion<'_>>> = BTreeMap::new();
     for (unit, insertion) in placing {
         let at = match position(paragraph, unit, part)? {
@@ -743,9 +827,7 @@ fn write(
         out: Vec::new(),
         open: Vec::new(),
         opened: Vec::new(),
-        between: Vec::new(),
-        inside: None,
-        closing: false,
+        held: Vec::new(),
         props_written: false,
         written: 0,
     };
@@ -756,29 +838,23 @@ fn write(
     let content_end = paragraph.end.as_ref().map_or(paragraph.start.end, |end| end.start);
     let mut at = paragraph.start.end;
     let mut item_index = 0usize;
+    // What the bytes before the next token follow: each gap stays with the tag or item before it.
+    let mut after = After::Written;
     for (span, token) in &tokens {
         if span.start < at || span.end > content_end {
             return Err(Unpreservable::Unmapped { part: part.to_string() });
         }
-        let gap = at..span.start;
+        writer.gap(at..span.start, after)?;
         match *token {
             Token::Props => {
-                writer.flush()?;
-                writer.copy(gap)?;
                 writer.props()?;
+                after = After::Written;
             }
-            // Bytes before a start tag stand outside its wrapper: written once the wrappers the
-            // next content leaves are closed, before those it enters are opened.
-            Token::Open => writer.between(gap)?,
-            // A wrapper is closed when the content after it needs it closed, so typing that
-            // continues its last character stays inside it. Bytes before its end tag stand inside it.
+            // A start tag is written when the content inside needs it.
+            Token::Open(index) => after = After::Open(index),
+            // An end tag is written when the content after needs the wrapper closed, so typing that
+            // continues its last character stays inside it.
             Token::Close(index) => {
-                if writer.closing {
-                    writer.between(gap)?;
-                } else {
-                    writer.copy(gap)?;
-                }
-                writer.closing = true;
                 // A hyperlink or content control whose content went with changes decided inside it
                 // stays, empty; one inside a tracked change goes with what was decided around it.
                 let emptied = writer.opened.get(index).is_some_and(|opened| !opened)
@@ -786,11 +862,13 @@ fn write(
                     && paragraph.wrappers.get(index).is_some_and(|wrapper| wrapper.kind == WrapperKind::Other && !revised(paragraph, wrapper.parent));
                 if emptied {
                     writer.emptied(index)?;
+                } else if !writer.open.contains(&Entry::Source(index)) {
+                    // Never written: what followed its start tag stays where it stood.
+                    writer.release_held(&|attach| attach != Attach::Open(index))?;
                 }
+                after = After::Close(index);
             }
             Token::Item(item) => {
-                writer.flush()?;
-                writer.inside = Some(gap);
                 writer.insertions(insertions.get(&At::Before(item_index)).map(Vec::as_slice))?;
                 item_index = item_index.saturating_add(1);
                 match item {
@@ -811,15 +889,13 @@ fn write(
                         writer.other("", parent, wrapper_span(paragraph, index), item_status)?;
                     }
                 }
-                writer.flush()?;
-                writer.closing = false;
+                after = After::Written;
             }
         }
         at = span.end;
     }
+    writer.gap(at..content_end, after)?;
     writer.insertions(insertions.get(&At::End).map(Vec::as_slice))?;
-    writer.sync(&[])?;
-    writer.copy(at..content_end)?;
     writer.end_paragraph(true)?;
     // Every insertion was placed where its character stands.
     if writer.written != inserted {
@@ -976,13 +1052,9 @@ struct Writer<'a, 'l, 'b> {
     open: Vec<Entry<'a>>,
     /// Source wrappers opened at least once: a second opening is a split.
     opened: Vec<bool>,
-    /// Bytes between wrapper tags, written once the next content's sync has closed what it leaves.
-    between: Vec<Range<usize>>,
-    /// Bytes before the item being written, written once its wrappers are open.
-    inside: Option<Range<usize>>,
-    /// An end tag was passed since the last item: what follows stands outside a wrapper that may
-    /// still be open.
-    closing: bool,
+    /// Bytes after a start or end tag not written yet, in order: each is written right after its
+    /// tag, or where it stood when the tag is never written.
+    held: Vec<(Range<usize>, Attach)>,
     /// The source's properties were written with its own mark.
     props_written: bool,
     /// Insertions written.
@@ -1030,12 +1102,11 @@ impl<'a> Writer<'a, '_, '_> {
 
     fn copy(&mut self, range: Range<usize>) -> Result<(), Unpreservable> {
         let source = self.source;
-        let length = source.length(range.clone());
+        let length = source.length(range.clone()).map_err(|_| self.unmapped())?;
         self.ledger.work(units(length) / BYTES_PER_UNIT_COPIED + 1)?;
         self.reserve(length)?;
         let out = &mut self.out;
-        source.each(range, |piece| out.extend_from_slice(piece));
-        Ok(())
+        source.each(range, |piece| out.extend_from_slice(piece)).map_err(|_| self.unmapped())
     }
 
     fn tag(&self, range: Range<usize>) -> Result<&'a str, Unpreservable> {
@@ -1043,37 +1114,58 @@ impl<'a> Writer<'a, '_, '_> {
         source.text(range).ok_or_else(|| self.unmapped())
     }
 
-    /// Bytes between wrapper tags, held until the wrappers around them are settled.
-    fn between(&mut self, gap: Range<usize>) -> Result<(), Unpreservable> {
+    /// Bytes between tags, after `after`: written now when what they follow is written, else held
+    /// until it is.
+    fn gap(&mut self, gap: Range<usize>, after: After) -> Result<(), Unpreservable> {
         if gap.is_empty() {
             return Ok(());
         }
-        self.ledger.hold(vector_slot::<Range<usize>>())?;
-        self.between.push(gap);
-        Ok(())
-    }
-
-    fn flush_between(&mut self) -> Result<(), Unpreservable> {
-        let gaps = std::mem::take(&mut self.between);
-        self.ledger.release(units(gaps.len()).saturating_mul(vector_slot::<Range<usize>>()));
-        for gap in gaps {
-            self.copy(gap)?;
-        }
-        Ok(())
-    }
-
-    /// Every gap held, where the output stands now.
-    fn flush(&mut self) -> Result<(), Unpreservable> {
-        self.flush_between()?;
-        match self.inside.take() {
-            Some(gap) => self.copy(gap),
-            None => Ok(()),
+        let attach = match after {
+            After::Written => None,
+            After::Open(index) => (!self.open.contains(&Entry::Source(index))).then_some(Attach::Open(index)),
+            After::Close(index) => self.open.contains(&Entry::Source(index)).then_some(Attach::Close(index)),
+        };
+        match attach {
+            None => self.copy(gap),
+            Some(attach) => {
+                self.ledger.hold(vector_slot::<(Range<usize>, Attach)>())?;
+                self.held.push((gap, attach));
+                Ok(())
+            }
         }
     }
 
-    fn change_tag(&mut self, kind: &str, revision: &Revision, empty: bool) -> String {
-        let id = self.ids.revision();
-        format!(
+    /// Write the held gaps `keep` does not keep back, in order.
+    fn release_held(&mut self, keep: &dyn Fn(Attach) -> bool) -> Result<(), Unpreservable> {
+        if self.held.iter().all(|(_, attach)| keep(*attach)) {
+            return Ok(());
+        }
+        let held = std::mem::take(&mut self.held);
+        let mut kept = Vec::new();
+        let mut result = Ok(());
+        for (gap, attach) in held {
+            if keep(attach) || result.is_err() {
+                kept.push((gap, attach));
+                continue;
+            }
+            self.ledger.release(vector_slot::<(Range<usize>, Attach)>());
+            result = self.copy(gap);
+        }
+        self.held = kept;
+        result
+    }
+
+    /// A new tracked change's start tag. The session is recorded as it is or not at all: a change
+    /// with no date, or an author XML cannot hold as given, is refused (6C-48 M3).
+    fn change_tag(&mut self, kind: &str, revision: &Revision, empty: bool) -> Result<String, Unpreservable> {
+        if revision.date.is_empty() {
+            return Err(Unpreservable::Verification("a tracked change of this session has no date".into()));
+        }
+        if !revision.author.chars().chain(revision.date.chars()).all(xml_char) {
+            return Err(Unpreservable::Verification("the name or date of this session's tracked changes holds a character a Word file cannot hold".into()));
+        }
+        let id = self.ids.revision()?;
+        Ok(format!(
             "<{name} {id_name}=\"{id}\" {author_name}=\"{author}\" {date_name}=\"{date}\"{end}",
             name = self.w(kind),
             id_name = self.w("id"),
@@ -1082,7 +1174,7 @@ impl<'a> Writer<'a, '_, '_> {
             author = esc(&revision.author),
             date = esc(&revision.date),
             end = if empty { "/>" } else { ">" },
-        )
+        ))
     }
 
     fn begin_paragraph(&mut self) -> Result<(), Unpreservable> {
@@ -1101,7 +1193,8 @@ impl<'a> Writer<'a, '_, '_> {
                 }
             }
             Some(mark) => {
-                let tag = retag(&start, &[("paraId", self.ids.paragraph()), ("textId", self.ids.paragraph())]);
+                let (paragraph_id, text_id) = (self.ids.paragraph()?, self.ids.paragraph()?);
+                let tag = retag(&start, &[("paraId", paragraph_id), ("textId", text_id)]);
                 self.push(&tag)?;
                 self.mark_props(mark)?;
             }
@@ -1126,7 +1219,7 @@ impl<'a> Writer<'a, '_, '_> {
     /// with the source's own mark), its formatting change with a fresh id (as Word copies it to the
     /// paragraph Enter makes, 6C-24), the mark inserted.
     fn mark_props(&mut self, mark: &Revision) -> Result<(), Unpreservable> {
-        let insertion = self.change_tag("ins", mark, true);
+        let insertion = self.change_tag("ins", mark, true)?;
         let paragraph = self.paragraph;
         let Some(props) = &paragraph.ppr else {
             let text = format!("<{ppr}><{rpr}>{insertion}</{rpr}></{ppr}>", ppr = self.w("pPr"), rpr = self.w("rPr"));
@@ -1156,7 +1249,7 @@ impl<'a> Writer<'a, '_, '_> {
                     }
                     let source = self.source;
                     let tag_end = start_tag_end(source.bytes, span).ok_or_else(|| self.unmapped())?;
-                    let id = self.ids.revision();
+                    let id = self.ids.revision()?;
                     let tag = retag(self.tag(span.start..tag_end)?, &[("id", id)]);
                     self.push(&tag)?;
                     self.copy(tag_end..span.end)?;
@@ -1194,7 +1287,6 @@ impl<'a> Writer<'a, '_, '_> {
 
     fn end_paragraph(&mut self, last: bool) -> Result<(), Unpreservable> {
         self.sync(&[])?;
-        self.flush()?;
         let paragraph = self.paragraph;
         match (&paragraph.end, last) {
             (Some(end), true) => self.copy(end.clone()),
@@ -1202,20 +1294,27 @@ impl<'a> Writer<'a, '_, '_> {
         }
     }
 
+    /// The wrappers an item of the source is written in: what stood before it in the source is
+    /// written before it.
     fn sync(&mut self, target: &[Entry<'a>]) -> Result<(), Unpreservable> {
+        self.settle(target)?;
+        let open: Vec<Entry<'a>> = self.open.clone();
+        self.release_held(&|attach| matches!(attach, Attach::Close(index) if open.contains(&Entry::Source(index))))
+    }
+
+    /// Close what `target` leaves and open what it enters, each tag with the bytes after it.
+    fn settle(&mut self, target: &[Entry<'a>]) -> Result<(), Unpreservable> {
         let common = self.open.iter().zip(target).take_while(|(open, wanted)| open == wanted).count();
         while self.open.len() > common {
             if let Some(entry) = self.open.pop() {
                 self.close(entry)?;
             }
         }
-        self.flush_between()?;
         for entry in target.iter().skip(common) {
             self.open_entry(*entry)?;
             self.open.push(*entry);
         }
-        self.closing = false;
-        self.flush()
+        Ok(())
     }
 
     /// A source wrapper whose content went, written empty where it stood.
@@ -1228,13 +1327,17 @@ impl<'a> Writer<'a, '_, '_> {
             *slot = true;
         }
         self.copy(wrapper.start.clone())?;
+        self.release_held(&|attach| attach != Attach::Open(index))?;
         self.copy(end)
     }
 
     fn close(&mut self, entry: Entry<'a>) -> Result<(), Unpreservable> {
         match entry {
             Entry::Source(index) => match self.paragraph.wrappers.get(index).and_then(|wrapper| wrapper.end.clone()) {
-                Some(end) => self.copy(end),
+                Some(end) => {
+                    self.copy(end)?;
+                    self.release_held(&|attach| attach != Attach::Close(index))
+                }
                 None => Err(self.unmapped()),
             },
             Entry::New { deleted, .. } => {
@@ -1255,17 +1358,25 @@ impl<'a> Writer<'a, '_, '_> {
                     if let Some(slot) = self.opened.get_mut(index) {
                         *slot = true;
                     }
-                    self.push(tag)
+                    // What stood before its start tag after a tag never written goes first.
+                    let start = wrapper.start.start;
+                    let open = self.open.clone();
+                    self.release_held(&|attach| match attach {
+                        Attach::Open(other) => open.contains(&Entry::Source(other)) || paragraph.wrappers.get(other).is_none_or(|other| other.start.start >= start),
+                        Attach::Close(other) => open.contains(&Entry::Source(other)),
+                    })?;
+                    self.push(tag)?;
+                    self.release_held(&|attach| attach != Attach::Open(index))
                 } else if wrapper.kind == WrapperKind::Other {
                     Err(Unpreservable::SplitWrapper { part: self.part.to_string() })
                 } else {
                     // The rest of a split tracked change: the same change, a fresh id.
-                    let id = self.ids.revision();
+                    let id = self.ids.revision()?;
                     self.push(&retag(tag, &[("id", id)]))
                 }
             }
             Entry::New { deleted, revision } => {
-                let tag = self.change_tag(if deleted { "del" } else { "ins" }, revision, false);
+                let tag = self.change_tag(if deleted { "del" } else { "ins" }, revision, false)?;
                 self.push(&tag)
             }
         }
@@ -1321,11 +1432,23 @@ impl<'a> Writer<'a, '_, '_> {
     /// others the properties alone.
     fn run_open(&mut self, run: &RunNode, first: bool) -> Result<(), Unpreservable> {
         self.push(&open_tag(self.tag(run.start.clone())?, run.end.is_none()))?;
-        match run.rpr.clone() {
+        match (run.rpr.clone(), run.rpr_change.clone()) {
             // What stands before the properties, unless a child does (it is written with its piece).
-            Some(rpr) if first && Self::properties_first(run) => self.copy(run.start.end..rpr.end),
-            Some(rpr) => self.copy(rpr),
-            None => Ok(()),
+            (Some(rpr), _) if first && Self::properties_first(run) => self.copy(run.start.end..rpr.end),
+            (Some(rpr), _) if first => self.copy(rpr),
+            // A later piece's copy of a formatting change is a change of its own: a fresh id
+            // (6C-48 M4).
+            (Some(rpr), Some(change)) => {
+                let source = self.source;
+                let tag_end = start_tag_end(source.bytes, &change).ok_or_else(|| self.unmapped())?;
+                self.copy(rpr.start..change.start)?;
+                let id = self.ids.revision()?;
+                let tag = retag(self.tag(change.start..tag_end)?, &[("id", id)]);
+                self.push(&tag)?;
+                self.copy(tag_end..rpr.end)
+            }
+            (Some(rpr), None) => self.copy(rpr),
+            (None, _) => Ok(()),
         }
     }
 
@@ -1508,7 +1631,7 @@ impl<'a> Writer<'a, '_, '_> {
                 }
                 Part::Chars { child, from, to } => {
                     let Some(whole) = run.children.get(*child) else { continue };
-                    let ChildKind::Text { chars, raw_name, .. } = &whole.kind else { continue };
+                    let ChildKind::Text { chars, raw_name, start, .. } = &whole.kind else { continue };
                     let ends = *to == chars.len();
                     if *from == 0 {
                         self.gap_before(run, *child)?;
@@ -1521,7 +1644,9 @@ impl<'a> Writer<'a, '_, '_> {
                             ("delText", Some(false)) => with_local(raw_name, "t"),
                             _ => raw_name.clone(),
                         };
-                        self.push(&format!("<{name} xml:space=\"preserve\">"))?;
+                        // The source's start tag, its attributes kept, its spaces kept (6C-48 M5).
+                        let tag = preserving_space(&rename_tag(self.tag(start.clone())?, raw_name, &name));
+                        self.push(&tag)?;
                         // Characters written next to each other are copied together.
                         let mut stretch: Option<Range<usize>> = None;
                         for character in chars.get(*from..*to).unwrap_or_default() {
@@ -1609,7 +1734,7 @@ impl<'a> Writer<'a, '_, '_> {
             .map(Entry::Source)
             .collect();
         target.push(Entry::New { deleted: false, revision });
-        self.sync(&target)?;
+        self.settle(&target)?;
         self.push(&format!("<{}>", self.w("r")))?;
         match props {
             RunProps::None => {}
@@ -1682,7 +1807,7 @@ mod tests {
     use crate::inspect::{MAX_MEMORY, MAX_WORK};
     use crate::package::{Package, ReadLimits, zip_entries};
     use crate::preserve::plan::{Change, Revision, Step};
-    use crate::preserve::scan::{ScannedPara, scan_package};
+    use crate::preserve::scan::{Loc, ScannedPara, Unit, WrapperKind, scan_package};
     use wordcraft_doc::{CharProps, Document, Paragraph, Revision as Recorded, RevisionKind};
 
     const W: &str =
@@ -1745,7 +1870,9 @@ mod tests {
         assert_eq!(
             rewritten(&source, &steps, &[]).unwrap(),
             format!(
-                r#"<w:p><w:r><w:rPr><w:b/>{change}</w:rPr><w:t xml:space="preserve">Rent</w:t></w:r><w:ins w:id="11" {SARI_ATTRIBUTES}><w:r><w:rPr><w:b/></w:rPr><w:t xml:space="preserve"> is</w:t></w:r></w:ins><w:r><w:rPr><w:b/>{change}</w:rPr><w:t xml:space="preserve"> due.</w:t></w:r></w:p>"#
+                r#"<w:p><w:r><w:rPr><w:b/>{change}</w:rPr><w:t xml:space="preserve">Rent</w:t></w:r><w:ins w:id="11" {SARI_ATTRIBUTES}><w:r><w:rPr><w:b/></w:rPr><w:t xml:space="preserve"> is</w:t></w:r></w:ins><w:r><w:rPr><w:b/>{again}</w:rPr><w:t xml:space="preserve"> due.</w:t></w:r></w:p>"#,
+                // 6C-48 M4 (amends the brief): a copy of the formatting change after the first has an id of its own.
+                again = change.replace(r#"w:id="9""#, r#"w:id="12""#)
             )
         );
     }
@@ -1842,10 +1969,10 @@ mod tests {
         let bytes = b"abcdefgh";
         let rewritten = BTreeMap::from([(2usize, (6usize, b"OUTER".to_vec())), (3, (4, b"in".to_vec())), (7, (8, b"!".to_vec()))]);
         let mut out = Vec::new();
-        Source { bytes, rewritten: &rewritten }.copy(0..8, &mut out);
+        Source { bytes, rewritten: &rewritten }.copy(0..8, &mut out).unwrap();
         assert_eq!(out, b"abOUTERg!");
         let used: HashSet<u32> = HashSet::from([1, 2]);
-        assert_eq!(Ids::new(0, used).paragraph(), "00000003");
+        assert_eq!(Ids::new(0, used).paragraph().unwrap(), "00000003");
     }
 
     // ---- Round trips: each rewrite read back by the desktop reader and inspected against its source.
@@ -2705,29 +2832,26 @@ mod tests {
     #[test]
     fn holds_no_more_than_it_charges() {
         if std::env::var_os(MEASURING).is_some() {
-            let (body, steps) = long_case();
-            let (bytes, scanned) = scanned(&body);
-            let none = BTreeMap::new();
-            let source = Source { bytes: &bytes, rewritten: &none };
-            let mut budget = Budget::new(MAX_WORK, MAX_MEMORY);
-            // The caller's set of paragraph ids, with room for those the new marks take.
-            let mut used = HashSet::with_capacity(16);
-            used.insert(1);
-            let mut ids = Ids::new(10_000, used);
-            let start = wordcraft_testkit::counting::reset_peak();
-            let written = rewrite(&source, "w", "word/document.xml", &scanned, &steps, &mut ids, &mut budget).unwrap();
-            let allocated = u64::try_from(wordcraft_testkit::counting::peak() - start).unwrap();
-            let kept = u64::try_from(wordcraft_testkit::counting::held() - start).unwrap();
-            eprintln!(
-                "{} bytes written; allocated {allocated} at most, {kept} kept; charged {} at most, {} kept",
-                written.len(),
-                budget.peak(),
-                budget.held()
-            );
-            assert!(written.len() > bytes.len() / 2);
-            assert!(allocated <= budget.peak(), "allocated {allocated}, charged {}", budget.peak());
-            assert!(kept <= budget.held(), "kept {kept}, charged {}", budget.held());
-            assert_eq!(budget.held(), held_by(&written));
+            // I2: a paste of 300,000 characters, 100,000 typed tabs, 20,000 insertions in one run.
+            let one = "<w:p><w:r><w:t>x</w:t></w:r></w:p>".to_string();
+            let typed = |text: String| [vec![Step::Insert { text, revision: sari(), anchor: Some(0) }], keep(0..1, Change::Same)].concat();
+            let many = format!("<w:p><w:r><w:t>{}</w:t></w:r></w:p>", "a".repeat(20_000));
+            let mut scattered = vec![Step::Insert { text: "b".into(), revision: sari(), anchor: None }];
+            for unit in 0..20_000 {
+                if unit > 0 {
+                    scattered.push(Step::Insert { text: "b".into(), revision: sari(), anchor: Some(unit - 1) });
+                }
+                scattered.push(Step::Keep { unit, change: Change::Same });
+            }
+            let cases = [
+                ("long case", long_case()),
+                ("long paste", (one.clone(), typed("abcdefghij".repeat(30_000)))),
+                ("long tabs", (one, typed("\t".repeat(100_000)))),
+                ("scattered insertions", (many, scattered)),
+            ];
+            for (name, (body, steps)) in cases {
+                measure(name, &body, &steps);
+            }
             return;
         }
         let status = std::process::Command::new(std::env::current_exe().unwrap())
@@ -2736,6 +2860,33 @@ mod tests {
             .status()
             .unwrap();
         assert!(status.success());
+    }
+
+    fn measure(name: &str, body: &str, steps: &[Step]) {
+        {
+            let (bytes, scanned) = scanned(body);
+            let none = BTreeMap::new();
+            let source = Source { bytes: &bytes, rewritten: &none };
+            let mut budget = Budget::new(MAX_WORK, MAX_MEMORY);
+            // The caller's set of paragraph ids, with room for those the new marks take.
+            let mut used = HashSet::with_capacity(16);
+            used.insert(1);
+            let mut ids = Ids::new(10_000, used);
+            let start = wordcraft_testkit::counting::reset_peak();
+            let written = rewrite(&source, "w", "word/document.xml", &scanned, steps, &mut ids, &mut budget).unwrap();
+            let allocated = u64::try_from(wordcraft_testkit::counting::peak() - start).unwrap();
+            let kept = u64::try_from(wordcraft_testkit::counting::held() - start).unwrap();
+            eprintln!(
+                "{name}: {} bytes written; allocated {allocated} at most, {kept} kept; charged {} at most, {} kept",
+                written.len(),
+                budget.peak(),
+                budget.held()
+            );
+            assert!(written.len() > bytes.len() / 2);
+            assert!(allocated <= budget.peak(), "{name}: allocated {allocated}, charged {}", budget.peak());
+            assert!(kept <= budget.held(), "{name}: kept {kept}, charged {}", budget.held());
+            assert_eq!(budget.held(), held_by(&written));
+        }
     }
 
     #[test]
@@ -2975,5 +3126,253 @@ mod tests {
                 format!(r#"<w:p><w:r><w:t xml:space="preserve">See </w:t></w:r>{open}{close}<w:r><w:t>.</w:t></w:r></w:p>"#)
             );
         }
+    }
+
+    // ---- Fix round 1 (6C-48).
+
+    /// The paragraph swept without the no-op short cut: what the walk itself writes.
+    fn swept(body: &str, steps: &[Step]) -> (Vec<u8>, Vec<u8>) {
+        let (bytes, scanned) = scanned(body);
+        let none = BTreeMap::new();
+        let mut budget = Budget::new(MAX_WORK, MAX_MEMORY);
+        let mut ledger = Ledger { budget: &mut budget, held: 0 };
+        let mut ids = Ids::new(100, HashSet::new());
+        let out = write(&Source { bytes: &bytes, rewritten: &none }, "w", "word/document.xml", &scanned, steps, &mut ids, &mut ledger).unwrap();
+        (bytes[scanned.span()].to_vec(), out)
+    }
+
+    /// Gap bytes (white space, comments, processing instructions) after every tag outside text and
+    /// run properties, inside the paragraph.
+    fn inject(body: &str, random: &mut Random) -> String {
+        const GAPS: &[&str] = &["", "", " ", "\n  ", "<!--c-->", "<?pi x?>", "\n<!-- a > b -->\t"];
+        let mut out = String::new();
+        let (mut in_text, mut in_rpr) = (false, false);
+        let mut rest = body;
+        while let Some(close) = rest.find('>') {
+            let (tag_part, after) = rest.split_at(close + 1);
+            out.push_str(tag_part);
+            let tag = &tag_part[tag_part.rfind('<').unwrap_or(0)..];
+            let closing = tag.starts_with("</");
+            let empty = tag.ends_with("/>");
+            let name: String = tag.trim_start_matches("</").trim_start_matches('<').chars().take_while(|c| !c.is_whitespace() && *c != '>' && *c != '/').collect();
+            if matches!(name.as_str(), "w:t" | "w:delText" | "w:instrText" | "w:delInstrText") && !empty {
+                in_text = !closing;
+            }
+            if name == "w:rPr" && !empty {
+                in_rpr = !closing;
+            }
+            if !in_text && !in_rpr && !(name == "w:p" && closing) && !after.is_empty() {
+                out.push_str(GAPS[random.below(GAPS.len())]);
+            }
+            rest = after;
+        }
+        out.push_str(rest);
+        out
+    }
+
+    fn gapped_corpus() -> Vec<String> {
+        let mut bodies: Vec<String> = vec![
+            // The review's two reproductions (6C-48 I1).
+            format!(r#"<w:p><w:hyperlink w:anchor="a"><w:ins w:id="1" {ANA}><w:r><w:t>x</w:t></w:r></w:ins> </w:hyperlink></w:p>"#),
+            format!(r#"<w:p><w:del w:id="1" {BOB}><w:r><w:delText>x</w:delText></w:r></w:del><!--after del--><w:sdt><w:sdtPr/><w:sdtContent><w:r><w:t>y</w:t></w:r></w:sdtContent></w:sdt></w:p>"#),
+            "<w:p/>".into(),
+            "<w:p >\n</w:p >".into(),
+            r#"<w:p><w:hyperlink w:anchor="a"><w:hyperlink w:anchor="b"></w:hyperlink><w:r><w:t>x</w:t></w:r><w:smartTag w:uri="u" w:element="e"><w:customXml w:element="z"></w:customXml></w:smartTag></w:hyperlink><w:r><w:t>y</w:t></w:r></w:p>"#.into(),
+            r#"<w:p><w:sdt><w:sdtPr><w:alias w:val="x"/></w:sdtPr><w:sdtEndPr/><w:sdtContent><w:ins w:id="7" w:author="A" w:date="D"><w:r><w:t>q</w:t></w:r></w:ins></w:sdtContent></w:sdt></w:p>"#.into(),
+            r#"<w:p><w:moveFrom w:id="3" w:author="A" w:date="D"><w:r><w:t>mv</w:t></w:r></w:moveFrom><w:moveTo w:id="4" w:author="A" w:date="D"><w:r><w:t>mv</w:t></w:r></w:moveTo></w:p>"#.into(),
+            r#"<w:p><w:r><w:t>a</w:t></w:r><w:ins w:id="1" w:author="A" w:date="D"></w:ins><w:del w:id="2" w:author="A" w:date="D"/><w:r><w:t>b</w:t></w:r></w:p>"#.into(),
+        ];
+        let mut random = Random(0x1234_5678_9ABC_DEF1);
+        let hand_made = bodies.len();
+        for index in 0..hand_made {
+            let gapped = inject(&bodies[index], &mut random);
+            bodies.push(gapped);
+        }
+        for _ in 0..300 {
+            let body = generated_paragraph(&mut random);
+            bodies.push(inject(&body, &mut random));
+        }
+        bodies
+    }
+
+    #[test]
+    fn sweeps_untouched_markup_byte_for_byte() {
+        // 6C-42, 6C-48 I1: every gap stays attached to the tag before it, so the walk itself, with
+        // nothing changed, writes the source.
+        for body in gapped_corpus() {
+            let (_, scanned) = scanned(&body);
+            let (source, written) = swept(&body, &keep(0..scanned.units.len(), Change::Same));
+            assert_eq!(String::from_utf8_lossy(&written), String::from_utf8_lossy(&source));
+        }
+    }
+
+    #[test]
+    fn keeps_the_bytes_before_and_after_a_change_as_they_were() {
+        // A deletion in the last run leaves everything before that run as written; typing before
+        // the first character leaves everything after its run as written.
+        let mut checked = 0;
+        for body in gapped_corpus() {
+            let (bytes, scanned) = scanned(&body);
+            let count = scanned.units.len();
+            let editable = |unit: &&Unit| {
+                let Loc::Text { node, .. } = unit.loc else { return false };
+                let chain = scanned.chain(scanned.nodes[node].wrapper());
+                !chain.iter().any(|wrapper| scanned.wrappers[*wrapper].kind == WrapperKind::Deleted)
+            };
+            let source = &bytes[scanned.span()];
+            if let Some(last) = scanned.units.iter().rposition(|unit| editable(&unit)) {
+                let Loc::Text { node, .. } = scanned.units[last].loc else { unreachable!() };
+                let mut steps = keep(0..count, Change::Same);
+                steps[last] = Step::Keep { unit: last, change: Change::Deleted(sari()) };
+                let written = rewritten(&body, &steps, &[]).unwrap();
+                let before = node_span(&scanned.nodes[node]).start - scanned.span().start;
+                assert!(written.as_bytes().starts_with(&source[..before]), "{body}\n=> {written}");
+                checked += 1;
+            }
+            if let Some(first) = scanned.units.iter().position(|unit| editable(&unit)) {
+                let Loc::Text { node, .. } = scanned.units[first].loc else { unreachable!() };
+                let steps = [keep(0..first, Change::Same), vec![Step::Insert { text: "z".into(), revision: sari(), anchor: Some(first) }], keep(first..count, Change::Same)].concat();
+                if let Ok(written) = rewritten(&body, &steps, &[]) {
+                    let after = node_span(&scanned.nodes[node]).end - scanned.span().start;
+                    assert!(written.as_bytes().ends_with(&source[after..]), "{body}\n=> {written}");
+                    checked += 1;
+                }
+            }
+        }
+        assert!(checked > 500, "{checked}");
+    }
+
+    #[test]
+    fn copies_a_paragraph_nothing_changes() {
+        // 6C-48 M1: a paragraph written empty stays written empty.
+        for body in ["<w:p/>", r#"<w:p w14:paraId="00000001" />"#, "<w:p><w:r><w:t>a</w:t></w:r></w:p>"] {
+            let (_, scanned) = scanned(body);
+            assert_eq!(rewritten(body, &keep(0..scanned.units.len(), Change::Same), &[]).unwrap(), body);
+        }
+    }
+
+    #[test]
+    fn refuses_ids_past_what_word_reads_and_writes_the_session_as_it_is() {
+        let body = "<w:p><w:r><w:t>ab</w:t></w:r></w:p>";
+        let (bytes, scanned) = scanned(body);
+        let none = BTreeMap::new();
+        let source = Source { bytes: &bytes, rewritten: &none };
+        let deleted = [keep(0..1, Change::Deleted(sari())), keep(1..2, Change::Same)].concat();
+        let write_with = |highest: u64, steps: &[Step]| {
+            let mut budget = Budget::new(MAX_WORK, MAX_MEMORY);
+            let written = rewrite(&source, "w", "word/document.xml", &scanned, steps, &mut Ids::new(highest, HashSet::new()), &mut budget);
+            if written.is_err() {
+                assert_eq!(budget.held(), 0);
+            }
+            written
+        };
+        // 6C-48 M2: the last id Word reads is i32::MAX.
+        let top = u64::try_from(i32::MAX).unwrap();
+        assert!(String::from_utf8(write_with(top - 1, &deleted).unwrap()).unwrap().contains(&format!(r#"w:id="{top}""#)));
+        assert_eq!(write_with(top, &deleted), Err(Unpreservable::TooManyChanges));
+        assert_eq!(write_with(u64::MAX, &deleted), Err(Unpreservable::TooManyChanges));
+        // 6C-48 M3: the writer records the session as it is, or not at all.
+        for revision in [Revision { author: "Sari".into(), date: String::new() }, Revision { author: "A \u{1}B".into(), date: "2026-10-10T08:00:00Z".into() }] {
+            let steps = [keep(0..1, Change::Deleted(revision.clone())), keep(1..2, Change::Same)].concat();
+            assert!(matches!(write_with(10, &steps), Err(Unpreservable::Verification(_))), "{revision:?}");
+            let typed = [vec![Step::Insert { text: "z".into(), revision: revision.clone(), anchor: Some(0) }], keep(0..2, Change::Same)].concat();
+            assert!(matches!(write_with(10, &typed), Err(Unpreservable::Verification(_))), "{revision:?}");
+        }
+        let escaped = Revision { author: "A <&\"'> B\tC".into(), date: "2026-10-10T08:00:00Z".into() };
+        let steps = [keep(0..1, Change::Deleted(escaped)), keep(1..2, Change::Same)].concat();
+        assert!(String::from_utf8(write_with(10, &steps).unwrap()).unwrap().contains(r#"w:author="A &lt;&amp;&quot;&apos;&gt; B&#9;C""#));
+    }
+
+    #[test]
+    fn gives_each_copy_of_a_formatting_change_after_the_first_an_id_of_its_own() {
+        // 6C-48 M4.
+        let body = format!(r#"<w:p><w:r><w:rPr><w:b/><w:rPrChange w:id="9" {ANA}><w:rPr/></w:rPrChange></w:rPr><w:t>abc</w:t></w:r></w:p>"#);
+        let steps = [keep(0..1, Change::Same), keep(1..2, Change::Deleted(sari())), keep(2..3, Change::Same)].concat();
+        let written = rewritten(&body, &steps, &[]).unwrap();
+        let ids: Vec<&str> = written.split(r#"<w:rPrChange w:id=""#).skip(1).map(|rest| rest.split('"').next().unwrap()).collect();
+        assert_eq!(ids, ["9", "12", "13"], "{written}");
+    }
+
+    #[test]
+    fn keeps_a_cut_texts_attributes() {
+        // 6C-48 M5.
+        let body = r#"<w:p><w:r><w:t w14:foo="1">a b</w:t><w:t xml:space="default" w14:bar="2">cd</w:t></w:r></w:p>"#;
+        let steps = [keep(0..2, Change::Same), keep(2..4, Change::Deleted(sari())), keep(4..5, Change::Same)].concat();
+        let written = rewritten(body, &steps, &[]).unwrap();
+        assert_eq!(
+            written,
+            format!(
+                r#"<w:p><w:r><w:t w14:foo="1" xml:space="preserve">a </w:t></w:r><w:del w:id="11" {SARI_ATTRIBUTES}><w:r><w:delText w14:foo="1" xml:space="preserve">b</w:delText></w:r><w:r><w:delText xml:space="preserve" w14:bar="2">c</w:delText></w:r></w:del><w:r><w:t xml:space="preserve" w14:bar="2">d</w:t></w:r></w:p>"#
+            )
+        );
+    }
+
+    #[test]
+    fn refuses_to_copy_across_a_paragraph_already_rewritten() {
+        // 6C-48 M6: a rewritten paragraph that reaches past either end of a copy cannot be copied
+        // in part.
+        let bytes = b"abcdefgh";
+        let rewritten = BTreeMap::from([(2usize, (6usize, b"IN".to_vec()))]);
+        let source = Source { bytes, rewritten: &rewritten };
+        let mut out = Vec::new();
+        assert!(source.copy(0..8, &mut out).is_ok());
+        assert_eq!(out, b"abINgh");
+        assert!(source.copy(0..4, &mut Vec::new()).is_err());
+        assert!(source.copy(4..8, &mut Vec::new()).is_err());
+        assert!(source.copy(6..8, &mut Vec::new()).is_ok());
+    }
+
+    /// A body in a document whose root writes WordprocessingML with prefix `w`, its first paragraph
+    /// scanned.
+    fn scanned_with_root(body: &str) -> (Vec<u8>, ScannedPara) {
+        scanned_at(body, 0)
+    }
+
+    #[test]
+    fn refuses_new_markup_where_the_parts_prefix_names_another_namespace() {
+        // 6C-48 I3: the prefix new markup is written with must name WordprocessingML where it is
+        // written; rebound on the paragraph or around it, the writer refuses.
+        let main = "http://schemas.openxmlformats.org/wordprocessingml/2006/main";
+        let run = r#"<x:r><x:t>ab</x:t></x:r>"#;
+        let rebound = [
+            format!(r#"<x:p xmlns:x="{main}" xmlns:w="urn:other">{run}</x:p>"#),
+            format!(r#"<w:sdt><w:sdtContent xmlns:x="{main}" xmlns:w="urn:other"><x:p>{run}</x:p></w:sdtContent></w:sdt>"#),
+            format!(r#"<w:tbl><w:tr><w:tc xmlns:x="{main}" xmlns:w="urn:other"><x:p>{run}</x:p></w:tc></w:tr></w:tbl>"#),
+            format!(r#"<x:p xmlns:x="{main}"><x:hyperlink x:anchor="a" xmlns:w="urn:other">{run}</x:hyperlink></x:p>"#),
+        ];
+        let typed = [vec![Step::Insert { text: "Z".into(), revision: sari(), anchor: Some(0) }], keep(0..2, Change::Same)].concat();
+        let deleted = keep(0..2, Change::Deleted(sari()));
+        for body in &rebound {
+            let (_, scanned) = scanned_with_root(body);
+            assert_eq!(scanned.units.len(), 2, "{body}");
+            assert!(matches!(rewritten(body, &typed, &[]), Err(Unpreservable::Namespace { .. })), "{body}");
+            assert!(matches!(rewritten(body, &deleted, &[]), Err(Unpreservable::Namespace { .. })), "{body}");
+            // Decisions write no new markup.
+            assert!(rewritten(body, &keep(0..2, Change::Same), &[]).is_ok(), "{body}");
+        }
+        // Rebound on the body, with the paragraph written in another prefix.
+        let body_rebound = format!(r#"<x:p xmlns:x="{main}">{run}</x:p>"#);
+        let document = format!(r#"<w:document {W}><w:body xmlns:w="urn:other" xmlns:x="{main}">{body_rebound}</w:body></w:document>"#);
+        let (bytes, scanned) = scanned_document(&document);
+        let none = BTreeMap::new();
+        let mut budget = Budget::new(MAX_WORK, MAX_MEMORY);
+        let written = rewrite(&Source { bytes: &bytes, rewritten: &none }, "w", "word/document.xml", &scanned, &typed, &mut Ids::new(10, HashSet::new()), &mut budget);
+        assert!(matches!(written, Err(Unpreservable::Namespace { .. })), "{written:?}");
+        // Another prefix bound to WordprocessingML, `w` untouched, or `w` bound again to it: written.
+        for body in [format!(r#"<x:p xmlns:x="{main}">{run}</x:p>"#), format!(r#"<x:p xmlns:x="{main}" xmlns:w="{main}">{run}</x:p>"#)] {
+            assert!(rewritten(&body, &typed, &[]).unwrap().contains("<w:ins "), "{body}");
+        }
+    }
+
+    /// The first body paragraph of `document` (a whole `word/document.xml`), scanned.
+    fn scanned_document(document: &str) -> (Vec<u8>, ScannedPara) {
+        let rels = r#"<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="word/document.xml"/></Relationships>"#;
+        let bytes = zip_entries(&[("_rels/.rels".into(), rels.as_bytes().to_vec()), ("word/document.xml".into(), document.as_bytes().to_vec())]).unwrap();
+        let pkg = Package::open_with(&bytes, &ReadLimits::default()).unwrap();
+        let wanted = BTreeMap::from([("word/document.xml".to_string(), BTreeSet::from([0u32]))]);
+        let mut budget = Budget::new(MAX_WORK, MAX_MEMORY);
+        let mut part = scan_package(&pkg, &wanted, &mut budget).unwrap().remove("word/document.xml").unwrap();
+        let paragraph = part.paragraphs.remove(&0).unwrap();
+        (part.bytes.to_vec(), paragraph)
     }
 }
