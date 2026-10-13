@@ -10,7 +10,7 @@ use wordcraft_engine::{Selection, Session};
 const DATE: &str = "2026-10-10T08:00:00Z";
 
 fn start_editing(session: &mut Session, may_decide: bool) {
-    session.begin_edit("Sari Wulan", DATE, EditRules { may_decide }).unwrap();
+    session.begin_edit("Sari Wulan", DATE, EditRules { may_decide, full: false }).unwrap();
 }
 
 fn editing(text: &str, may_decide: bool) -> Session {
@@ -62,7 +62,7 @@ fn deleting_an_earlier_session_s_insertion_marks_it_deleted() {
     let mut session = editing("", false);
     session.run("text.insert", &json!({ "text": "abc" })).unwrap();
     // A later edit session by the same person: their earlier insertion is on record now.
-    session.begin_edit("Sari Wulan", "2026-10-11T08:00:00Z", EditRules { may_decide: false }).unwrap();
+    session.begin_edit("Sari Wulan", "2026-10-11T08:00:00Z", EditRules { may_decide: false, full: false }).unwrap();
     session.run("select.all", &json!({})).unwrap();
     session.run("text.delete", &json!({})).unwrap();
     assert!(session.doc.plain_text(StoryRef::Body).contains("abc"));
@@ -165,7 +165,7 @@ mod saves {
         s.run("select.text", &json!({"text": "premises"})).unwrap();
         s.run("review.newComment", &json!({"text": "Which premises are meant?"})).unwrap();
         s.run("caret.set", &json!({"pos": {"story": "body", "path": [0], "off": 0}})).unwrap();
-        s.begin_edit(BASE_AUTHOR, EARLIER, EditRules { may_decide: false }).unwrap();
+        s.begin_edit(BASE_AUTHOR, EARLIER, EditRules { may_decide: false, full: false }).unwrap();
         s.run("select.text", &json!({"text": "keeps"})).unwrap();
         s.run("select.collapse", &json!({})).unwrap();
         s.run("text.insert", &json!({"text": "always "})).unwrap();
@@ -370,7 +370,7 @@ mod saves {
         // Whatever `allows` lets through, from the whole registry, has a case here.
         let registry = Session::new(Document::default()).registry.clone();
         let mut allowed = 0;
-        for spec in registry.all().iter().filter(|spec| edit_mode::allows(spec.id, EditRules { may_decide: true })) {
+        for spec in registry.all().iter().filter(|spec| edit_mode::allows(spec.id, EditRules { may_decide: true, full: false })) {
             allowed += 1;
             assert!(cases.iter().any(|case| case.id == spec.id), "{} is allowed in an edit session but not saved and inspected here", spec.id);
         }
@@ -460,12 +460,12 @@ mod saves {
             (EDITOR, "1900-02-29T08:00:00Z"),
             (EDITOR, "2026-10-00T08:00:00Z"),
         ] {
-            let refused = s.begin_edit(author, date, EditRules { may_decide: true });
+            let refused = s.begin_edit(author, date, EditRules { may_decide: true, full: false });
             assert_eq!(refused.as_ref().map_err(CmdError::edit_refusal), Err(Some(Refusal::InvalidEditSession)), "{author:?} {date:?}");
             assert_eq!((s.edit_rules(), s.revision_date()), (None, None));
         }
-        assert!(s.begin_edit(&"x".repeat(256), DATE, EditRules { may_decide: false }).is_err());
-        assert!(s.begin_edit(EDITOR, DATE, EditRules { may_decide: false }).is_ok());
+        assert!(s.begin_edit(&"x".repeat(256), DATE, EditRules { may_decide: false, full: false }).is_err());
+        assert!(s.begin_edit(EDITOR, DATE, EditRules { may_decide: false, full: false }).is_ok());
         assert_eq!(s.revision_date(), Some(DATE));
         s.end_edit();
         assert_eq!((s.edit_rules(), s.revision_date()), (None, None));
@@ -559,7 +559,7 @@ mod saves {
         let mut s = Session::new(Document::from_text("Rent is due."));
         for date in ["2028-02-29T08:00:00Z", "2000-02-29T23:59:59Z", "2026-12-31T00:00:00Z"] {
             assert!(edit_mode::is_revision_date(date), "{date}");
-            assert!(s.begin_edit(EDITOR, date, EditRules { may_decide: false }).is_ok(), "{date}");
+            assert!(s.begin_edit(EDITOR, date, EditRules { may_decide: false, full: false }).is_ok(), "{date}");
         }
     }
 
@@ -615,7 +615,7 @@ mod saves {
         assert!(!s.doc.plain_text(StoryRef::Body).contains("abc"), "the insertion is still this session's own");
         // Another date is another session.
         s.run("edit.undo", &json!({})).unwrap();
-        s.begin_edit(EDITOR, "2026-10-11T08:00:00Z", EditRules { may_decide: false }).unwrap();
+        s.begin_edit(EDITOR, "2026-10-11T08:00:00Z", EditRules { may_decide: false, full: false }).unwrap();
         assert!(!s.can_undo());
         s.run("select.all", &json!({})).unwrap();
         s.run("text.delete", &json!({})).unwrap();
@@ -680,7 +680,7 @@ mod probes {
     #[test]
     fn a_file_revision_named_and_dated_like_the_session_is_never_its_own() {
         let mut file = opened(&agreement());
-        file.begin_edit(EDITOR, DATE, EditRules { may_decide: false }).unwrap();
+        file.begin_edit(EDITOR, DATE, EditRules { may_decide: false, full: false }).unwrap();
         file.run("select.text", &json!({"text": "first"})).unwrap();
         file.run("text.insert", &json!({"text": "second"})).unwrap();
         let base = saved(&file);
@@ -898,7 +898,7 @@ mod pages {
         s.run("text.insert", &json!({ "text": "x" })).unwrap();
         assert_ne!(s.content_version(), version);
         assert_eq!(s.doc.revisions.len(), 1);
-        let _ = EditRules { may_decide: true };
+        let _ = EditRules { may_decide: true, full: false };
     }
 
     fn footer(doc: &mut Document, text: &str) -> u32 {
@@ -981,4 +981,23 @@ mod pages {
         assert_eq!(s.content_version(), edited);
         assert!(s.doc.plain_text(StoryRef::Body).starts_with('x'));
     }
+}
+
+/// `full`: formatting runs too (bold here), and typed text is still a tracked change in the
+/// session's author and date. Without it the same command is refused.
+#[test]
+fn full_editing_runs_formatting_and_still_tracks_typing() {
+    let mut limited = editing("Rent is due.", false);
+    limited.run("select.all", &json!({})).unwrap();
+    assert!(limited.run("format.bold", &json!({})).is_err(), "formatting is refused without full editing");
+
+    let mut session = Session::new(Document::from_text("Rent is due."));
+    session.begin_edit("Sari Wulan", DATE, EditRules { may_decide: false, full: true }).unwrap();
+    session.run("select.all", &json!({})).unwrap();
+    session.run("format.bold", &json!({})).unwrap();
+    assert!(session.doc.plain_text(StoryRef::Body).contains("Rent is due."));
+    session.run("caret.docEnd", &json!({})).ok();
+    session.run("text.insert", &json!({ "text": " Monthly." })).unwrap();
+    let revision = session.doc.revisions.last().unwrap();
+    assert_eq!((revision.kind, revision.author.as_str(), revision.date.as_str()), (RevisionKind::Insert, "Sari Wulan", DATE));
 }

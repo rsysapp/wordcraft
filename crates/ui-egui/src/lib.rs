@@ -917,8 +917,9 @@ impl WordApp {
 
     /// Requests commands make of the UI (open a dialog…).
     fn handle_request(&mut self, req: &Value) {
-        // embed: view mode opens no dialogs, Backstage pages or windows.
-        if self.profile.is_view() {
+        // embed: view mode opens no dialogs, Backstage pages or windows; full editing opens dialogs only.
+        let full_editing = host::edit::full_editing(self);
+        if self.profile.is_view() && !full_editing {
             return;
         }
         // Ctrl+F: type straight into the Navigation pane's search box (#712).
@@ -927,6 +928,7 @@ impl WordApp {
         }
         if let Some(what) = req.get("open").and_then(Value::as_str) {
             match what {
+                "openFile" | "saveAs" | "print" | "options" if full_editing => {}
                 "openFile" => self.open_dialog(),
                 "saveAs" => {
                     self.save_as_dialog();
@@ -1562,7 +1564,17 @@ impl WordApp {
         // Keytips are read before layout so the frame paints the new state; badges paint after
         // the ribbon so they sit on top of it.
         crate::keytips::logic(self, &ctx);
-        if self.profile.is_view() {
+        // embed: full editing shows the application's ribbon over the document (no title bar, no Backstage).
+        let full_editing = host::edit::full_editing(self);
+        if full_editing {
+            ribbon::show(self, ui);
+            chrome::status_bar(self, ui);
+            panes::show(self, ui);
+            egui::CentralPanel::default().frame(egui::Frame::NONE.fill(t.canvas)).show(ui, |ui| {
+                canvas::show(self, ui);
+            });
+            host::edit::notice(self, &ctx);
+        } else if self.profile.is_view() {
             // embed: view mode shows the document only.
             host::view::show(self, ui);
         } else if self.ui.backstage {
@@ -1576,8 +1588,8 @@ impl WordApp {
                 canvas::show(self, ui);
             });
         }
-        // embed: view mode has no dialogs, pop-ups or windows.
-        if !self.profile.is_view() {
+        // embed: view mode has no dialogs, pop-ups or windows; full editing has the ribbon's.
+        if !self.profile.is_view() || full_editing {
             content_controls::popup(self, &ctx);
             dialogs::show(self, &ctx);
             #[cfg(not(target_arch = "wasm32"))]

@@ -188,6 +188,7 @@ export interface EditorPermissions {
     redact: boolean;
     stamps: boolean;
     drawing: boolean;
+    fullEditing?: boolean;
 }
 
 export type ModeRequest =
@@ -226,7 +227,7 @@ export type EditRefusalCode =
 
 `MountOptions.mode` is always `'view'`: an editor mounts in view mode, needing no author, and
 `setMode` switches it. `EditorPermissions` is the API's shared shape; this editor reads
-`acceptRejectChanges` only. `redactionsPending` belongs to the other editor of the API: this one
+`acceptRejectChanges` and `fullEditing` only. `redactionsPending` belongs to the other editor of the API: this one
 never sends it, and its `applyRedactions()` does nothing.
 
 ## Edit mode (API 0.2)
@@ -238,7 +239,8 @@ selection reported in view mode is cleared first (`selectionCleared`, then `mode
 `setMode({ mode: 'view' })` leaves edit mode and keeps the edits on screen; the host calls `open`
 again to discard them. A malformed request (an unknown mode, a missing author, a blank author name
 or one over 255 characters, a `revisionDate` that is not ISO 8601 UTC on a calendar day, a
-permission that is missing, not a boolean, or not one of the six the API names) throws a `TypeError`
+permission that is missing, not a boolean, or not one the API names; `fullEditing` alone may be
+left out) throws a `TypeError`
 and queues nothing. An unknown permission is refused, never ignored (a restriction the editor cannot
 read must not become a tool it offers); fields of `author` it does not read are ignored.
 
@@ -253,6 +255,15 @@ Only typing, deleting, line breaks (Shift+Enter), tab characters, cut, plain pas
 run, and, with `acceptRejectChanges`, accepting and rejecting tracked changes; formatting, styles,
 tables, pictures, fields, find-and-replace, list levels, indents and restricting editing do not
 (each would be an untracked change). New paragraphs are refused for now ("Known limitation" below).
+**Full editing.** With `fullEditing: true` the view bar and edit strip give way to the
+application's full ribbon (Home, Insert, Layout, Review and the rest), and every command runs:
+formatting, styles, tables, pictures, new paragraphs, rich paste, Tab and Shift+Tab as in the
+application, and accepting and rejecting tracked changes. Typed and deleted text is still tracked
+under `author.name` and `revisionDate`; formatting changes are not tracked. The file stays the
+host's: Backstage, the File tab and the application's own open, save and export commands are
+refused (`command_not_allowed`), and a save still answers with `saveRequested`. Missing or `false`
+leaves edit mode exactly as described below.
+
 The edit strip in the view bar offers Undo, Redo, Previous change, Next change and, when allowed,
 Accept, Reject, Accept all and Reject all. **Headers and footers** are entered by double-clicking
 them, and the part entered is the one the clicked page shows, as Word renders it: the first-page

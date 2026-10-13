@@ -5013,15 +5013,15 @@ fn insert_picture_takes_a_windows_metafile() {
 fn an_edit_session_redoes_a_decision_only_while_it_may_decide() {
     use crate::edit_mode::{EditRules, Refusal};
     let mut s = Session::new(wordcraft_doc::Document::from_text("Rent is due."));
-    s.begin_edit("Sari Wulan", "2026-10-10T08:00:00Z", EditRules { may_decide: true }).unwrap_or_else(|e| panic!("{e}"));
+    s.begin_edit("Sari Wulan", "2026-10-10T08:00:00Z", EditRules { may_decide: true, full: false }).unwrap_or_else(|e| panic!("{e}"));
     run(&mut s, "text.insert", json!({"text": "Monthly: "}));
     run(&mut s, "review.rejectAll", json!({}));
     run(&mut s, "edit.undo", json!({}));
-    s.edit_rules = Some(EditRules { may_decide: false });
+    s.edit_rules = Some(EditRules { may_decide: false, full: false });
     let refused = s.run("edit.redo", &json!({})).err().and_then(|e| e.edit_refusal());
     assert_eq!(refused, Some(Refusal::DecisionNotAllowed));
     assert!(text(&s).starts_with("Monthly: "), "the decision was not replayed");
-    s.edit_rules = Some(EditRules { may_decide: true });
+    s.edit_rules = Some(EditRules { may_decide: true, full: false });
     run(&mut s, "edit.redo", json!({}));
     assert_eq!(text(&s), "Rent is due.");
 }

@@ -302,7 +302,10 @@ fn edit_session_takes(s: &Session, text: &str, what: &str) -> Result<bool, CmdEr
     if s.edit_rules.is_none() {
         return Ok(true);
     }
-    if let Err(refusal) = crate::edit_mode::check_text(text) {
+    // embed: full editing types paragraph breaks and every other character, as the full application.
+    if s.edit_rules.is_some_and(|rules| !rules.full)
+        && let Err(refusal) = crate::edit_mode::check_text(text)
+    {
         return Err(CmdError::Editing(crate::edit_mode::EditRefusal::new(refusal, what)));
     }
     Ok(!text.is_empty())

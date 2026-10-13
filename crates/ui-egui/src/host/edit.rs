@@ -56,7 +56,7 @@ pub(crate) fn set_mode(app: &mut WordApp, host: &mut HostState, request: ModeReq
         host.bridge.emit(HostEvent::ModeChanged { mode: mode_in_force(host) });
         return;
     }
-    let rules = EditRules { may_decide: permissions.accept_reject_changes };
+    let rules = EditRules { may_decide: permissions.accept_reject_changes, full: permissions.full_editing };
     let running = host.edit.as_mut().filter(|edit| edit.author == author.name && edit.date == date && edit.rules == rules);
     if let Some(edit) = running {
         // The session running: not a new entry, so its history and its own changes stay. The other
@@ -126,6 +126,14 @@ pub(crate) fn gate(app: &mut WordApp, id: &str, params: &Value, rules: EditRules
             }
             Some(Ok(json!({})))
         }
+        // Full editing: everything the ribbon offers, but no file menu, opening or saving of the
+        // application's own: the host owns the file.
+        _ if rules.full
+            && (id == "ui.backstage" || id.starts_with("file.") || (id == "ui.tab" && params.get("tab").and_then(Value::as_str) == Some("File"))) =>
+        {
+            Some(Err(refuse(app, id, Refusal::CommandNotAllowed)))
+        }
+        _ if rules.full => None,
         // Ctrl/⌘+V: rich paste would bring formatting nobody tracked.
         "edit.paste" => Some(app.run("edit.pasteText", params.clone())),
         // Shift+Tab does nothing in edit mode (embed API 0.2, "Keyboard in edit mode"): no list
@@ -275,7 +283,12 @@ fn strip_groups(may_decide: bool) -> Vec<Vec<(&'static str, &'static str)>> {
 }
 
 fn strip_permissions(app: &WordApp) -> Option<PermissionsSpec> {
-    app.host.as_ref().and_then(|host| host.edit.as_ref()).map(|edit| edit.permissions)
+    app.host.as_ref().and_then(|host| host.edit.as_ref()).map(|edit| edit.permissions).filter(|permissions| !permissions.full_editing)
+}
+
+/// Whether the host page asked for full editing: the full ribbon shows instead of the view bar.
+pub(crate) fn full_editing(app: &WordApp) -> bool {
+    app.session.edit_rules().is_some_and(|rules| rules.full)
 }
 
 /// Sections as the person counts them (1-based), runs joined: `[1, 2, 3, 5]` is "2–4, 6".
@@ -462,8 +475,15 @@ mod tests {
         let bytes = wordcraft_engine::io::save_bytes("lease.docx", &Document::from_text("Rent is due monthly.")).expect("writes");
         bridge.send(HostCommand::Open { name: "lease.docx".into(), bytes });
         harness.run_steps(3);
-        let permissions =
-            PermissionsSpec { accept_reject_changes: false, organize_pages: true, fill_forms: true, redact: true, stamps: true, drawing: true };
+        let permissions = PermissionsSpec {
+            accept_reject_changes: false,
+            organize_pages: true,
+            fill_forms: true,
+            redact: true,
+            stamps: true,
+            drawing: true,
+            full_editing: false,
+        };
         bridge.send(HostCommand::SetMode(ModeRequest::Edit {
             author: AuthorSpec { id: "u-sari".into(), name: "Sari Wulan".into() },
             revision_date: "2026-10-10T08:00:00Z".into(),

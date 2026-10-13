@@ -1310,7 +1310,7 @@ impl Session {
             if self.author != self.edit_author {
                 self.author.clone_from(&self.edit_author);
             }
-            if id == TAB {
+            if id == TAB && !rules.full {
                 // A refused tab is the Tab key's, not typing's.
                 return match self.run("text.insert", &tab_params()) {
                     Err(CmdError::Editing(refused)) => Err(self.refused(TAB, refused.refusal, refused.detail)),
@@ -1343,7 +1343,7 @@ impl Session {
                 return Err(self.refused(id, refusal_for(id, rules), None));
             }
             // Redo replays a whole document state: one a decision made needs the permission now.
-            if id == "edit.redo" && !rules.may_decide && self.redo.last().is_some_and(|step| step.decision) {
+            if id == "edit.redo" && !rules.may_decide && !rules.full && self.redo.last().is_some_and(|step| step.decision) {
                 return Err(self.refused(id, Refusal::DecisionNotAllowed, None));
             }
             // Comments and text boxes stay as the file has them (Ruling W2-2).
