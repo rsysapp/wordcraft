@@ -18,6 +18,7 @@ mod read;
 mod smart_art;
 mod units;
 mod wordml2003;
+mod wordml2003_write;
 mod write;
 mod xml;
 
@@ -34,6 +35,7 @@ pub use smart_art::smart_art_items;
 // embed: a caller with less memory or stack than the desktop reads within tighter limits.
 pub use package::ReadLimits;
 pub use read::{read, read_with_limits};
+pub use wordml2003_write::write as write_wordml2003;
 pub use write::{write, write_as};
 // embed: where a document read from a package keeps it.
 pub use preserve::SOURCE_PACKAGE;

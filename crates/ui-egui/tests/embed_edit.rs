@@ -1204,3 +1204,39 @@ fn full_editing_shows_the_ribbon_runs_formatting_and_tracks_typing() {
     // The file stays the host's.
     assert!(harness.state_mut().run("ui.backstage", json!({})).is_err());
 }
+
+/// Upstream #1062 writes "Author" and no date for annotations when a document asks Word to remove
+/// personal information and dates on save. An edit session's tracked changes must still carry the
+/// person's name and the host's date (embed API 0.2), so its saves write them.
+#[test]
+fn an_edit_sessions_save_keeps_names_and_dates_where_the_document_asks_to_remove_them() {
+    use std::io::Read;
+    let mut private = Document::from_text("Rent is due monthly.");
+    private.settings.remove_personal_info = true;
+    private.settings.remove_date_time = true;
+    let bytes = wordcraft_engine::io::save_bytes("private.docx", &private).unwrap();
+    let (mut harness, bridge) = common::view_app(Document::from_text(""), 1.0);
+    bridge.send(HostCommand::Open { name: "private.docx".into(), bytes });
+    harness.run_steps(3);
+    assert!(harness.state().session.doc.settings.remove_personal_info, "the setting was read");
+    bridge.send(edit(false));
+    harness.run_steps(2);
+    harness.state_mut().run("text.insert", json!({"text": "Monthly: "})).unwrap();
+    bridge.take_events();
+    bridge.send(HostCommand::RequestSave);
+    harness.run_steps(2);
+    let saved = bridge
+        .take_events()
+        .into_iter()
+        .find_map(|event| match event {
+            HostEvent::SaveRequested { bytes, .. } => Some(bytes),
+            _ => None,
+        })
+        .expect("a save answer");
+    let mut archive = zip::ZipArchive::new(std::io::Cursor::new(saved)).unwrap();
+    let mut document = String::new();
+    archive.by_name("word/document.xml").unwrap().read_to_string(&mut document).unwrap();
+    assert!(document.contains(&format!(r#"w:author="{AUTHOR}""#)), "{document}");
+    assert!(document.contains(&format!(r#"w:date="{DATE}""#)), "{document}");
+    assert!(!document.contains(r#"w:author="Author""#), "{document}");
+}

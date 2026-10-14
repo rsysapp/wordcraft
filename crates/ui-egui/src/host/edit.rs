@@ -248,7 +248,21 @@ pub(crate) fn save(app: &mut WordApp, host: &mut HostState) {
     let file_name = if host.file_name.is_empty() { "document.docx".to_string() } else { host.file_name.clone() };
     // The writer is chosen by extension; the host's name is kept for the event.
     let target = if file_name.to_ascii_lowercase().ends_with(".docx") { file_name.clone() } else { format!("{file_name}.docx") };
-    match wordcraft_engine::io::save_bytes(&target, &app.session.doc) {
+    // embed: every tracked change an edit session saves carries the person's name and the host's
+    // date (embed API 0.2), and the host's save check compares them. Word's "remove personal
+    // information" and "remove date and time" settings (upstream #1062) would write "Author" and no
+    // date instead, so an edit session writes as before upstream honoured them: names and dates
+    // kept, the two settings not written.
+    let settings = &app.session.doc.settings;
+    let document = if settings.remove_personal_info || settings.remove_date_time {
+        let mut kept = app.session.doc.clone();
+        kept.settings.remove_personal_info = false;
+        kept.settings.remove_date_time = false;
+        std::borrow::Cow::Owned(kept)
+    } else {
+        std::borrow::Cow::Borrowed(&app.session.doc)
+    };
+    match wordcraft_engine::io::save_bytes(&target, &document) {
         Ok(bytes) => host.bridge.emit(HostEvent::SaveRequested { file_name, bytes }),
         Err(message) => {
             log::warn!("embed: an edited document could not be written: {message}");
