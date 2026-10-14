@@ -193,7 +193,7 @@ fn run(args: &[String]) -> Result<(), Failure> {
             let paths: Vec<&String> = rest
                 .iter()
                 .enumerate()
-                .filter(|(n, a)| !a.starts_with("--") && !(*n > 0 && rest.get(n - 1).is_some_and(|p| p == "--format")))
+                .filter(|(n, a)| !(a.starts_with("--") || *n > 0 && rest.get(n - 1).is_some_and(|p| p == "--format")))
                 .map(|(_, a)| a)
                 .collect();
             let missing = || format!("missing argument\n\n{USAGE}");
