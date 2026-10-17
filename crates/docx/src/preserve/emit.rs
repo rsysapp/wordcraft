@@ -85,7 +85,7 @@ impl Ids {
     }
 
     /// A new `w:id`: Word reads ids as 32-bit signed numbers, so none past `i32::MAX` is made.
-    fn revision(&mut self) -> Result<String, Unpreservable> {
+    pub(super) fn revision(&mut self) -> Result<String, Unpreservable> {
         let id = self.next_revision;
         if id > MAX_ID {
             return Err(Unpreservable::TooManyChanges);
@@ -581,7 +581,8 @@ pub(crate) fn rewrite(
     // Nothing changes (6C-48 M1): the paragraph as written.
     let unchanged = steps.len() == paragraph.units.len()
         && steps.iter().enumerate().all(|(index, step)| matches!(step, Step::Keep { unit, change: Change::Same } if *unit == index));
-    let written = if unchanged { copied(source, part, paragraph, &mut ledger) } else { write(source, prefix, part, paragraph, steps, ids, &mut ledger) };
+    let written =
+        if unchanged { copied(source, part, paragraph, &mut ledger) } else { write(source, prefix, part, paragraph, steps, ids, &mut ledger) };
     match written {
         Ok(out) => {
             // What it worked with is gone; the paragraph stays, charged by its room.
@@ -1162,7 +1163,9 @@ impl<'a> Writer<'a, '_, '_> {
             return Err(Unpreservable::Verification("a tracked change of this session has no date".into()));
         }
         if !revision.author.chars().chain(revision.date.chars()).all(xml_char) {
-            return Err(Unpreservable::Verification("the name or date of this session's tracked changes holds a character a Word file cannot hold".into()));
+            return Err(Unpreservable::Verification(
+                "the name or date of this session's tracked changes holds a character a Word file cannot hold".into(),
+            ));
         }
         let id = self.ids.revision()?;
         Ok(format!(
@@ -1362,7 +1365,9 @@ impl<'a> Writer<'a, '_, '_> {
                     let start = wrapper.start.start;
                     let open = self.open.clone();
                     self.release_held(&|attach| match attach {
-                        Attach::Open(other) => open.contains(&Entry::Source(other)) || paragraph.wrappers.get(other).is_none_or(|other| other.start.start >= start),
+                        Attach::Open(other) => {
+                            open.contains(&Entry::Source(other)) || paragraph.wrappers.get(other).is_none_or(|other| other.start.start >= start)
+                        }
                         Attach::Close(other) => open.contains(&Entry::Source(other)),
                     })?;
                     self.push(tag)?;
@@ -3214,14 +3219,15 @@ mod tests {
             let tag = &tag_part[tag_part.rfind('<').unwrap_or(0)..];
             let closing = tag.starts_with("</");
             let empty = tag.ends_with("/>");
-            let name: String = tag.trim_start_matches("</").trim_start_matches('<').chars().take_while(|c| !c.is_whitespace() && *c != '>' && *c != '/').collect();
+            let name: String =
+                tag.trim_start_matches("</").trim_start_matches('<').chars().take_while(|c| !c.is_whitespace() && *c != '>' && *c != '/').collect();
             if matches!(name.as_str(), "w:t" | "w:delText" | "w:instrText" | "w:delInstrText") && !empty {
                 in_text = !closing;
             }
             if name == "w:rPr" && !empty {
                 in_rpr = !closing;
             }
-            if !in_text && !in_rpr && !(name == "w:p" && closing) && !after.is_empty() {
+            if !(in_text || in_rpr || (name == "w:p" && closing) || after.is_empty()) {
                 out.push_str(GAPS[random.below(GAPS.len())]);
             }
             rest = after;
@@ -3281,7 +3287,7 @@ mod tests {
             };
             let source = &bytes[scanned.span()];
             if let Some(last) = scanned.units.iter().rposition(|unit| editable(&unit)) {
-                let Loc::Text { node, .. } = scanned.units[last].loc else { unreachable!() };
+                let Loc::Text { node, .. } = scanned.units[last].loc else { panic!("an editable unit is text") };
                 let mut steps = keep(0..count, Change::Same);
                 steps[last] = Step::Keep { unit: last, change: Change::Deleted(sari()) };
                 let written = rewritten(&body, &steps, &[]).unwrap();
@@ -3290,8 +3296,13 @@ mod tests {
                 checked += 1;
             }
             if let Some(first) = scanned.units.iter().position(|unit| editable(&unit)) {
-                let Loc::Text { node, .. } = scanned.units[first].loc else { unreachable!() };
-                let steps = [keep(0..first, Change::Same), vec![Step::Insert { text: "z".into(), revision: sari(), anchor: Some(first) }], keep(first..count, Change::Same)].concat();
+                let Loc::Text { node, .. } = scanned.units[first].loc else { panic!("an editable unit is text") };
+                let steps = [
+                    keep(0..first, Change::Same),
+                    vec![Step::Insert { text: "z".into(), revision: sari(), anchor: Some(first) }],
+                    keep(first..count, Change::Same),
+                ]
+                .concat();
                 if let Ok(written) = rewritten(&body, &steps, &[]) {
                     let after = node_span(&scanned.nodes[node]).end - scanned.span().start;
                     assert!(written.as_bytes().ends_with(&source[after..]), "{body}\n=> {written}");
@@ -3332,7 +3343,9 @@ mod tests {
         assert_eq!(write_with(top, &deleted), Err(Unpreservable::TooManyChanges));
         assert_eq!(write_with(u64::MAX, &deleted), Err(Unpreservable::TooManyChanges));
         // 6C-48 M3: the writer records the session as it is, or not at all.
-        for revision in [Revision { author: "Sari".into(), date: String::new() }, Revision { author: "A \u{1}B".into(), date: "2026-10-10T08:00:00Z".into() }] {
+        for revision in
+            [Revision { author: "Sari".into(), date: String::new() }, Revision { author: "A \u{1}B".into(), date: "2026-10-10T08:00:00Z".into() }]
+        {
             let steps = [keep(0..1, Change::Deleted(revision.clone())), keep(1..2, Change::Same)].concat();
             assert!(matches!(write_with(10, &steps), Err(Unpreservable::Verification(_))), "{revision:?}");
             let typed = [vec![Step::Insert { text: "z".into(), revision: revision.clone(), anchor: Some(0) }], keep(0..2, Change::Same)].concat();
@@ -3416,7 +3429,15 @@ mod tests {
         let (bytes, scanned) = scanned_document(&document);
         let none = BTreeMap::new();
         let mut budget = Budget::new(MAX_WORK, MAX_MEMORY);
-        let written = rewrite(&Source { bytes: &bytes, rewritten: &none }, "w", "word/document.xml", &scanned, &typed, &mut Ids::new(10, HashSet::new()), &mut budget);
+        let written = rewrite(
+            &Source { bytes: &bytes, rewritten: &none },
+            "w",
+            "word/document.xml",
+            &scanned,
+            &typed,
+            &mut Ids::new(10, HashSet::new()),
+            &mut budget,
+        );
         assert!(matches!(written, Err(Unpreservable::Namespace { .. })), "{written:?}");
         // Another prefix bound to WordprocessingML, `w` untouched, or `w` bound again to it: written.
         for body in [format!(r#"<x:p xmlns:x="{main}">{run}</x:p>"#), format!(r#"<x:p xmlns:x="{main}" xmlns:w="{main}">{run}</x:p>"#)] {
@@ -3427,7 +3448,8 @@ mod tests {
     /// The first body paragraph of `document` (a whole `word/document.xml`), scanned.
     fn scanned_document(document: &str) -> (Vec<u8>, ScannedPara) {
         let rels = r#"<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="word/document.xml"/></Relationships>"#;
-        let bytes = zip_entries(&[("_rels/.rels".into(), rels.as_bytes().to_vec()), ("word/document.xml".into(), document.as_bytes().to_vec())]).unwrap();
+        let bytes =
+            zip_entries(&[("_rels/.rels".into(), rels.as_bytes().to_vec()), ("word/document.xml".into(), document.as_bytes().to_vec())]).unwrap();
         let pkg = Package::open_with(&bytes, &ReadLimits::default()).unwrap();
         let wanted = BTreeMap::from([("word/document.xml".to_string(), BTreeSet::from([0u32]))]);
         let mut budget = Budget::new(MAX_WORK, MAX_MEMORY);

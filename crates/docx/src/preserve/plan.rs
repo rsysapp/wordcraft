@@ -1576,7 +1576,14 @@ mod tests {
         let original = para(&[("Rent monthly.", None, None, false)]);
         let removed = para(&[("Rent .", None, None, false)]);
         assert_eq!(planned(&original, &doc(&[]), &[&removed], &doc(&[])), Err(Unpreservable::Untracked));
-        let page = |result: &str| InlineObject::Field { instr: "PAGE".into(), result: result.into(), locked: false, dirty: false, code: false, form: String::new() };
+        let page = |result: &str| InlineObject::Field {
+            instr: "PAGE".into(),
+            result: result.into(),
+            locked: false,
+            dirty: false,
+            code: false,
+            form: String::new(),
+        };
         let original = with_object(para(&[("Page ", None, None, false)]), 5, page("3"), &CharProps::default());
         let recalculated = with_object(para(&[("Page ", None, None, false)]), 5, page("4"), &CharProps::default());
         assert_eq!(planned(&original, &doc(&[]), &[&recalculated], &doc(&[])), Err(Unpreservable::Untracked));
