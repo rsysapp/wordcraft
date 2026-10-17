@@ -39,8 +39,8 @@ pub use package::ReadLimits;
 pub use read::{read, read_with_limits};
 pub use wordml2003_write::write as write_wordml2003;
 pub use write::{write, write_as};
-// embed: where a document read from a package keeps it.
-pub use preserve::SOURCE_PACKAGE;
+// embed: the writer that keeps the source package, and the report a corpus check reads.
+pub use preserve::{PreservationReport, SOURCE_PACKAGE, preservation_report, write_preserving};
 
 /// Largest `.xml` file read as a Word XML document.
 pub const MAX_XML_FILE: usize = 1 << 30;

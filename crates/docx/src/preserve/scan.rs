@@ -114,6 +114,7 @@ impl ScannedPara {
     /// `units`. Objects, markers and everything locked (a field's result among them, 6C-18, and a
     /// text box's paragraphs, 6C-39) lie between them. Deleted text and text inside content controls
     /// count as editable here: a caller choosing edit points filters them by wrapper.
+    #[cfg(test)]
     pub fn editable(&self) -> Vec<Range<usize>> {
         let mut ranges: Vec<Range<usize>> = Vec::new();
         for (index, unit) in self.units.iter().enumerate() {
@@ -192,7 +193,15 @@ pub(crate) struct Child {
 #[derive(Clone, Debug)]
 pub(crate) enum ChildKind {
     /// `w:t` or `w:delText`, character by character.
-    Text { start: Range<usize>, end: Option<Range<usize>>, raw_name: String, deleted: bool, chars: Vec<RawChar> },
+    Text {
+        start: Range<usize>,
+        end: Option<Range<usize>>,
+        raw_name: String,
+        // embed: the scan's tests read it; the writer finds deleted text through its wrapper.
+        #[cfg_attr(not(test), expect(dead_code, reason = "embed: read by the scan's tests only"))]
+        deleted: bool,
+        chars: Vec<RawChar>,
+    },
     /// A child that is one character (`w:tab`, `w:br`…), and that character's unit (`None` when the
     /// character is not an editable unit where it stands: inside a field's result or a text box).
     Single { unit: Option<usize> },

@@ -334,6 +334,14 @@ pub fn save_bytes_opts(name: &str, doc: &Document, opts: &ExportOptions) -> Resu
     }
 }
 
+/// embed: a document read from a Word package, written by keeping that package and rewriting only
+/// the paragraphs an edit session changed, as tracked changes. A change that cannot be written that
+/// way is refused with its reason, never written by regenerating the package: the host's save
+/// check refuses what a regenerated package loses.
+pub fn save_docx_preserving(doc: &Document) -> Result<Vec<u8>, String> {
+    wordcraft_docx::write_preserving(doc).map_err(|e| e.to_string())
+}
+
 /// [`save_bytes`], encrypted with `password` when there is one and the format is a Word package
 /// (other formats are copies and are written as they are).
 pub fn save_bytes_with(name: &str, doc: &Document, password: Option<&str>, opts: &ExportOptions) -> Result<Vec<u8>, String> {

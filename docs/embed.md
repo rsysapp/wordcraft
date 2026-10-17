@@ -287,14 +287,19 @@ the strip then says "Header (shared with sections N–M)". Making a new header o
 - **Save.** `requestSave()`, or Ctrl/⌘+S in edit mode, answers `saveRequested` with the `.docx`
   bytes in a new `Uint8Array` the host owns (a copy outside the module's memory) and `fileName`, the
   name the document was opened under, verbatim (`LEASE.DOCX` stays `LEASE.DOCX`). The bytes are
-  always a Word `.docx` package, also for a file opened as `.docm` or `.dotx`. **Saves are answered
+  the opened package with only the paragraphs this session changed rewritten, as tracked changes by
+  the session's author and date: every other part, relationship and content type is the original's,
+  byte for byte, and a save with no change is the original file. A file opened as `.docm` or `.dotx`
+  keeps its form. **Saves are answered
   when requested**: each from the document and mode at its own request, before a later command of
   the same frame (an `open`, a `setMode`), so a save asked in view mode answers `saveFailed` even
   when a later one in the same frame, after `setMode`, answers `saveRequested`. Two requests in one
   frame, for the same document in the same mode with nothing changed in between, answer once. Every
   other save gets exactly one answer. In view mode `requestSave()` answers `saveFailed` ("Nothing to
-  save: the document is open for viewing only.") and Ctrl/⌘+S sends nothing; a document that cannot
-  be written answers `saveFailed` ("The document could not be written."), and so does a save whose
+  save: the document is open for viewing only.") and Ctrl/⌘+S sends nothing; a change that cannot
+  be written that way (a formatting or untracked change, an inserted picture or object, text typed next to a
+  field written as one element, a document not read from a Word file) answers `saveFailed` with the reason ("This change
+  cannot be saved without altering the document: …"), and so does a save whose
   bytes the page cannot take, when allocating their array fails ("The document could not be handed
   to the page."); the editor keeps working. Saving never leaves edit mode and never downloads: the
   host decides what a save becomes. The size of a save is not limited here.

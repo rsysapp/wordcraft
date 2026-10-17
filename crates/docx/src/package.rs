@@ -259,6 +259,11 @@ impl Package {
         u32::try_from(position).ok()
     }
 
+    /// embed: every part's name, sorted (the order part indexes count in).
+    pub fn part_names(&self) -> impl Iterator<Item = &str> {
+        self.files.keys().map(String::as_str)
+    }
+
     /// embed: the part name at `index` (see [`Package::part_index`]).
     pub fn part_name(&self, index: u32) -> Option<&str> {
         self.files.keys().nth(usize::try_from(index).ok()?).map(String::as_str)
@@ -457,7 +462,6 @@ pub fn zip_entries(entries: &[(String, Vec<u8>)]) -> Result<Vec<u8>, DocxError> 
 
 /// embed: the archive's file names in the order they are stored (folders left out, each name
 /// once), so a writer that keeps the package keeps its order too.
-#[cfg_attr(not(test), expect(dead_code, reason = "embed: read by the preserving writer, which keeps the source package's order"))]
 pub fn entry_order(bytes: &[u8]) -> Result<Vec<String>, DocxError> {
     let zip = zip::ZipArchive::new(Cursor::new(bytes)).map_err(|e| DocxError::Zip(e.to_string()))?;
     let mut seen = std::collections::HashSet::new();
