@@ -1037,7 +1037,9 @@ mod tests {
 
     /// #960 review: with no header anywhere, one made on a later section's page goes in the first
     /// section, linked through to the later ones (Word's "Link to Previous" default); with Odd &
-    /// Even on and only a default header, an even page edits the one it shows.
+    /// Even on and only a default header, an even page shows none, as Word draws it. embed: upstream
+    /// (#1144) edited the default header from an even page, because its layout drew it there; the
+    /// fork's layout does not (W3 fix 5), so there is nothing on an even page to enter or create.
     #[test]
     fn new_header_links_to_previous_and_even_pages_edit_what_they_show() {
         let mut s = two_pages();
@@ -1051,9 +1053,8 @@ mod tests {
         assert!(s.layout().pages.iter().all(|p| p.header_story == Some(id)), "every page shows it");
         assert_eq!(s.doc.sections()[0].1.headers.default, Some(id));
         s.run("layout.differentOddEven", &json!({"value": true})).unwrap();
-        assert_eq!(s.layout().pages[1].header_story, Some(id));
-        assert_eq!(s.run("insert.editHeader", &json!({"page": 1})).unwrap()["story"].as_u64(), Some(id as u64));
-        assert_eq!(s.doc.sections()[0].1.headers.even, None, "nothing made");
+        assert_eq!(s.layout().pages[1].header_story, None, "an even page shows the even part or none");
+        assert_eq!(s.layout().pages[0].header_story, Some(id), "an odd page shows the default one");
     }
 
     #[test]

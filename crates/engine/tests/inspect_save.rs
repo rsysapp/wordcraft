@@ -31,14 +31,24 @@ fn edit(base: &[u8], change: impl FnOnce(&mut Session)) -> Vec<u8> {
     save_bytes("edited.docx", &s.doc).unwrap()
 }
 
+/// The parts upstream's writer keeps a comment's durable ids and UTC date in (#1034). The inspector
+/// reads them as plain XML parts, so a save that adds a comment reports them as altered or added.
+/// The embed's edit mode adds no comments (the host owns them) and saves through the preserving
+/// writer, which refuses a changed comment; until the inspector reads these parts as part of the
+/// comments, only this regenerating save of a comment shows them.
+const COMMENT_ID_PARTS: [&str; 2] = ["word/commentsIds.xml", "word/commentsExtensible.xml"];
+
 /// What a host requires of every save besides the editor's own revisions and comments.
 fn assert_clean(inspection: &Inspection) {
     assert_eq!(inspection.resolved, Resolved::default());
     assert_eq!((inspection.altered_revisions, inspection.untracked_changes), (0, 0), "{inspection:#?}");
-    assert!(inspection.losses.is_empty(), "{inspection:#?}");
+    assert!(inspection.losses.iter().all(|loss| COMMENT_ID_PARTS.contains(&loss.part.as_str())), "{inspection:#?}");
     assert!(!inspection.too_many_changes);
-    assert!(inspection.added_parts.is_empty(), "{inspection:#?}");
-    assert!(inspection.changed_relationships.is_empty(), "{inspection:#?}");
+    assert!(inspection.added_parts.iter().all(|added| COMMENT_ID_PARTS.contains(&added.part.as_str())), "{inspection:#?}");
+    assert!(
+        inspection.changed_relationships.iter().all(|change| COMMENT_ID_PARTS.iter().any(|part| part.ends_with(change.target.as_str()))),
+        "{inspection:#?}"
+    );
     assert!(inspection.content_types.is_empty(), "{inspection:#?}");
     assert_eq!((inspection.comments.removed, inspection.comments.altered), (0, 0), "{inspection:#?}");
 }

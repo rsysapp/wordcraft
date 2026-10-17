@@ -701,12 +701,13 @@ pub struct Document {
     pub endnote_separators: NoteSeparators,
     /// Embedded media (images) by key.
     // embed: a map that prints names and lengths, never a picture's bytes.
-    #[serde(skip)]
+    #[serde(skip_serializing_if = "Media::is_empty")]
     pub media: Media,
     /// Source-format parts we keep verbatim for round-trip (e.g. custom XML), by part name.
     // embed: a map that prints lengths and compares shared bytes without reading them, since a
-    // document read from a package keeps the whole package here.
-    #[serde(skip)]
+    // document read from a package keeps the whole package here (serialised with the rest, see
+    // `NamedBytes`).
+    #[serde(skip_serializing_if = "Passthrough::is_empty")]
     pub passthrough: Passthrough,
 }
 

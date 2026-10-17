@@ -22,6 +22,26 @@ impl NamedBytes {
     pub fn new() -> Self {
         NamedBytes(BTreeMap::new())
     }
+
+    /// For `skip_serializing_if`, which names a path, not a method reached by dereferencing.
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+}
+
+/// Serialised as the map it holds, as upstream's maps are (a crash recovery copy keeps the
+/// pictures and the parts kept verbatim). The source package of a document read from a Word file
+/// is among them, so a recovered document can still be saved by keeping that file.
+impl serde::Serialize for NamedBytes {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.collect_map(self.0.iter())
+    }
+}
+
+impl<'de> serde::Deserialize<'de> for NamedBytes {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        BTreeMap::<String, Arc<Vec<u8>>>::deserialize(deserializer).map(NamedBytes)
+    }
 }
 
 impl<'a> IntoIterator for &'a NamedBytes {
