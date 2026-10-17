@@ -295,7 +295,7 @@ fn object_hash(object: &InlineObject) -> u64 {
     match object {
         InlineObject::Image { media, alt, .. } => (media, alt).hash(&mut hasher),
         InlineObject::Shape { story, .. } => story.hash(&mut hasher),
-        InlineObject::Field { instr, result, locked, code } => (instr, result, locked, code).hash(&mut hasher),
+        InlineObject::Field { instr, result, locked, dirty, code, form } => (instr, result, locked, dirty, code, form).hash(&mut hasher),
         InlineObject::NoteRef { kind, id, custom } => (kind, id, custom).hash(&mut hasher),
         InlineObject::BookmarkStart { name } | InlineObject::BookmarkEnd { name } => name.hash(&mut hasher),
         InlineObject::CommentStart { id } | InlineObject::CommentEnd { id } => id.hash(&mut hasher),
@@ -1383,7 +1383,7 @@ mod tests {
 
     #[test]
     fn anchors_typing_next_to_a_field_and_a_bookmark() {
-        let field = InlineObject::Field { instr: "PAGE".into(), result: "3".into(), locked: false, code: false };
+        let field = InlineObject::Field { instr: "PAGE".into(), result: "3".into(), locked: false, dirty: false, code: false, form: String::new() };
         let original = with_object(para(&[("Page ", None, None, false), (" of", None, None, false)]), 5, field, &bold());
         // After the field, with its formatting: the field.
         let mut after_field = original.clone();
@@ -1576,7 +1576,7 @@ mod tests {
         let original = para(&[("Rent monthly.", None, None, false)]);
         let removed = para(&[("Rent .", None, None, false)]);
         assert_eq!(planned(&original, &doc(&[]), &[&removed], &doc(&[])), Err(Unpreservable::Untracked));
-        let page = |result: &str| InlineObject::Field { instr: "PAGE".into(), result: result.into(), locked: false, code: false };
+        let page = |result: &str| InlineObject::Field { instr: "PAGE".into(), result: result.into(), locked: false, dirty: false, code: false, form: String::new() };
         let original = with_object(para(&[("Page ", None, None, false)]), 5, page("3"), &CharProps::default());
         let recalculated = with_object(para(&[("Page ", None, None, false)]), 5, page("4"), &CharProps::default());
         assert_eq!(planned(&original, &doc(&[]), &[&recalculated], &doc(&[])), Err(Unpreservable::Untracked));

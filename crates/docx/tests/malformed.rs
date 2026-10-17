@@ -337,3 +337,30 @@ fn the_element_budget_spans_every_part_and_is_never_skipped() {
     let (document_part, styles_part) = (2 + 3 * 1_000, 1 + 2_000);
     assert!(elements - 1 > document_part.max(styles_part), "each part alone is under the budget");
 }
+
+#[test]
+fn long_header_reference_chain_is_cut_off() {
+    const HDR_REL: &str = "http://schemas.openxmlformats.org/officeDocument/2006/relationships/header";
+    const RELS_NS: &str = "http://schemas.openxmlformats.org/package/2006/relationships";
+    let rels_for = |next: usize| {
+        let rel = format!(r#"<Relationship Id="rId1" Type="{HDR_REL}" Target="header{next}.xml"/>"#);
+        format!(r#"<Relationships xmlns="{RELS_NS}">{rel}</Relationships>"#)
+    };
+    let sect = r#"<w:sectPr><w:headerReference w:type="default" r:id="rId1"/></w:sectPr>"#;
+    let doc = format!("<w:document {W_NS}><w:body><w:p><w:r><w:t>body</w:t></w:r></w:p>{sect}</w:body></w:document>");
+    // header0 -> header1 -> ... -> header59: every header's last paragraph holds a section that points at the next one.
+    let mut entries: Vec<(String, Vec<u8>)> = vec![
+        ("_rels/.rels".into(), ROOT_RELS.as_bytes().to_vec()),
+        ("word/document.xml".into(), doc.into_bytes()),
+        ("word/_rels/document.xml.rels".into(), rels_for(0).into_bytes()),
+    ];
+    for i in 0..60 {
+        let hdr = format!("<w:hdr {W_NS}><w:p><w:pPr>{sect}</w:pPr><w:r><w:t>h{i}</w:t></w:r></w:p></w:hdr>");
+        entries.push((format!("word/header{i}.xml"), hdr.into_bytes()));
+        entries.push((format!("word/_rels/header{i}.xml.rels"), rels_for(i + 1).into_bytes()));
+    }
+    let refs: Vec<(&str, &[u8])> = entries.iter().map(|(n, b)| (n.as_str(), b.as_slice())).collect();
+    let d = read(&zip(&refs)).unwrap();
+    assert!(!d.parts.is_empty());
+    assert!(d.parts.len() <= 8, "followed {} chained headers", d.parts.len());
+}

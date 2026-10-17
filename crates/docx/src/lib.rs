@@ -11,6 +11,7 @@ mod chart_spec;
 mod crypt;
 mod custom;
 mod flat;
+mod fonts;
 mod package;
 // embed: the writer that keeps the source package.
 mod preserve;
@@ -31,6 +32,7 @@ pub use crypt::{
     is_encrypted, protection_hash,
 };
 pub use flat::{XmlKind, sniff_xml, write as write_flat};
+pub use fonts::embedded_fonts;
 pub use smart_art::smart_art_items;
 // embed: a caller with less memory or stack than the desktop reads within tighter limits.
 pub use package::ReadLimits;

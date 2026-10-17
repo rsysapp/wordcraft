@@ -773,7 +773,7 @@ mod tests {
     }
 
     fn field(result: &str) -> InlineObject {
-        InlineObject::Field { instr: "REF clause_five".into(), result: result.into(), locked: false, code: false }
+        InlineObject::Field { instr: "REF clause_five".into(), result: result.into(), locked: false, dirty: false, code: false, form: String::new() }
     }
 
     fn found_in_paragraph(paragraph: Paragraph, passage: &str) -> (Document, Vec<(usize, usize)>) {
@@ -907,7 +907,7 @@ mod tests {
         // "A " + hidden [comment anchor] + " B " + field "5": the field is objects[1].
         let mut paragraph = paragraph_with_hidden(&[("A ", false), ("\u{FFFC}", true), (" B ", false), ("\u{FFFC}", false)]);
         paragraph.objects =
-            vec![InlineObject::Field { instr: "REF hidden_one".into(), result: "WRONG".into(), locked: false, code: false }, field("5")];
+            vec![InlineObject::Field { instr: "REF hidden_one".into(), result: "WRONG".into(), locked: false, dirty: false, code: false, form: String::new() }, field("5")];
         let (_, ranges) = found_in_paragraph(paragraph.clone(), "a b 5");
         assert_eq!(ranges, vec![(0, paragraph.text.len())]);
         assert!(found_in_paragraph(paragraph.clone(), "wrong").1.is_empty(), "the hidden field's result is not shown");
