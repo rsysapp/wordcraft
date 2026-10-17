@@ -4,7 +4,10 @@ WordCraft's embed build is a WebAssembly module that a host page mounts on its o
 and drives through one typed JavaScript API, `EmbeddedEditor` (`wordcraft_embed.d.ts`). An
 editor mounts in **view mode** (the document with the editor's own page navigation, zoom and
 find); API 0.2 (release `embed-v0.2.0`) adds **edit mode**, in which every change is a tracked
-change, and save, which hands the `.docx` bytes to the host ("Edit mode (API 0.2)"). Sources:
+change, and save, which hands the `.docx` bytes to the host ("Edit mode (API 0.2)"). Release
+`embed-v0.3.0` keeps the API and adds the `fullEditing` permission, and its save keeps the opened
+package: only the paragraphs the session changed are rewritten, every other part is the original's
+bytes, and a change that cannot be written that way is refused with its reason. Sources:
 `apps/wordcraft-embed` (wasm-bindgen glue) and `crates/ui-egui/src/host/` (host bridge, view and
 edit mode, marks, selection, opening files).
 
