@@ -40,7 +40,7 @@ use wordcraft_doc::para::OBJ;
 use super::Unpreservable;
 use super::plan::{Change, Revision, Step};
 use super::scan::{Child, ChildKind, Loc, Node, Props, RunNode, ScannedPara, WrapperKind};
-use crate::inspect::budget::{BYTES_PER_UNIT_COPIED, Budget, table_room, table_slot, tree_room, tree_slot, units, vector_slot};
+use crate::inspect::budget::{BYTES_PER_UNIT_COPIED, Budget, table_room, table_slot, tree_room, tree_slot, units, vector_room, vector_slot};
 use crate::xml::esc;
 
 /// What may sit inside a new deletion besides runs: range markers and proofing marks, which Word
@@ -430,7 +430,7 @@ fn position(paragraph: &ScannedPara, unit: usize, part: &str) -> Result<(Option<
         Some(Loc::Marker { node }) => (Some(*node), None),
         Some(Loc::Locked { node: Some(node), child: Some(child) }) => (None, Some(At::Child { node: *node, child: *child, raw: 0 })),
         Some(Loc::Locked { node: Some(node), child: None }) => (Some(*node), None),
-        Some(Loc::Locked { node: None, .. }) => return Err(Unpreservable::Locked { part: part.to_string() }),
+        Some(Loc::Locked { node: None, .. } | Loc::ControlEnd) => return Err(Unpreservable::Locked { part: part.to_string() }),
         // A paragraph with no node has nothing to stand before: the end.
         Some(Loc::Outside { at_end: false }) => ((!paragraph.nodes.is_empty()).then_some(0), None),
         Some(Loc::Outside { at_end: true }) => (None, None),
@@ -513,7 +513,7 @@ fn unit_nodes(paragraph: &ScannedPara, unit: usize) -> Option<(usize, usize)> {
     match paragraph.units.get(unit)?.loc {
         Loc::Text { node, .. } | Loc::Single { node, .. } | Loc::Marker { node } | Loc::Locked { node: Some(node), .. } => Some((node, node)),
         Loc::Atomic { first, last } => Some((first, last)),
-        Loc::Locked { node: None, .. } | Loc::Outside { .. } => None,
+        Loc::Locked { node: None, .. } | Loc::Outside { .. } | Loc::ControlEnd => None,
     }
 }
 
@@ -533,7 +533,9 @@ fn sealed(paragraph: &ScannedPara, at: usize) -> bool {
             _ => false,
         }
     };
-    at.checked_sub(1).is_some_and(inside) || inside(at)
+    // Typing before the end mark of a content control would be inside it, at its end.
+    let before_control_end = paragraph.units.get(at).is_some_and(|unit| matches!(unit.loc, Loc::ControlEnd));
+    at.checked_sub(1).is_some_and(inside) || inside(at) || before_control_end
 }
 
 /// A typed character as run content: text, or the element the reader reads it from.
@@ -637,7 +639,8 @@ fn write(
                 | Step::Keep { change: Change::Deleted(_) | Change::AcceptedThenDeleted(_) | Change::RejectedThenDeleted(_), .. }
         )
     });
-    if new_markup && prefix.is_empty() {
+    // ... and the prefix must name WordprocessingML where the paragraph is (6C-48 I3).
+    if new_markup && (prefix.is_empty() || !paragraph.prefix_bound) {
         return Err(Unpreservable::Namespace { part: part.to_string() });
     }
 
@@ -687,7 +690,7 @@ fn write(
             continue;
         }
         match unit.loc {
-            Loc::Outside { .. } => *slot = KEPT,
+            Loc::Outside { .. } | Loc::ControlEnd => *slot = KEPT,
             Loc::Locked { .. } => return Err(locked()),
             _ => {}
         }
@@ -728,7 +731,7 @@ fn write(
                     locked_children.insert((node, child), *unit_status);
                 }
             }
-            Loc::Locked { node: None, .. } | Loc::Outside { .. } => {}
+            Loc::Locked { node: None, .. } | Loc::Outside { .. } | Loc::ControlEnd => {}
         }
     }
 
@@ -813,6 +816,10 @@ fn write(
             _ => At::End,
         };
         ledger.hold(tree_slot::<At, Vec<Insertion<'_>>>())?;
+        // Each place's own vector holds its first room (four insertions) whatever it holds.
+        if !insertions.contains_key(&at) {
+            ledger.hold(vector_room::<Insertion<'_>>())?;
+        }
         insertions.entry(at).or_default().push(insertion);
     }
 
@@ -1717,6 +1724,8 @@ impl<'a> Writer<'a, '_, '_> {
             // A comment reference, ruby or a page number inside a run: that run.
             Some(Loc::Locked { node: Some(node), child: Some(_) }) => of_node(*node),
             Some(Loc::Outside { .. }) => Some((None, RunProps::None)),
+            // Typing that continued the end of a content control is not written beside it.
+            Some(Loc::ControlEnd) => None,
             // A field written as one element, or anything inside something copied whole.
             Some(Loc::Locked { .. }) => None,
         };
@@ -1724,11 +1733,11 @@ impl<'a> Writer<'a, '_, '_> {
     }
 
     fn typed(&mut self, text: &str, revision: &'a Revision, anchor: Option<usize>) -> Result<(), Unpreservable> {
-        let content: Vec<Typed> = text
-            .chars()
-            .map(typed_char)
-            .collect::<Option<_>>()
-            .ok_or_else(|| Unpreservable::Verification("typed text holds a character a Word file cannot hold".into()))?;
+        // Checked before anything is written, and never collected: typed text is as long as the
+        // person pasted (6C-48 I2).
+        if !text.chars().all(|ch| typed_char(ch).is_some()) {
+            return Err(Unpreservable::Verification("typed text holds a character a Word file cannot hold".into()));
+        }
         let (innermost, props) = self.anchor(anchor)?;
         // Inside the hyperlink or content control typing continued in; never inside a tracked change.
         let paragraph = self.paragraph;
@@ -1750,7 +1759,7 @@ impl<'a> Writer<'a, '_, '_> {
             }
             RunProps::Mark => self.mark_properties_as_run_properties()?,
         }
-        self.content(&content)?;
+        self.content(text)?;
         self.push(&format!("</{}>", self.w("r")))
     }
 
@@ -1771,34 +1780,70 @@ impl<'a> Writer<'a, '_, '_> {
         self.push(&format!("</{}>", rpr.raw_name))
     }
 
-    /// Typed characters as run content: text in `w:t`, the rest as their elements.
-    fn content(&mut self, content: &[Typed]) -> Result<(), Unpreservable> {
-        let mut plain = String::new();
-        for typed in content {
-            match typed {
-                Typed::Text(ch) => plain.push(*ch),
-                Typed::Element(name, kind) => {
-                    self.text_run(&mut plain)?;
+    /// Typed characters as run content: text in `w:t`, the rest as their elements. The text is
+    /// written in pieces of at most [`TYPED_PIECE`] bytes: a piece, its escaped form and nothing
+    /// else besides the output is made, and that is charged before it is.
+    fn content(&mut self, text: &str) -> Result<(), Unpreservable> {
+        let held = units(text.len().min(TYPED_PIECE)).saturating_mul(16).saturating_add(512);
+        self.ledger.hold(held)?;
+        let written = self.typed_pieces(text);
+        self.ledger.release(held);
+        written
+    }
+
+    fn typed_pieces(&mut self, text: &str) -> Result<(), Unpreservable> {
+        let mut plain = String::with_capacity(text.len().min(TYPED_PIECE).saturating_add(4));
+        let mut open = false;
+        for ch in text.chars() {
+            match typed_char(ch) {
+                Some(Typed::Text(ch)) => {
+                    plain.push(ch);
+                    if plain.len() >= TYPED_PIECE {
+                        self.text_piece(&mut plain, &mut open)?;
+                    }
+                }
+                Some(Typed::Element(name, kind)) => {
+                    self.text_piece(&mut plain, &mut open)?;
+                    self.close_text(&mut open)?;
                     let tag = match kind {
                         Some(kind) => format!("<{} {}=\"{kind}\"/>", self.w(name), self.w("type")),
                         None => format!("<{}/>", self.w(name)),
                     };
                     self.push(&tag)?;
                 }
+                None => return Err(Unpreservable::Verification("typed text holds a character a Word file cannot hold".into())),
             }
         }
-        self.text_run(&mut plain)
+        self.text_piece(&mut plain, &mut open)?;
+        self.close_text(&mut open)
     }
 
-    fn text_run(&mut self, plain: &mut String) -> Result<(), Unpreservable> {
+    /// `plain` as the next piece of the open `w:t` (opened first when it is not).
+    fn text_piece(&mut self, plain: &mut String, open: &mut bool) -> Result<(), Unpreservable> {
         if plain.is_empty() {
             return Ok(());
         }
-        let tag = format!("<{t} xml:space=\"preserve\">{}</{t}>", esc(plain), t = self.w("t"));
+        if !*open {
+            let tag = format!("<{} xml:space=\"preserve\">", self.w("t"));
+            self.push(&tag)?;
+            *open = true;
+        }
+        let escaped = esc(plain);
         plain.clear();
-        self.push(&tag)
+        self.push(&escaped)
+    }
+
+    fn close_text(&mut self, open: &mut bool) -> Result<(), Unpreservable> {
+        if std::mem::take(open) {
+            let tag = format!("</{}>", self.w("t"));
+            self.push(&tag)?;
+        }
+        Ok(())
     }
 }
+
+/// The most typed text made into one piece of output at a time.
+const TYPED_PIECE: usize = 4096;
 
 #[cfg(test)]
 mod tests {
@@ -1960,12 +2005,13 @@ mod tests {
 
     #[test]
     fn accepts_and_rejects_an_inserted_content_control_whole() {
+        // The control's two marks are characters of the paragraph, as the reader makes them: four units.
         let source = r#"<w:p><w:ins w:id="5" w:author="Ana" w:date="A"><w:sdt><w:sdtPr><w:tag w:val="t"/></w:sdtPr><w:sdtContent><w:r><w:t>ab</w:t></w:r></w:sdtContent></w:sdt></w:ins></w:p>"#;
         assert_eq!(
-            rewritten(source, &keep(0..2, Change::Accepted), &[]).unwrap(),
+            rewritten(source, &keep(0..4, Change::Accepted), &[]).unwrap(),
             r#"<w:p><w:sdt><w:sdtPr><w:tag w:val="t"/></w:sdtPr><w:sdtContent><w:r><w:t>ab</w:t></w:r></w:sdtContent></w:sdt></w:p>"#
         );
-        let removed: Vec<Step> = (0..2).map(|unit| Step::Remove { unit }).collect();
+        let removed: Vec<Step> = (0..4).map(|unit| Step::Remove { unit }).collect();
         assert_eq!(rewritten(source, &removed, &[]).unwrap(), "<w:p></w:p>");
     }
 
@@ -2344,7 +2390,8 @@ mod tests {
         // nor after the last of them (the scan does not say where the field ends).
         let (_, next) = scanned_at(spilled, 1);
         let units = next.units.len();
-        assert_eq!(units, "More".len());
+        // "More" and the mark where the field's result ends.
+        assert_eq!(units, "More".len() + 1);
         for at in 0..=units {
             let steps =
                 [keep(0..at, Change::Same), vec![Step::Insert { text: "x".into(), revision: sari(), anchor: None }], keep(at..units, Change::Same)]
@@ -2437,10 +2484,13 @@ mod tests {
             r#"<w:p><w:smartTag w:uri="urn:x" w:element="place"><w:r><w:t>abcd</w:t></w:r></w:smartTag></w:p>"#,
             r#"<w:p><w:customXml w:element="party"><w:r><w:t>abcd</w:t></w:r></w:customXml></w:p>"#,
         ] {
-            let split = [keep(0..2, Change::Same), vec![Step::Break { revision: sari() }], keep(2..4, Change::Same)].concat();
+            // A control's marks are characters too: the text starts after its start mark.
+            let (_, scanned) = scanned(wrapped);
+            let (lead, units) = (scanned.units.iter().position(|unit| unit.ch != wordcraft_doc::para::OBJ).unwrap(), scanned.units.len());
+            let split = [keep(0..lead + 2, Change::Same), vec![Step::Break { revision: sari() }], keep(lead + 2..units, Change::Same)].concat();
             assert!(matches!(rewritten(wrapped, &split, &[]), Err(Unpreservable::SplitWrapper { .. })), "{wrapped}");
             // At its edge, a mark is outside it.
-            let before = [vec![Step::Break { revision: sari() }], keep(0..4, Change::Same)].concat();
+            let before = [vec![Step::Break { revision: sari() }], keep(0..units, Change::Same)].concat();
             assert!(rewritten(wrapped, &before, &[]).is_ok(), "{wrapped}");
         }
     }
@@ -2727,16 +2777,18 @@ mod tests {
         assert!(matches!(before, Err(Unpreservable::Unsupported(_))), "{:?}", before.as_ref().err());
         let before = rewritten(
             body,
-            &[keep(0..7, Change::Same), vec![Step::Insert { text: "the ".into(), revision: sari(), anchor: Some(6) }], keep(7..13, Change::Same)]
+            // The control's start mark is the eighth character, its end mark the last.
+            &[keep(0..7, Change::Same), vec![Step::Insert { text: "the ".into(), revision: sari(), anchor: Some(6) }], keep(7..15, Change::Same)]
                 .concat(),
             &[],
         )
         .unwrap();
         assert!(before.contains(r#"</w:t></w:r></w:ins><w:sdt><w:sdtPr>"#), "{before}");
-        // Typing that continues the control's first character, written in the control.
+        // Typing that continues the control's first character (the one after its start mark), written in
+        // the control.
         let rendered = rewritten(
             body,
-            &[keep(0..7, Change::Same), vec![Step::Insert { text: "The ".into(), revision: sari(), anchor: Some(7) }], keep(7..13, Change::Same)]
+            &[keep(0..8, Change::Same), vec![Step::Insert { text: "The ".into(), revision: sari(), anchor: Some(8) }], keep(8..15, Change::Same)]
                 .concat(),
             &[],
         )
@@ -3368,14 +3420,15 @@ mod tests {
 
     #[test]
     fn keeps_a_cut_texts_attributes() {
-        // 6C-48 M5.
+        // 6C-48 M5: each cut text keeps its own attributes, with xml:space added. The deleted
+        // characters of one source run stay together in one run inside the `w:del`.
         let body = r#"<w:p><w:r><w:t w14:foo="1">a b</w:t><w:t xml:space="default" w14:bar="2">cd</w:t></w:r></w:p>"#;
         let steps = [keep(0..2, Change::Same), keep(2..4, Change::Deleted(sari())), keep(4..5, Change::Same)].concat();
         let written = rewritten(body, &steps, &[]).unwrap();
         assert_eq!(
             written,
             format!(
-                r#"<w:p><w:r><w:t w14:foo="1" xml:space="preserve">a </w:t></w:r><w:del w:id="11" {SARI_ATTRIBUTES}><w:r><w:delText w14:foo="1" xml:space="preserve">b</w:delText></w:r><w:r><w:delText xml:space="preserve" w14:bar="2">c</w:delText></w:r></w:del><w:r><w:t xml:space="preserve" w14:bar="2">d</w:t></w:r></w:p>"#
+                r#"<w:p><w:r><w:t w14:foo="1" xml:space="preserve">a </w:t></w:r><w:del w:id="11" {SARI_ATTRIBUTES}><w:r><w:delText w14:foo="1" xml:space="preserve">b</w:delText><w:delText xml:space="preserve" w14:bar="2">c</w:delText></w:r></w:del><w:r><w:t xml:space="preserve" w14:bar="2">d</w:t></w:r></w:p>"#
             )
         );
     }
@@ -3404,28 +3457,34 @@ mod tests {
     #[test]
     fn refuses_new_markup_where_the_parts_prefix_names_another_namespace() {
         // 6C-48 I3: the prefix new markup is written with must name WordprocessingML where it is
-        // written; rebound on the paragraph or around it, the writer refuses.
+        // written; rebound on the paragraph or around it, the writer refuses. The element that
+        // rebinds `w` is itself written with `x`: written with the rebound `w`, it would not be
+        // WordprocessingML, and the paragraph inside it would not be read at all.
         let main = "http://schemas.openxmlformats.org/wordprocessingml/2006/main";
         let run = r#"<x:r><x:t>ab</x:t></x:r>"#;
         let rebound = [
             format!(r#"<x:p xmlns:x="{main}" xmlns:w="urn:other">{run}</x:p>"#),
-            format!(r#"<w:sdt><w:sdtContent xmlns:x="{main}" xmlns:w="urn:other"><x:p>{run}</x:p></w:sdtContent></w:sdt>"#),
-            format!(r#"<w:tbl><w:tr><w:tc xmlns:x="{main}" xmlns:w="urn:other"><x:p>{run}</x:p></w:tc></w:tr></w:tbl>"#),
+            format!(r#"<w:sdt><x:sdtContent xmlns:x="{main}" xmlns:w="urn:other"><x:p>{run}</x:p></x:sdtContent></w:sdt>"#),
+            format!(r#"<w:tbl><w:tr><x:tc xmlns:x="{main}" xmlns:w="urn:other"><x:p>{run}</x:p></x:tc></w:tr></w:tbl>"#),
             format!(r#"<x:p xmlns:x="{main}"><x:hyperlink x:anchor="a" xmlns:w="urn:other">{run}</x:hyperlink></x:p>"#),
         ];
-        let typed = [vec![Step::Insert { text: "Z".into(), revision: sari(), anchor: Some(0) }], keep(0..2, Change::Same)].concat();
-        let deleted = keep(0..2, Change::Deleted(sari()));
         for body in &rebound {
             let (_, scanned) = scanned_with_root(body);
-            assert_eq!(scanned.units.len(), 2, "{body}");
+            // The two letters, and the marks of a block control around them.
+            let count = scanned.units.len();
+            let first = scanned.units.iter().position(|unit| unit.ch != OBJ).unwrap();
+            assert_eq!(scanned.units.iter().filter(|unit| unit.ch != OBJ).count(), 2, "{body}");
+            let typed = [vec![Step::Insert { text: "Z".into(), revision: sari(), anchor: Some(first) }], keep(0..count, Change::Same)].concat();
+            let deleted = keep(0..count, Change::Deleted(sari()));
             assert!(matches!(rewritten(body, &typed, &[]), Err(Unpreservable::Namespace { .. })), "{body}");
             assert!(matches!(rewritten(body, &deleted, &[]), Err(Unpreservable::Namespace { .. })), "{body}");
             // Decisions write no new markup.
-            assert!(rewritten(body, &keep(0..2, Change::Same), &[]).is_ok(), "{body}");
+            assert!(rewritten(body, &keep(0..count, Change::Same), &[]).is_ok(), "{body}");
         }
         // Rebound on the body, with the paragraph written in another prefix.
         let body_rebound = format!(r#"<x:p xmlns:x="{main}">{run}</x:p>"#);
-        let document = format!(r#"<w:document {W}><w:body xmlns:w="urn:other" xmlns:x="{main}">{body_rebound}</w:body></w:document>"#);
+        let document = format!(r#"<w:document {W}><x:body xmlns:w="urn:other" xmlns:x="{main}">{body_rebound}</x:body></w:document>"#);
+        let typed = [vec![Step::Insert { text: "Z".into(), revision: sari(), anchor: Some(0) }], keep(0..2, Change::Same)].concat();
         let (bytes, scanned) = scanned_document(&document);
         let none = BTreeMap::new();
         let mut budget = Budget::new(MAX_WORK, MAX_MEMORY);

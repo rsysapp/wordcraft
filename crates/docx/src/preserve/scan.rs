@@ -31,9 +31,18 @@ use crate::DocxError;
 use crate::inspect::budget::{Budget, table_sized, table_slot, tree_slot, units, vector_slot};
 use crate::package::{Package, Rels, rt};
 use crate::read::MAX_PARTS;
-use crate::read::story::{MAX_FIELD_DEPTH, MAX_STORY_DEPTH, MAX_TABLE_DEPTH, choice_understood, clean_char};
+use crate::read::story::{
+    MAX_FIELD_DEPTH, MAX_STORY_DEPTH, MAX_TABLE_DEPTH, choice_understood, clean_char, is_range_instr, vml_drawn_shape_made, vml_is_watermark,
+};
 use crate::units::int;
 use crate::xml::MAX_DEPTH;
+
+/// Most move ranges open at once, and most move names tracked, as the reader's.
+const MAX_OPEN_MOVES: usize = 64;
+const MAX_MOVES: usize = 100_000;
+
+/// The most permission range ids kept, as the reader's `marker`.
+const MAX_PERMS: usize = 100_000;
 
 /// The most items a field's result buffers, as the reader's `emit_text`/`emit_obj`.
 const MAX_FIELD_ITEMS: usize = 100_000;
@@ -81,6 +90,10 @@ pub(crate) struct ScannedPara {
     pub wrappers: Vec<Wrapper>,
     /// One per character of the model paragraph's text, in order.
     pub units: Vec<Unit>,
+    /// Whether the part's prefix still names WordprocessingML everywhere new markup would be
+    /// written in this paragraph (6C-48 I3): not rebound on the paragraph, an element around it,
+    /// or one inside it. The writer refuses new markup where it is not.
+    pub prefix_bound: bool,
 }
 
 impl ScannedPara {
@@ -128,6 +141,53 @@ impl ScannedPara {
         }
         ranges
     }
+}
+
+/// The WordprocessingML namespaces a prefix may be bound to where new markup is written with it.
+const WORDPROCESSINGML: [&str; 2] =
+    ["http://schemas.openxmlformats.org/wordprocessingml/2006/main", "http://purl.oclc.org/ooxml/wordprocessingml/main"];
+
+/// How a start tag declares `prefix`: (bound to something else, bound to WordprocessingML). Read from
+/// the tag's bytes, so a value written with a reference counts as something else, and a declaration
+/// is never taken for another because of what a later attribute's value holds.
+fn declares(tag: &str, prefix: &str) -> (bool, bool) {
+    let needle = format!("xmlns:{prefix}");
+    let (mut elsewhere, mut main) = (false, false);
+    for (at, _) in tag.match_indices(&needle) {
+        if !tag[..at].ends_with(|ch: char| ch.is_ascii_whitespace()) {
+            continue;
+        }
+        let rest = tag[at + needle.len()..].trim_start();
+        let Some(rest) = rest.strip_prefix('=') else { continue };
+        let rest = rest.trim_start();
+        let value = rest.chars().next().filter(|quote| matches!(quote, '"' | '\'')).and_then(|quote| rest[1..].split(quote).next());
+        match value {
+            Some(value) if WORDPROCESSINGML.contains(&value) => main = true,
+            _ => elsewhere = true,
+        }
+    }
+    (elsewhere, main)
+}
+
+/// The paragraphs of `element` at, around or inside which `prefix` is bound to anything but
+/// WordprocessingML (`bound`: whether it is, where `element` starts). Returns whether `prefix` is
+/// rebound on `element` or inside it.
+fn rebound_paragraphs(element: &PEl, bytes: &[u8], prefix: &str, mut bound: bool, found: &mut HashSet<usize>) -> bool {
+    let tag = bytes.get(element.start.clone()).and_then(|tag| std::str::from_utf8(tag).ok()).unwrap_or("");
+    let (elsewhere, main) = declares(tag, prefix);
+    if elsewhere {
+        bound = false;
+    } else if main {
+        bound = true;
+    }
+    let mut inside = false;
+    for kid in element.els() {
+        inside |= rebound_paragraphs(kid, bytes, prefix, bound, found);
+    }
+    if element.name == "w:p" && (!bound || inside) {
+        found.insert(element.start.start);
+    }
+    elsewhere || inside
 }
 
 /// A properties element (`w:pPr`, the `w:rPr` inside it): its tags and its children by name.
@@ -266,6 +326,9 @@ pub(crate) enum Loc {
     /// A marker the reader moved into the paragraph from between blocks: at its start, or, for
     /// the last paragraph of a story, at its end.
     Outside { at_end: bool },
+    /// The mark that ends an inline content control (the reader's `ControlEnd`): kept as it stands,
+    /// and nothing is typed before it, which would be inside the control at its end.
+    ControlEnd,
 }
 
 /// The main document part, as the reader finds it.
@@ -309,6 +372,10 @@ fn scan_with(pkg: &Package, wanted: &BTreeMap<String, BTreeSet<u32>>, memory: &M
         memory,
         failure: None,
         bookmarks: HashSet::new(),
+        perms: HashSet::new(),
+        next_story_in_header: false,
+        moves_open: [Vec::new(), Vec::new()],
+        moves_seen: HashSet::new(),
         comments: HashSet::new(),
         comments_ended: HashSet::new(),
         footnotes: HashSet::new(),
@@ -487,6 +554,27 @@ struct Story {
     pending: Vec<Unit>,
     /// Text-box nesting: a story deeper than 0 is a text box's.
     depth: usize,
+    /// The tracked-change wrappers around what is being read (the reader's `RunCtx::ins`/`del`).
+    rev: Revs,
+    /// A header's or footer's own story (not a text box in one): where a watermark is a setting.
+    in_header: bool,
+}
+
+/// The tracked insertion and deletion around content, as the reader knows them: by kind, author, date
+/// and, for a move, the name of the range it is one end of.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+struct Revs {
+    ins: Option<std::rc::Rc<str>>,
+    del: Option<std::rc::Rc<str>>,
+}
+
+impl Revs {
+    /// The key of a revision wrapper: its kind, author (256 characters) and date (64), as the reader's `revision`.
+    fn key(element: &PEl, kind: &str, move_name: Option<&str>) -> std::rc::Rc<str> {
+        let author: String = element.attr("w:author").unwrap_or("").chars().take(256).collect();
+        let date: String = element.attr("w:date").unwrap_or("").chars().take(64).collect();
+        format!("{kind}\u{0}{author}\u{0}{date}\u{0}{}", move_name.unwrap_or("")).into()
+    }
 }
 
 struct Field {
@@ -501,7 +589,101 @@ struct Field {
     charged: u64,
     /// The node it began in.
     first: Option<usize>,
+    /// The start of its instruction, enough to tell a range field (`TOC`, `ADDIN`) from the others.
+    instr: String,
+    /// A range field: its result flows into the paragraph between two marks, never buffered.
+    range: bool,
+    /// The tracked changes around where it began, and those around what its result holds (the first
+    /// two kinds: two are enough to know one differs from any other field's). When the result lies in
+    /// changes the field does not, the reader keeps the field as a range around the result (#1037).
+    begin: Revs,
+    seen: Vec<Revs>,
+    /// Its result holds a drawing (a picture, chart or shape), which also keeps it as a range.
+    has_frame: bool,
 }
+
+impl Field {
+    /// More of the code, kept to its start: leading white space is dropped, as the range test skips it.
+    fn push_instr(&mut self, more: &str) {
+        let more = if self.instr.is_empty() { more.trim_start() } else { more };
+        let room = INSTR_HEAD.saturating_sub(self.instr.len());
+        let mut end = more.len().min(room);
+        while !more.is_char_boundary(end) {
+            end -= 1;
+        }
+        self.instr.push_str(&more[..end]);
+    }
+}
+
+/// `element` as the reader's tree, to `levels` of children below it (no text): enough for the
+/// reader's decisions about a shape, without copying a text box's content.
+fn shallow(element: &PEl, levels: usize) -> crate::xml::El {
+    let kids = if levels == 0 { Vec::new() } else { element.els().map(|kid| crate::xml::Node::El(shallow(kid, levels - 1))).collect() };
+    crate::xml::El { name: element.name.clone(), attrs: element.attrs.clone(), kids }
+}
+
+/// The first `v:textbox` under `element` holding text, with its `w:txbxContent` (depth-first, as the
+/// reader's `vml_textbox`).
+fn vml_text_box(element: &PEl, depth: usize) -> Option<&PEl> {
+    if depth > MAX_DEPTH {
+        return None;
+    }
+    element.els().find_map(|child| match child.child("w:txbxContent") {
+        Some(content) if child.name == "v:textbox" => Some(content),
+        _ => vml_text_box(child, depth + 1),
+    })
+}
+
+/// An element's direct text as the reader's `El::text` makes it: text and references (unknown ones
+/// left out), CDATA as written.
+fn raw_text(ctx: &Ctx<'_>, element: &PEl) -> String {
+    let piece = |range: &Range<usize>| ctx.src.get(range.clone()).unwrap_or_default();
+    let mut text = String::new();
+    for kid in &element.kids {
+        match kid {
+            PKid::Text(range) => text.push_str(std::str::from_utf8(piece(range)).unwrap_or("")),
+            PKid::Ref { ch, .. } => text.extend(*ch),
+            PKid::CData(range) => {
+                text.push_str(&String::from_utf8_lossy(ctx.src.get(range.start.saturating_add(9)..range.end.saturating_sub(3)).unwrap_or_default()))
+            }
+            PKid::El(_) => {}
+        }
+    }
+    text
+}
+
+/// [`raw_text`] as the reader reads text into a story (`clean_text`).
+fn cleaned_text(ctx: &Ctx<'_>, element: &PEl) -> String {
+    raw_text(ctx, element).chars().filter_map(clean_char).collect()
+}
+
+/// Whether a block control is a table of contents': the control the reader leaves to the TOC, from
+/// its last kind-setting property (`sdt_pr`).
+fn is_toc_control(properties: Option<&PEl>) -> bool {
+    const KINDS: [&str; 11] = [
+        "w:richText",
+        "w:text",
+        "w14:checkbox",
+        "w:comboBox",
+        "w:dropDownList",
+        "w:date",
+        "w:picture",
+        "w:docPartObj",
+        "w:docPartList",
+        "w15:repeatingSection",
+        "w15:repeatingSectionItem",
+    ];
+    let Some(last) = properties.and_then(|properties| properties.els().filter(|element| KINDS.contains(&element.name.as_str())).last()) else {
+        return false;
+    };
+    last.name == "w:docPartObj"
+        && last.child("w:docPartGallery").and_then(|gallery| gallery.attr("w:val")).is_some_and(|value| {
+            value.chars().filter(|ch| *ch != OBJ && !ch.is_control()).take(wordcraft_doc::control::MAX_CONTROL_TEXT).eq("Table of Contents".chars())
+        })
+}
+
+/// How much of a field's instruction is kept: the reader decides a range field by its first word.
+const INSTR_HEAD: usize = 256;
 
 /// One paragraph under construction, charging what it holds as it grows.
 struct Builder<'m> {
@@ -703,14 +885,36 @@ impl<'m> Builder<'m> {
 /// The last block of a block list (the reader's `out.last()`), for markers left at its end.
 #[derive(Default)]
 struct Out {
+    first: Option<Last>,
     last: Option<Last>,
+}
+
+impl Out {
+    /// A block was made: the first of the list when none was before, and its last.
+    fn made(&mut self, block: Last) {
+        self.first.get_or_insert(block);
+        self.last = Some(block);
+    }
 }
 
 #[derive(Clone, Copy)]
 enum Last {
     /// A paragraph, by its position in the part (`None`: a table flattened into one).
     Para(Option<u32>),
-    Table,
+    /// A table: where the markers left at the end of a list that ends in it go, the last paragraph of
+    /// its last cell (the reader's `last_para_mut`), `levels` of tables down, if the scan keeps it.
+    Table { ordinal: Option<u32>, levels: usize },
+}
+
+impl Last {
+    /// The paragraph markers left over at the end of a block list ending in this block go to.
+    fn end_paragraph(self) -> Option<u32> {
+        match self {
+            Last::Para(ordinal) => ordinal,
+            // Tables are looked into to the reader's depth.
+            Last::Table { ordinal, levels } => ordinal.filter(|_| levels <= MAX_TABLE_DEPTH),
+        }
+    }
 }
 
 /// Inside something copied whole: the paragraph node that holds it, when there is one.
@@ -734,6 +938,9 @@ struct Ctx<'t> {
     src: &'t [u8],
     rels: &'t Rels,
     ordinals: &'t HashMap<usize, u32>,
+    /// Where the part's prefix is rebound (see [`ScannedPara::prefix_bound`]): the start offsets of
+    /// the paragraphs it is rebound at, around or inside.
+    rebound: &'t HashSet<usize>,
 }
 
 struct Scanner<'p> {
@@ -744,6 +951,14 @@ struct Scanner<'p> {
     failure: Option<DocxError>,
     /// Bookmark ids a `w:bookmarkStart` opened (the reader's `bookmarks`).
     bookmarks: HashSet<String>,
+    /// Permission range ids a `w:permStart` named (the reader's `perms`), at most [`MAX_PERMS`].
+    perms: HashSet<String>,
+    /// The next story made is a header's or footer's own.
+    next_story_in_header: bool,
+    /// The open move ranges, source then destination: (`w:id`, `w:name`), as the reader's `moves`, and
+    /// the names seen (at most [`MAX_MOVES`]). A move's change is told from a plain one by the name.
+    moves_open: [Vec<(String, String)>; 2],
+    moves_seen: HashSet<String>,
     /// Comment ids the comments part holds, as far as it has been read (`comment_map`).
     comments: HashSet<String>,
     comments_ended: HashSet<String>,
@@ -780,16 +995,38 @@ fn locked_unit(unit: Unit) -> Unit {
     Unit { ch: unit.ch, loc }
 }
 
-/// One item where the reader's `emit_text`/`emit_obj` put it: the innermost open field's result,
-/// nowhere (its instruction), or the paragraph (locked while a spilled field is open).
+/// One item where the reader's `emit_text`/`emit_obj` put it: the innermost open field's result
+/// (a range field's result is no buffer: its content flows on), nowhere (its instruction), or the
+/// paragraph (locked while a field is open).
 fn emit(story: &mut Story, b: &mut Builder<'_>, item: Vec<Unit>) {
-    match story.fields.last_mut() {
+    emit_as(story, b, item, false);
+}
+
+/// [`emit`] for a drawing: a field whose result holds one stays a range.
+fn emit_frame(story: &mut Story, b: &mut Builder<'_>, item: Vec<Unit>) {
+    emit_as(story, b, item, true);
+}
+
+fn emit_as(story: &mut Story, b: &mut Builder<'_>, item: Vec<Unit>, frame: bool) {
+    let revs = [story.rev.clone()];
+    emit_in(story, b, item, frame, &revs);
+}
+
+/// [`emit_as`] for an item that lay in the tracked changes `revs`.
+fn emit_in(story: &mut Story, b: &mut Builder<'_>, item: Vec<Unit>, frame: bool, revs: &[Revs]) {
+    match story.fields.iter_mut().rev().find(|field| !field.range) {
         Some(field) if !field.spilled => {
             if field.result && field.items < MAX_FIELD_ITEMS {
                 let charge = vector_slot::<Unit>().saturating_mul(units(item.len()));
                 if b.memory.hold(charge) {
                     field.items += 1;
                     field.charged = field.charged.saturating_add(charge);
+                    for rev in revs {
+                        if field.seen.len() < 2 && !field.seen.contains(rev) {
+                            field.seen.push(rev.clone());
+                        }
+                    }
+                    field.has_frame |= frame;
                     field.buf.extend(item);
                 }
             }
@@ -898,11 +1135,27 @@ impl Scanner<'_> {
                 ScannedPart { bytes: Arc::new(bytes.to_vec()), root: root.name.clone(), prefix, paragraphs: BTreeMap::new() },
             );
         }
-        let ctx = Ctx { part: key, src: bytes, rels: &rels, ordinals: &ordinals };
+        // The prefix new markup is written with must name WordprocessingML where it is written: the
+        // paragraphs it is rebound at, around or inside are found once, only in a part that
+        // declares it more than once.
+        let rebound = match self.parts.get(key).map(|part| part.prefix.as_str()) {
+            Some(prefix) if !prefix.is_empty() && bytes.windows(prefix.len() + 6).filter(|window| window.starts_with(b"xmlns:")).count() > 1 => {
+                let mut found = HashSet::new();
+                rebound_paragraphs(&root, bytes, prefix, false, &mut found);
+                found
+            }
+            _ => HashSet::new(),
+        };
+        let held = table_sized::<usize>(rebound.len());
+        if !self.memory.hold(held) {
+            self.memory.release(walked);
+            return Ok(true);
+        }
+        let ctx = Ctx { part: key, src: bytes, rels: &rels, ordinals: &ordinals, rebound: &rebound };
         walk(self, &ctx, &root);
-        drop(ordinals);
+        drop((ordinals, rebound));
         drop(root);
-        self.memory.release(walked);
+        self.memory.release(walked.saturating_add(held));
         Ok(true)
     }
 
@@ -977,7 +1230,12 @@ impl Scanner<'_> {
         remember(self.memory, &mut self.headers, name.clone(), extra);
         // A header that is not well formed is an empty one to the reader; one past a limit stops
         // the scan.
-        if let Err(error @ DocxError::Limit(_)) = self.with_part(&name, |scanner, ctx, root| scanner.story(ctx, root, 0)) {
+        let read = self.with_part(&name, |scanner, ctx, root| {
+            scanner.next_story_in_header = true;
+            scanner.story(ctx, root, 0);
+            scanner.next_story_in_header = false;
+        });
+        if let Err(error @ DocxError::Limit(_)) = read {
             self.failure.get_or_insert(error);
         }
     }
@@ -985,7 +1243,7 @@ impl Scanner<'_> {
     /// A story's blocks with fresh state, then its leftover markers (the reader's `read_blocks`
     /// and `flush_pending`). `depth`: text-box nesting.
     fn story(&mut self, ctx: &Ctx<'_>, container: &PEl, depth: usize) {
-        let mut story = Story { depth, ..Story::default() };
+        let mut story = Story { depth, in_header: std::mem::take(&mut self.next_story_in_header), ..Story::default() };
         let mut out = Out::default();
         self.blocks(ctx, &mut story, container, &mut out, 0);
         self.flush(ctx, &mut story, &out);
@@ -1013,7 +1271,7 @@ impl Scanner<'_> {
         if pending.is_empty() {
             return;
         }
-        let Some(Last::Para(Some(ordinal))) = out.last else { return };
+        let Some(ordinal) = out.last.and_then(Last::end_paragraph) else { return };
         let memory = self.memory;
         if let Some(paragraph) = self.parts.get_mut(ctx.part).and_then(|part| part.paragraphs.get_mut(&ordinal)) {
             // A kept paragraph is charged for its room: the room these need, before it is made.
@@ -1025,6 +1283,104 @@ impl Scanner<'_> {
             paragraph.units.reserve_exact(pending.len());
             memory.hold(bytes_of_size::<Unit>(paragraph.units.capacity().saturating_sub(room.max(needed))));
             paragraph.units.extend(pending.into_iter().map(|unit| Unit { ch: unit.ch, loc: Loc::Outside { at_end: true } }));
+        }
+    }
+
+    /// A block control's mark at the start or end of `block`, when that is a paragraph the scan keeps.
+    fn mark_control(&mut self, ctx: &Ctx<'_>, block: Option<Last>, at_start: bool) {
+        let Some(Last::Para(Some(ordinal))) = block else { return };
+        let memory = self.memory;
+        let Some(paragraph) = self.parts.get_mut(ctx.part).and_then(|part| part.paragraphs.get_mut(&ordinal)) else { return };
+        // A kept paragraph is charged for its room: the room the mark needs, before it is made.
+        let room = paragraph.units.capacity();
+        if !memory.hold(bytes_of_size::<Unit>(paragraph.units.len().saturating_add(1).saturating_sub(room))) {
+            return;
+        }
+        paragraph.units.reserve_exact(1);
+        memory.hold(bytes_of_size::<Unit>(paragraph.units.capacity().saturating_sub(room.max(paragraph.units.len().saturating_add(1)))));
+        let mark = Unit { ch: OBJ, loc: Loc::Outside { at_end: !at_start } };
+        if at_start {
+            paragraph.units.insert(0, mark);
+            // Every character and one-character child after it is one unit later.
+            for node in &mut paragraph.nodes {
+                let Node::Run(run) = node else { continue };
+                for child in &mut run.children {
+                    match &mut child.kind {
+                        ChildKind::Text { chars, .. } => chars.iter_mut().filter_map(|raw| raw.unit.as_mut()).for_each(|unit| *unit += 1),
+                        ChildKind::Single { unit: Some(unit) } => *unit += 1,
+                        _ => {}
+                    }
+                }
+            }
+        } else {
+            paragraph.units.push(mark);
+        }
+    }
+
+    /// The reader's `read_ruby`: the base text and the ruby text of a `w:ruby` make one object, the
+    /// base text alone when there is no ruby text, nothing when there is no base text. Locked: the
+    /// ruby is one element.
+    fn ruby(&mut self, ctx: &Ctx<'_>, story: &mut Story, b: &mut Builder<'_>, element: &PEl, node: Option<usize>, lock: Option<Lock>) {
+        const MAX: usize = 4096;
+        let part = |name: &str| -> String {
+            let mut text = String::new();
+            for run in element.child(name).into_iter().flat_map(|part| part.els().filter(|child| child.name == "w:r")) {
+                for piece in run.els().filter(|piece| matches!(piece.name.as_str(), "w:t" | "w:delText")) {
+                    if text.len() < MAX {
+                        text.push_str(&cleaned_text(ctx, piece).replace('\t', " "));
+                    }
+                }
+            }
+            text.chars().take(MAX).collect()
+        };
+        let (base, ruby) = (part("w:rubyBase"), part("w:rt"));
+        if base.is_empty() {
+            return;
+        }
+        let loc = locked(node, lock, None);
+        if ruby.is_empty() {
+            emit(story, b, base.chars().map(|ch| Unit { ch, loc: loc.clone() }).collect());
+        } else {
+            emit(story, b, object(loc));
+        }
+    }
+
+    /// The name of the innermost open move range of a side (0 source, 1 destination), if any.
+    fn open_move(&self, side: usize) -> Option<&str> {
+        self.moves_open.get(side).and_then(|open| open.last()).map(|(_, name)| name.as_str())
+    }
+
+    /// The reader's `move_range`: a `w:moveFromRangeStart/End` or `w:moveToRangeStart/End`.
+    fn move_range(&mut self, element: &PEl) {
+        let (side, start) = match element.name.as_str() {
+            "w:moveFromRangeStart" => (0, true),
+            "w:moveFromRangeEnd" => (0, false),
+            "w:moveToRangeStart" => (1, true),
+            "w:moveToRangeEnd" => (1, false),
+            _ => return,
+        };
+        let id: String = element.attr("w:id").unwrap_or("").chars().take(64).collect();
+        if start {
+            let name: String = element.attr("w:name").unwrap_or("").chars().take(256).collect();
+            let full = self.moves_open.get(side).is_none_or(|open| open.len() >= MAX_OPEN_MOVES);
+            if name.is_empty() || full || (self.moves_seen.len() >= MAX_MOVES && !self.moves_seen.contains(&name)) {
+                return;
+            }
+            let extra = name.len();
+            if !remember(self.memory, &mut self.moves_seen, name.clone(), extra) && !self.moves_seen.contains(&name) {
+                return;
+            }
+            let held = units(id.len().saturating_add(name.len()).saturating_add(std::mem::size_of::<(String, String)>()));
+            if self.memory.hold(held)
+                && let Some(open) = self.moves_open.get_mut(side)
+            {
+                open.push((id, name));
+            }
+        } else if let Some(open) = self.moves_open.get_mut(side)
+            && let Some(at) = open.iter().rposition(|(open_id, _)| *open_id == id)
+        {
+            let (open_id, name) = open.remove(at);
+            self.memory.release(units(open_id.len().saturating_add(name.len()).saturating_add(std::mem::size_of::<(String, String)>())));
         }
     }
 
@@ -1041,18 +1397,32 @@ impl Scanner<'_> {
             match element.name.as_str() {
                 "w:p" => {
                     let ordinal = self.paragraph(ctx, story, element, depth);
-                    out.last = Some(Last::Para(ordinal));
+                    out.made(Last::Para(ordinal));
                 }
                 "w:tbl" => {
                     if depth / 4 >= MAX_TABLE_DEPTH {
-                        out.last = Some(Last::Para(None));
+                        out.made(Last::Para(None));
                     } else {
                         self.table(ctx, story, element, out, depth);
                     }
                 }
                 "w:sdt" => {
                     if let Some(content) = element.child("w:sdtContent") {
-                        self.blocks(ctx, story, content, out, depth + 1);
+                        let mut inner = Out::default();
+                        self.blocks(ctx, story, content, &mut inner, depth + 1);
+                        // The reader marks a block control's start at the start of its first
+                        // paragraph and its end at the end of its last (a table at either end carries
+                        // the control instead, and a table of contents' control is the TOC's).
+                        if inner.first.is_some() && !is_toc_control(element.child("w:sdtPr")) {
+                            self.mark_control(ctx, inner.first, true);
+                            self.mark_control(ctx, inner.last, false);
+                        }
+                        if let Some(first) = inner.first {
+                            out.first.get_or_insert(first);
+                        }
+                        if inner.last.is_some() {
+                            out.last = inner.last;
+                        }
                     }
                 }
                 "w:customXml" | "w:smartTag" | "w:ins" | "w:moveTo" => self.blocks(ctx, story, element, out, depth + 1),
@@ -1061,9 +1431,10 @@ impl Scanner<'_> {
                         self.blocks(ctx, story, branch, out, depth + 1);
                     }
                 }
+                "w:moveFromRangeStart" | "w:moveFromRangeEnd" | "w:moveToRangeStart" | "w:moveToRangeEnd" => self.move_range(element),
                 // The guard registers what the marker opens or closes, as the reader's `marker` does,
                 // then charges the unit waiting for the next paragraph.
-                "w:bookmarkStart" | "w:bookmarkEnd" | "w:commentRangeStart" | "w:commentRangeEnd"
+                "w:bookmarkStart" | "w:bookmarkEnd" | "w:commentRangeStart" | "w:commentRangeEnd" | "w:permStart" | "w:permEnd"
                     if self.marker(element) && self.memory.hold(vector_slot::<Unit>()) =>
                 {
                     story.pending.push(Unit { ch: OBJ, loc: Loc::Outside { at_end: false } });
@@ -1078,10 +1449,12 @@ impl Scanner<'_> {
         let mut rows = Vec::new();
         collect(table, "w:tr", &mut rows, 0);
         let mut any_row = false;
+        let mut last_row_end = None;
         for row in rows.into_iter().take(MAX_ROWS) {
             let mut cells = Vec::new();
             collect(row, "w:tc", &mut cells, 0);
             let mut read = 0usize;
+            let mut row_end = None;
             for cell in cells.into_iter().take(MAX_COLS) {
                 // A legacy horizontal merge (the last `w:hMerge` says) continues the cell before it:
                 // the reader reads nothing of it.
@@ -1095,12 +1468,22 @@ impl Scanner<'_> {
                 let mut cell_out = Out::default();
                 self.blocks(ctx, story, cell, &mut cell_out, depth + 4);
                 self.flush(ctx, story, &cell_out);
+                // The table's last cell's last paragraph, one table level further down if a table.
+                row_end = Some(match cell_out.last {
+                    Some(Last::Para(ordinal)) => (ordinal, 1),
+                    Some(Last::Table { ordinal, levels }) => (ordinal, levels.saturating_add(1)),
+                    None => (None, 1),
+                });
                 read += 1;
             }
-            any_row |= read > 0;
+            if read > 0 {
+                any_row = true;
+                last_row_end = row_end;
+            }
         }
         if any_row {
-            out.last = Some(Last::Table);
+            let (ordinal, levels) = last_row_end.unwrap_or((None, 1));
+            out.made(Last::Table { ordinal, levels });
         }
     }
 
@@ -1118,6 +1501,17 @@ impl Scanner<'_> {
                 true
             }
             "w:bookmarkEnd" => self.bookmarks.contains(&id),
+            "w:permStart" => {
+                // The id is known whatever the reader makes of the mark: a mark with neither a group
+                // nor an editor is nothing, its end still is a mark.
+                if self.perms.len() >= MAX_PERMS {
+                    return false;
+                }
+                remember(self.memory, &mut self.perms, id, extra);
+                let named = |name: &str| element.attr(name).filter(|value| value.len() <= 256).is_some_and(|value| !value.is_empty());
+                named("w:edGrp") || named("w:ed")
+            }
+            "w:permEnd" => self.perms.contains(&id),
             "w:commentRangeStart" => self.comments.contains(&id),
             "w:commentRangeEnd" => {
                 if !self.comments.contains(&id) {
@@ -1137,6 +1531,7 @@ impl Scanner<'_> {
         let pending = std::mem::take(&mut story.pending);
         self.memory.release(vector_slot::<Unit>().saturating_mul(units(pending.len())));
         b.units(pending);
+        story.rev = Revs::default();
         let props = paragraph.child("w:pPr");
         if let Some(section) = props.and_then(|props| props.child("w:sectPr")) {
             self.section(ctx, section);
@@ -1150,7 +1545,7 @@ impl Scanner<'_> {
         // The reader's `spill_fields`: an open field cannot keep buffering past the paragraph; the
         // rest of its result flows into the paragraph, still inside the field.
         for field in story.fields.iter_mut() {
-            if field.spilled {
+            if field.spilled || field.range {
                 continue;
             }
             field.spilled = true;
@@ -1177,7 +1572,8 @@ impl Scanner<'_> {
         match keep {
             Some((ordinal, raw_name, ppr)) => {
                 let (memory, held) = (b.memory, b.held);
-                let scanned = finish(paragraph, raw_name, ppr, b);
+                let mut scanned = finish(paragraph, raw_name, ppr, b);
+                scanned.prefix_bound = !ctx.rebound.contains(&paragraph.start.start);
                 // What the kept paragraph holds replaces what growing it was charged.
                 memory.release(held);
                 if memory.hold(paragraph_bytes(&scanned))
@@ -1235,40 +1631,59 @@ impl Scanner<'_> {
             }
             "w:hyperlink" | "w:ins" | "w:moveTo" | "w:del" | "w:moveFrom" | "w:smartTag" | "w:customXml" | "w:dir" | "w:bdo" => {
                 let inner = self.wrap(b, element, wrapper, lock);
+                let outside = story.rev.clone();
+                match element.name.as_str() {
+                    "w:ins" => story.rev.ins = Some(Revs::key(element, "insert", None)),
+                    "w:moveTo" => story.rev.ins = Some(Revs::key(element, "insert", self.open_move(1))),
+                    "w:del" => story.rev.del = Some(Revs::key(element, "delete", None)),
+                    "w:moveFrom" => story.rev.del = Some(Revs::key(element, "delete", self.open_move(0))),
+                    _ => {}
+                }
                 for child in element.els() {
                     self.inline(ctx, story, b, child, inner, depth + 1, lock);
                 }
+                story.rev = outside;
             }
             "w:sdt" => {
                 // The reader reads the first `w:sdtContent` only; the rest is copied whole.
                 let content = element.child("w:sdtContent");
                 let outer = self.wrap(b, element, wrapper, lock);
+                // The reader marks where the control starts and ends, straight in the paragraph; a
+                // control without content makes nothing. The start mark stands at the control's
+                // properties, so typing before the control goes before them; typing before the end
+                // mark would be inside the control at its end, which the writer cannot place.
+                let mut properties = None;
                 for child in element.els() {
                     if content.is_some_and(|content| std::ptr::eq(content, child)) {
+                        let start = match (lock, properties) {
+                            (None, Some(node)) => Loc::Marker { node },
+                            _ => locked(properties, lock, None),
+                        };
+                        push(story, b, object(start));
                         let inner = self.wrap(b, child, outer, lock);
                         for inside in child.els() {
                             self.inline(ctx, story, b, inside, inner, depth + 1, lock);
                         }
                     } else if lock.is_none() {
-                        b.other(child, outer);
+                        let node = b.other(child, outer);
+                        properties = properties.or(node);
                     }
+                }
+                if content.is_some() {
+                    push(story, b, object(if lock.is_none() { Loc::ControlEnd } else { locked(None, lock, None) }));
                 }
             }
             "w:fldSimple" => {
                 let node = node_of(b);
                 let inner = Some(lock.unwrap_or(Lock(node)));
-                self.begin_field(story, node);
-                // As the reader: the innermost open field's result begins (an ignored begin leaves
-                // the field around it in its result).
-                if let Some(field) = story.fields.last_mut() {
-                    field.result = true;
-                }
+                self.begin_field(story, node, element.attr("w:instr").unwrap_or(""));
+                self.separate_field(story, b, node, inner);
                 for child in element.els() {
                     self.inline(ctx, story, b, child, wrapper, depth + 1, inner);
                 }
                 self.end_field(story, b, None, inner);
             }
-            "w:bookmarkStart" | "w:bookmarkEnd" | "w:commentRangeStart" | "w:commentRangeEnd" => {
+            "w:bookmarkStart" | "w:bookmarkEnd" | "w:commentRangeStart" | "w:commentRangeEnd" | "w:permStart" | "w:permEnd" => {
                 let node = node_of(b);
                 if self.marker(element) {
                     let loc = match (lock, node) {
@@ -1278,6 +1693,10 @@ impl Scanner<'_> {
                     // Markers go straight into the paragraph, never into a field's result.
                     push(story, b, object(loc));
                 }
+            }
+            "w:moveFromRangeStart" | "w:moveFromRangeEnd" | "w:moveToRangeStart" | "w:moveToRangeEnd" => {
+                node_of(b);
+                self.move_range(element);
             }
             "m:oMath" => {
                 let node = node_of(b);
@@ -1348,6 +1767,10 @@ impl Scanner<'_> {
             }
             "w:t" | "w:delText" => self.text(ctx, story, b, element, node, lock),
             "w:tab" | "w:ptab" => self.single(story, b, element, node, lock, '\t'),
+            // A break inside a field's instruction is part of the code, not content (the reader's).
+            "w:br" | "w:cr" if story.fields.iter().any(|field| !field.result) => {
+                other(b);
+            }
             "w:br" => {
                 let ch = match element.attr("w:type") {
                     Some("page") => '\u{000C}',
@@ -1357,6 +1780,17 @@ impl Scanner<'_> {
                 self.single(story, b, element, node, lock, ch);
             }
             "w:cr" => self.single(story, b, element, node, lock, '\n'),
+            "w:instrText" | "w:delInstrText" => {
+                other(b);
+                // The code collects in the innermost field while it has not separated.
+                if let Some(field) = story.fields.last_mut()
+                    && !field.result
+                    && !field.spilled
+                    && field.instr.len() < INSTR_HEAD
+                {
+                    field.push_instr(&raw_text(ctx, element));
+                }
+            }
             "w:noBreakHyphen" => self.single(story, b, element, node, lock, '\u{2011}'),
             "w:softHyphen" => self.single(story, b, element, node, lock, '\u{00AD}'),
             "w:sym" => {
@@ -1375,27 +1809,25 @@ impl Scanner<'_> {
             "w:fldChar" => {
                 other(b);
                 match element.attr("w:fldCharType") {
-                    Some("begin") => self.begin_field(story, lock.map_or(node, |Lock(at)| at)),
-                    Some("separate") => {
-                        if story.ignored_begins == 0
-                            && let Some(field) = story.fields.last_mut()
-                        {
-                            field.result = true;
-                        }
-                    }
+                    Some("begin") => self.begin_field(story, lock.map_or(node, |Lock(at)| at), ""),
+                    Some("separate") => self.separate_field(story, b, node, lock),
                     Some("end") => self.end_field(story, b, node, lock),
                     _ => {}
                 }
             }
             "w:drawing" | "w:pict" | "w:object" => {
                 let child = other(b);
-                let made = if element.name == "w:drawing" { self.drawing(ctx, story.depth, element) } else { self.vml(ctx, story.depth, element) };
+                let made = if element.name == "w:drawing" {
+                    self.drawing(ctx, story.depth, element)
+                } else {
+                    self.vml(ctx, story.depth, story.in_header, element)
+                };
                 if made {
                     let loc = whole(node, lock);
                     if let (Loc::Atomic { first, .. }, Some(child)) = (&loc, child) {
                         b.makers.insert(*first, child);
                     }
-                    emit(story, b, object(loc));
+                    emit_frame(story, b, object(loc));
                 }
             }
             "w:footnoteReference" | "w:endnoteReference" => {
@@ -1423,14 +1855,7 @@ impl Scanner<'_> {
             }
             "w:ruby" => {
                 other(b);
-                let inner = Some(lock.unwrap_or(Lock(node)));
-                if let Some(base) = element.child("w:rubyBase") {
-                    for run in base.els().filter(|child| child.name == "w:r") {
-                        for child in run.els() {
-                            self.run_child(ctx, story, b, child, node, inner, note, depth + 1);
-                        }
-                    }
-                }
+                self.ruby(ctx, story, b, element, node, lock);
             }
             "mc:AlternateContent" => {
                 other(b);
@@ -1526,12 +1951,50 @@ impl Scanner<'_> {
         b.memory.release(transient);
     }
 
-    fn begin_field(&mut self, story: &mut Story, first: Option<usize>) {
+    fn begin_field(&mut self, story: &mut Story, first: Option<usize>, instr: &str) {
         if story.fields.len() >= MAX_FIELD_DEPTH || story.ignored_begins > 0 {
             story.ignored_begins += 1;
             return;
         }
-        story.fields.push(Field { result: false, spilled: false, buf: Vec::new(), items: 0, charged: 0, first });
+        let mut field = Field {
+            result: false,
+            spilled: false,
+            buf: Vec::new(),
+            items: 0,
+            charged: 0,
+            first,
+            instr: String::new(),
+            range: false,
+            begin: story.rev.clone(),
+            seen: Vec::new(),
+            has_frame: false,
+        };
+        field.push_instr(instr);
+        story.fields.push(field);
+    }
+
+    /// Whether the field below the innermost one is still collecting its code (a field nested in
+    /// another's code contributes text to that code, never content).
+    fn parent_in_instr(story: &Story) -> bool {
+        let count = story.fields.len();
+        count >= 2 && story.fields.get(count - 2).is_some_and(|parent| !parent.spilled && !parent.range && !parent.result)
+    }
+
+    /// The reader's `separate_field`: the code is complete; a range field starts its result with a mark.
+    fn separate_field(&mut self, story: &mut Story, b: &mut Builder<'_>, node: Option<usize>, lock: Option<Lock>) {
+        if story.ignored_begins > 0 {
+            return;
+        }
+        let nested_in_instr = Self::parent_in_instr(story);
+        let Some(field) = story.fields.last_mut() else { return };
+        if field.range {
+            return;
+        }
+        field.result = true;
+        if !field.spilled && !nested_in_instr && is_range_instr(&field.instr) {
+            field.range = true;
+            emit(story, b, object(locked(node, lock, None)));
+        }
     }
 
     fn end_field(&mut self, story: &mut Story, b: &mut Builder<'_>, last: Option<usize>, lock: Option<Lock>) {
@@ -1539,13 +2002,47 @@ impl Scanner<'_> {
             story.ignored_begins -= 1;
             return;
         }
+        let nested_in_instr = Self::parent_in_instr(story);
         let Some(field) = story.fields.pop() else { return };
         self.memory.release(field.charged);
+        if field.range {
+            emit(story, b, object(locked(last, lock, None)));
+            return;
+        }
         if field.spilled {
             return;
         }
+        // A range field with no result yet.
+        if !field.result && !nested_in_instr && is_range_instr(&field.instr) {
+            emit(story, b, object(locked(last, lock, None)));
+            emit(story, b, object(locked(last, lock, None)));
+            return;
+        }
+        // A result holding a drawing, or a tracked change the field is not wrapped in, keeps the field
+        // a range around its result: its content stays in the paragraph, locked.
+        let differs = field.seen.iter().any(|revs| *revs != field.begin);
+        if !nested_in_instr && (differs || field.has_frame) {
+            let Field { begin, buf, first, has_frame, seen, .. } = field;
+            let outside = std::mem::replace(&mut story.rev, begin);
+            emit(story, b, object(locked(first.or(last), lock, None)));
+            let begun = std::mem::replace(&mut story.rev, outside);
+            // Each item again where the reader puts it, in the field around this one if there is one.
+            // A drawing among them is still one in the field around this one.
+            for unit in buf {
+                emit_in(story, b, vec![locked_unit(unit)], has_frame, &seen);
+            }
+            let outside = std::mem::replace(&mut story.rev, begun);
+            emit(story, b, object(locked(last, lock, None)));
+            story.rev = outside;
+            return;
+        }
         // Inside another field's instruction: it becomes part of that text, not an object.
-        if story.fields.last().is_some_and(|parent| !parent.spilled && !parent.result) {
+        if let Some(parent) = story.fields.last_mut()
+            && !parent.spilled
+            && !parent.result
+        {
+            let text: String = field.buf.iter().map(|unit| unit.ch).filter(|ch| *ch != OBJ).collect();
+            parent.push_instr(&text);
             return;
         }
         let loc = match (lock, field.first, last) {
@@ -1556,7 +2053,9 @@ impl Scanner<'_> {
             (Some(Lock(at)), _, _) => Loc::Locked { node: at, child: None },
             (None, first, last) => Loc::Locked { node: last.or(first), child: None },
         };
+        let outside = std::mem::replace(&mut story.rev, field.begin.clone());
         emit(story, b, object(loc));
+        story.rev = outside;
     }
 
     fn media_exists(&self, ctx: &Ctx<'_>, id: &str) -> bool {
@@ -1580,19 +2079,24 @@ impl Scanner<'_> {
         true
     }
 
-    /// The reader's `read_vml`.
-    fn vml(&mut self, ctx: &Ctx<'_>, depth: usize, pict: &PEl) -> bool {
+    /// The reader's `read_vml`: whether it makes an object. `in_header`: the story is a header's or
+    /// footer's own, where a watermark is a setting.
+    fn vml(&mut self, ctx: &Ctx<'_>, depth: usize, in_header: bool, pict: &PEl) -> bool {
         let Some(shape) = pict.els().find(|element| element.name.starts_with("v:") && element.local() != "shapetype") else { return false };
+        if in_header && vml_is_watermark(&shallow(shape, 1)) {
+            return false;
+        }
         if let Some(image) = shape.find("v:imagedata") {
             return image.attr("r:id").or_else(|| image.attr("r:pict")).is_some_and(|id| self.media_exists(ctx, id));
         }
-        if let Some(content) = shape.find("w:txbxContent")
+        if let Some(content) = vml_text_box(shape, 0)
             && depth < MAX_STORY_DEPTH
         {
             self.text_box(ctx, content, depth);
             return true;
         }
-        false
+        // A box too deep to be read falls to what the shape draws, as the reader's.
+        vml_drawn_shape_made(&shallow(pict, 2), &shallow(shape, 1))
     }
 
     /// The reader's `read_textbox`: a story one level deeper, then the part it makes.
@@ -1655,6 +2159,7 @@ fn finish(paragraph: &PEl, raw_name: String, ppr: Option<Props>, mut b: Builder<
         nodes: std::mem::take(&mut b.nodes),
         wrappers: std::mem::take(&mut b.wrappers),
         units: std::mem::take(&mut b.units),
+        prefix_bound: true,
     }
 }
 
@@ -1680,7 +2185,7 @@ fn settle_objects(b: &mut Builder<'_>) {
         let (first, last) = match unit.loc {
             Loc::Text { node, .. } | Loc::Single { node, .. } | Loc::Marker { node } | Loc::Locked { node: Some(node), .. } => (node, node),
             Loc::Atomic { first, last } => (first, last),
-            Loc::Locked { node: None, .. } | Loc::Outside { .. } => continue,
+            Loc::Locked { node: None, .. } | Loc::Outside { .. } | Loc::ControlEnd => continue,
         };
         if first > last || last >= count {
             continue;
@@ -1758,7 +2263,7 @@ mod tests {
     use super::*;
     use crate::package::{ReadLimits, zip_entries};
 
-    const W: &str = r#"xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships" xmlns:wp="http://schemas.openxmlformats.org/drawingml/2006/wordprocessingDrawing" xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main" xmlns:pic="http://schemas.openxmlformats.org/drawingml/2006/picture" xmlns:wps="http://schemas.microsoft.com/office/word/2010/wordprocessingShape" xmlns:mc="http://schemas.openxmlformats.org/markup-compatibility/2006" xmlns:v="urn:schemas-microsoft-com:vml" xmlns:m="http://schemas.openxmlformats.org/officeDocument/2006/math""#;
+    const W: &str = r#"xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships" xmlns:wp="http://schemas.openxmlformats.org/drawingml/2006/wordprocessingDrawing" xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main" xmlns:pic="http://schemas.openxmlformats.org/drawingml/2006/picture" xmlns:wps="http://schemas.microsoft.com/office/word/2010/wordprocessingShape" xmlns:w14="http://schemas.microsoft.com/office/word/2010/wordml" xmlns:mc="http://schemas.openxmlformats.org/markup-compatibility/2006" xmlns:v="urn:schemas-microsoft-com:vml" xmlns:m="http://schemas.openxmlformats.org/officeDocument/2006/math""#;
     const REL: &str = "http://schemas.openxmlformats.org/officeDocument/2006/relationships";
     const PNG: &[u8] = &[0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A];
 
@@ -2185,7 +2690,11 @@ mod tests {
                 Loc::Marker { node } => {
                     assert!(unit.ch == OBJ && markers.insert(node), "one unit for each marker");
                     let Node::Other { name, span, .. } = &paragraph.nodes[node] else { panic!("a marker that is a run") };
-                    assert!(matches!(name.as_str(), "w:bookmarkStart" | "w:bookmarkEnd" | "w:commentRangeStart" | "w:commentRangeEnd"));
+                    // A content control's start mark stands at the control's properties.
+                    assert!(matches!(
+                        name.as_str(),
+                        "w:bookmarkStart" | "w:bookmarkEnd" | "w:commentRangeStart" | "w:commentRangeEnd" | "w:permStart" | "w:permEnd" | "w:sdtPr"
+                    ));
                     assert_eq!(local(&tag_name(bytes, span)), local(name));
                 }
                 Loc::Locked { node, child } => {
@@ -2198,6 +2707,7 @@ mod tests {
                         assert!(child.is_none());
                     }
                 }
+                Loc::ControlEnd => assert_eq!(unit.ch, OBJ),
                 Loc::Outside { at_end } => {
                     assert_eq!(unit.ch, OBJ);
                     assert!(if at_end { index >= paragraph.units.len() - outside_end } else { index < outside_start }, "outside units at the ends");
@@ -2429,7 +2939,8 @@ mod tests {
         let scanned = scans_as_read(&bytes);
         // Each text names its paragraph, so an index one off would have failed above; these pin the
         // numbering the two agree on.
-        let at = |part: &str, index: u32| scanned[part].paragraphs[&index].text();
+        let at =
+            |part: &str, index: u32| scanned[part].paragraphs.get(&index).unwrap_or_else(|| panic!("no paragraph {part} #{index} was kept")).text();
         assert_eq!(at("word/document.xml", 0), "Body first");
         assert_eq!(at("word/document.xml", 3), "Inner cell");
         assert_eq!(at("word/document.xml", 9), "Choice one");
@@ -2441,12 +2952,13 @@ mod tests {
         assert_eq!(at("word/endnotes.xml", 1), "End one");
         assert_eq!(at("word/comments.xml", 1), "Comment in a cell");
         assert!(!scanned["word/comments.xml"].paragraphs.contains_key(&3), "a repeated comment id is skipped");
-        assert_eq!(at("word/header1.xml", 1), "Header two");
+        // A block control's marks stand at the start of its first paragraph and the end of its last.
+        assert_eq!(at("word/header1.xml", 1), format!("{OBJ}Header two{OBJ}"));
         assert_eq!(at("word/footer1.xml", 0), "Footer one");
         assert_eq!(at("word/header2.xml", 0), "First page header");
     }
 
-    /// One letter per unit: Text, Single, Atomic, Marker, Locked, Outside.
+    /// One letter per unit: Text, Single, Atomic, Marker, Locked, Outside, a control's End mark.
     fn kinds(paragraph: &ScannedPara) -> String {
         paragraph
             .units
@@ -2458,6 +2970,7 @@ mod tests {
                 Loc::Marker { .. } => 'M',
                 Loc::Locked { .. } => 'L',
                 Loc::Outside { .. } => 'O',
+                Loc::ControlEnd => 'E',
             })
             .collect()
     }
@@ -2480,10 +2993,10 @@ mod tests {
         let paragraph = body_paragraph(&scanned, 0);
         // a; five one-character children; b, a space for the carriage return, c (control characters,
         // U+FFFC and the unknown reference dropped); CDATA and a w:t holding an element, copied
-        // whole; the page number; the bidi text; the move; the ruby base; an equation; the two of
-        // one paragraph of equations, which share their node and so are locked; the second w:pPr
-        // is content, not properties.
-        assert_eq!(kinds(paragraph), ["T", "SSSSS", "TTT", "LL", "LL", "L", "TTTT", "T", "TTTTT", "TTTTT", "LLLL", "A", "LL"].concat());
+        // whole; the page number; the bidi text; the move; the ruby (base and ruby text, one object);
+        // an equation; the two of one paragraph of equations, which share their node and so are
+        // locked; the second w:pPr is content, not properties.
+        assert_eq!(kinds(paragraph), ["T", "SSSSS", "TTT", "LL", "LL", "L", "TTTT", "T", "TTTTT", "TTTTT", "L", "A", "LL"].concat());
         let kinds: Vec<WrapperKind> = paragraph.wrappers.iter().map(|wrapper| wrapper.kind).collect();
         assert_eq!(kinds, vec![WrapperKind::Other, WrapperKind::Other, WrapperKind::Deleted, WrapperKind::Inserted]);
         let Node::Run(first) = &paragraph.nodes[0] else { panic!("a run") };
@@ -2513,14 +3026,16 @@ mod tests {
         let scanned = scans_as_read(&bytes);
         let first = body_paragraph(&scanned, 0);
         assert_eq!(kinds(first), format!("{}L{}", "T".repeat(8), "L".repeat(9)));
-        assert_eq!(objects(first), vec![&Loc::Locked { node: Some(1), child: None }]);
+        // A table of contents is a range field: its result flows into the paragraphs between a mark where
+        // the result begins (the run of the `separate`) and a mark where it ends, and all of it is locked.
+        assert_eq!(objects(first), vec![&Loc::Locked { node: Some(3), child: None }]);
         assert_eq!(first.editable(), vec![0..8]);
         // The bookmark, the entry, its tab and the page number field inside the result: all locked.
         let second = body_paragraph(&scanned, 1);
         assert_eq!(kinds(second), format!("L{}LL", "L".repeat(10)));
         assert!(second.editable().is_empty());
         assert!(second.nodes.iter().all(|node| !matches!(node, Node::Run(run) if run.children.iter().any(|child| matches!(child.kind, ChildKind::Text { ref chars, .. } if chars.iter().any(|raw| raw.unit.is_some()))))));
-        assert_eq!(kinds(body_paragraph(&scanned, 2)), "TTTTT");
+        assert_eq!(kinds(body_paragraph(&scanned, 2)), "LTTTTT", "the field's end mark, then the text after it");
         // A field in another's instruction is part of that text; an end or separate with no field
         // open is nothing.
         assert_eq!(kinds(body_paragraph(&scanned, 3)), "TA");
@@ -2566,7 +3081,10 @@ mod tests {
                 &Loc::Locked { node: Some(1), child: None },
                 &Loc::Atomic { first: 2, last: 2 },
                 &Loc::Locked { node: Some(3), child: None },
+                // A field whose result holds a tracked change the field is not in stays in the paragraph
+                // as a range: a mark where it began and one where it ended.
                 &Loc::Locked { node: Some(5), child: None },
+                &Loc::Locked { node: Some(8), child: None },
                 &Loc::Locked { node: Some(10), child: None },
                 &Loc::Locked { node: Some(9), child: None },
             ]
@@ -2657,10 +3175,15 @@ mod tests {
             zip_entries(&entries).unwrap()
         };
         let scanned = scans_as_read(&bytes);
-        // The anchored picture, the shape without a text box, the VML picture.
+        // The anchored picture, the shape without a text box, the VML picture, the VML line.
         assert_eq!(
             objects(body_paragraph(&scanned, 0)),
-            vec![&Loc::Atomic { first: 2, last: 2 }, &Loc::Atomic { first: 3, last: 3 }, &Loc::Atomic { first: 4, last: 4 }]
+            vec![
+                &Loc::Atomic { first: 2, last: 2 },
+                &Loc::Atomic { first: 3, last: 3 },
+                &Loc::Atomic { first: 4, last: 4 },
+                &Loc::Atomic { first: 6, last: 6 }
+            ]
         );
         let texts: Vec<String> = scanned["word/document.xml"].paragraphs.values().map(ScannedPara::text).collect();
         // Text boxes are read MAX_STORY_DEPTH deep: a deeper shape is an object with no story, a
@@ -2670,6 +3193,75 @@ mod tests {
             let read = texts.iter().any(|text| text.starts_with(&format!("level {level}")));
             assert_eq!(read, deep <= MAX_STORY_DEPTH, "level {level}");
         }
+    }
+
+    /// The marks a content control makes (the reader's `ControlStart` and `ControlEnd`): inline, in the
+    /// paragraph; block, at the start of its first paragraph and the end of its last; none for a
+    /// control with no content, one around a table (the table carries it), or a table of contents.
+    #[test]
+    fn marks_content_controls_as_the_reader_does() {
+        let toc = r#"<w:sdt><w:sdtPr><w:docPartObj><w:docPartGallery w:val="Table of Contents"/></w:docPartObj></w:sdtPr><w:sdtContent><w:p><w:r><w:t>toc</w:t></w:r></w:p></w:sdtContent></w:sdt>"#;
+        let body = [
+            // 0: inline, with properties, content, an empty control and a content-less one.
+            r#"<w:p><w:r><w:t>a</w:t></w:r><w:sdt><w:sdtPr><w:tag w:val="t"/></w:sdtPr><w:sdtContent><w:r><w:t>b</w:t></w:r></w:sdtContent></w:sdt><w:sdt><w:sdtContent/></w:sdt><w:sdt><w:sdtPr/></w:sdt></w:p>"#,
+            // 1, 2: a block control around two paragraphs.
+            r#"<w:sdt><w:sdtContent><w:p><w:r><w:t>x</w:t></w:r></w:p><w:p><w:r><w:t>y</w:t></w:r></w:p></w:sdtContent></w:sdt>"#,
+            toc,
+            // 4: after a block control that holds a table only, which carries the control.
+            r#"<w:sdt><w:sdtContent><w:tbl><w:tr><w:tc><w:p><w:r><w:t>cell</w:t></w:r></w:p></w:tc></w:tr></w:tbl></w:sdtContent></w:sdt><w:p><w:r><w:t>z</w:t></w:r></w:p>"#,
+        ]
+        .concat();
+        let scanned = scans_as_read(&package(&body, &[], &[]));
+        // a, the first control (its start mark at its properties, b, its end), the empty control (no
+        // properties to stand at, so locked), and nothing for the control with no content.
+        assert_eq!(kinds(body_paragraph(&scanned, 0)), "TMTELE");
+        assert_eq!(kinds(body_paragraph(&scanned, 1)), "OT");
+        assert_eq!(kinds(body_paragraph(&scanned, 2)), "TO");
+        assert_eq!(kinds(body_paragraph(&scanned, 3)), "TTT", "a table of contents' control is the TOC's");
+        assert_eq!(kinds(body_paragraph(&scanned, 4)), "TTTT");
+        assert_eq!(kinds(body_paragraph(&scanned, 5)), "T");
+    }
+
+    /// The reader's `read_ruby`: one object for a base and its ruby text, the base text alone without
+    /// ruby text, nothing without a base.
+    #[test]
+    fn reads_ruby_as_the_reader_does() {
+        let ruby = |base: &str, text: &str| {
+            format!(
+                r#"<w:r><w:ruby><w:rt><w:r><w:t>{text}</w:t></w:r></w:rt><w:rubyBase><w:r><w:t>{base}</w:t><w:tab/></w:r></w:rubyBase></w:ruby></w:r>"#
+            )
+        };
+        let body =
+            format!("<w:p>{}</w:p><w:p>{}</w:p><w:p>{}<w:r><w:t>after</w:t></w:r></w:p>", ruby("base", "top"), ruby("base", ""), ruby("", "top"));
+        let scanned = scans_as_read(&package(&body, &[], &[]));
+        assert_eq!(kinds(body_paragraph(&scanned, 0)), "L", "base and ruby text are one object");
+        assert_eq!(kinds(body_paragraph(&scanned, 1)), "LLLL", "the base text alone is locked text");
+        assert_eq!(kinds(body_paragraph(&scanned, 2)), "TTTTT", "no base text, no ruby");
+    }
+
+    /// 6C-48 I3: the paragraphs the part's prefix is rebound at, around or inside are not written with it.
+    #[test]
+    fn says_where_the_prefix_is_rebound() {
+        let main = "http://schemas.openxmlformats.org/wordprocessingml/2006/main";
+        let run = "<x:r><x:t>ab</x:t></x:r>";
+        let rebound = |paragraph: &str| {
+            let document = format!(r#"<w:document {W}><w:body>{paragraph}</w:body></w:document>"#);
+            scanned_flag(&document)
+        };
+        assert!(rebound(&format!(r#"<x:p xmlns:x="{main}">{run}</x:p>"#)), "another prefix, `w` untouched");
+        assert!(rebound(&format!(r#"<x:p xmlns:x="{main}" xmlns:w="{main}">{run}</x:p>"#)), "`w` bound again to WordprocessingML");
+        assert!(!rebound(&format!(r#"<x:p xmlns:x="{main}" xmlns:w="urn:other">{run}</x:p>"#)), "rebound on the paragraph");
+        assert!(!rebound(&format!(r#"<x:p xmlns:x="{main}"><x:hyperlink xmlns:w="urn:other">{run}</x:hyperlink></x:p>"#)), "rebound inside it");
+        assert!(!rebound(&format!(r#"<x:tbl xmlns:x="{main}" xmlns:w="urn:other"><x:tr><x:tc><x:p>{run}</x:p></x:tc></x:tr></x:tbl>"#)), "around it");
+    }
+
+    /// Whether the first paragraph of `document` is kept with the prefix bound to WordprocessingML.
+    fn scanned_flag(document: &str) -> bool {
+        let bytes = package_of(document.as_bytes().to_vec(), &[], &[]);
+        let pkg = Package::open_with(&bytes, &ReadLimits::default()).unwrap();
+        let wanted = BTreeMap::from([("word/document.xml".to_string(), BTreeSet::from([0u32]))]);
+        let scanned = scan_package(&pkg, &wanted, &mut budget()).unwrap();
+        scanned["word/document.xml"].paragraphs[&0].prefix_bound
     }
 
     #[test]

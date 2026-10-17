@@ -32,7 +32,7 @@ pub(crate) const MAX_FIELD_DEPTH: usize = 32;
 /// Deepest text-box-in-text-box nesting.
 pub(crate) const MAX_STORY_DEPTH: usize = 4;
 /// Longest field code we keep (Zotero's citation codes embed item data as JSON).
-const MAX_INSTR: usize = 2 * 1024 * 1024;
+pub(crate) const MAX_INSTR: usize = 2 * 1024 * 1024;
 /// Longest legacy form field definition (`w:ffData`) we keep.
 const MAX_FORM: usize = 64 * 1024;
 
@@ -96,7 +96,7 @@ fn enclosure(f: &FieldState) -> Option<wordcraft_doc::eq::Enclosure> {
 
 /// Fields kept as ranges: those whose result another program writes, with formatting and often
 /// several paragraphs (TOCs and citation managers' `ADDIN` fields).
-fn is_range_instr(instr: &str) -> bool {
+pub(crate) fn is_range_instr(instr: &str) -> bool {
     super::is_toc(instr) || instr.trim_start().get(..5).is_some_and(|k| k.eq_ignore_ascii_case("ADDIN"))
 }
 
@@ -1411,26 +1411,7 @@ impl Reader<'_> {
             let alt = shape.attr("alt").or_else(|| img.attr("o:title")).unwrap_or("").to_string();
             return Some(InlineObject::Image { media, w, h, alt, float, crop: [0.0; 4], ole: None });
         }
-        // The shapetype the shape is drawn from (its `type`, ECMA-376 Part 4 VML), when written in
-        // the same picture: what the shape leaves out, it takes from there.
-        let type_id = shape.attr("type").map(|t| t.trim().trim_start_matches('#'));
-        let shapetype = type_id.and_then(|id| pict.els().find(|e| e.name == "v:shapetype" && e.attr("id") == Some(id)));
-        let attr = |name: &str| shape.attr(name).or_else(|| shapetype.and_then(|t| t.attr(name)));
-        let on = |name: &str| attr(name).is_none_or(|v| !matches!(v, "f" | "false" | "0"));
-        let stroke = on("stroked").then(|| attr("strokecolor").map_or(Some(Rgb::BLACK), vml_color)).flatten();
-        let stroke_width = attr("strokeweight").and_then(|v| measure(v, 1.0)).unwrap_or(0.75).clamp(0.0, 100.0);
-        let fill = on("filled").then(|| attr("fillcolor").map_or(Some(Rgb::WHITE), vml_color)).flatten();
-        let kind = match shape.local() {
-            "line" => Some(ShapeKind::Line),
-            "rect" => Some(ShapeKind::Rectangle),
-            "roundrect" => Some(ShapeKind::RoundedRectangle),
-            "oval" => Some(ShapeKind::Ellipse),
-            // A preset, unless the shape's own path replaces its shapetype's geometry.
-            "shape" if shape.attr("path").is_none() && shape.child("v:path").and_then(|p| p.attr("v")).is_none() => {
-                vml_spt(shape, shapetype, type_id).and_then(vml_preset_kind)
-            }
-            _ => None,
-        };
+        let VmlLook { kind, stroke, stroke_width, fill } = vml_look(pict, shape);
         if let Some((tb, t)) = vml_textbox(shape, 0)
             && sc.story_depth < MAX_STORY_DEPTH
         {
@@ -1770,6 +1751,61 @@ fn wrap_polygon(e: &El) -> Option<wordcraft_doc::wrap::WrapPolygon> {
     wordcraft_doc::wrap::WrapPolygon::new(edited, pts)
 }
 
+/// What a VML shape draws: its geometry, line and fill, from its own attributes and those of the
+/// shapetype it is drawn from. Shared with the writer that keeps the source package, which needs to
+/// know whether a shape makes an object.
+struct VmlLook {
+    kind: Option<ShapeKind>,
+    stroke: Option<Rgb>,
+    stroke_width: f32,
+    fill: Option<Rgb>,
+}
+
+fn vml_look(pict: &El, shape: &El) -> VmlLook {
+    // The shapetype the shape is drawn from (its `type`, ECMA-376 Part 4 VML), when written in
+    // the same picture: what the shape leaves out, it takes from there.
+    let type_id = shape.attr("type").map(|t| t.trim().trim_start_matches('#'));
+    let shapetype = type_id.and_then(|id| pict.els().find(|e| e.name == "v:shapetype" && e.attr("id") == Some(id)));
+    let attr = |name: &str| shape.attr(name).or_else(|| shapetype.and_then(|t| t.attr(name)));
+    let on = |name: &str| attr(name).is_none_or(|v| !matches!(v, "f" | "false" | "0"));
+    let stroke = on("stroked").then(|| attr("strokecolor").map_or(Some(Rgb::BLACK), vml_color)).flatten();
+    let stroke_width = attr("strokeweight").and_then(|v| measure(v, 1.0)).unwrap_or(0.75).clamp(0.0, 100.0);
+    let fill = on("filled").then(|| attr("fillcolor").map_or(Some(Rgb::WHITE), vml_color)).flatten();
+    let kind = match shape.local() {
+        "line" => Some(ShapeKind::Line),
+        "rect" => Some(ShapeKind::Rectangle),
+        "roundrect" => Some(ShapeKind::RoundedRectangle),
+        "oval" => Some(ShapeKind::Ellipse),
+        // A preset, unless the shape's own path replaces its shapetype's geometry.
+        "shape" if shape.attr("path").is_none() && shape.child("v:path").and_then(|p| p.attr("v")).is_none() => {
+            vml_spt(shape, shapetype, type_id).and_then(vml_preset_kind)
+        }
+        _ => None,
+    };
+    VmlLook { kind, stroke, stroke_width, fill }
+}
+
+/// Whether a VML shape with no picture and no text box makes an object: a freeform (its path read
+/// and something to draw) or a drawn kind with a line (or, but a line, a fill). The tail of
+/// `read_vml`, for the writer that keeps the source package.
+pub(crate) fn vml_drawn_shape_made(pict: &El, shape: &El) -> bool {
+    let VmlLook { kind, stroke, fill, .. } = vml_look(pict, shape);
+    let style = shape.attr("style").unwrap_or("");
+    let len = |k: &str| vml_style(style, k).and_then(|v| measure(v, 1.0)).unwrap_or(0.0).clamp(0.0, crate::units::MAX_LEN_PT);
+    if shape.local() == "shape"
+        && shape.child("v:textpath").is_none()
+        && let Some(path) = shape.attr("path")
+        && let Some(vp) = super::freeform::vml_path(path, shape.attr("coordsize"), shape.attr("coordorigin"), len("width"), len("height"))
+    {
+        let opacity = |el: &str| shape.child(el).and_then(|e| e.attr("opacity")).and_then(vml_fraction).unwrap_or(1.0);
+        let fill = fill.filter(|_| !vp.no_fill && opacity("v:fill") > 0.0);
+        let stroke = stroke.filter(|_| !vp.no_stroke);
+        return stroke.is_some() || fill.is_some();
+    }
+    let Some(kind) = kind else { return false };
+    !(stroke.is_none() && (fill.is_none() || kind == ShapeKind::Line))
+}
+
 /// A VML shape's preset type (`o:spt`): its own, its shapetype's, or the number in Word's
 /// shapetype id `_x0000_tNN` (`type_id`), Word writing each shapetype only at its first use.
 fn vml_spt(shape: &El, shapetype: Option<&El>, type_id: Option<&str>) -> Option<u32> {
@@ -1868,6 +1904,11 @@ fn vml_float(shape: &El, style: &str) -> Float {
 /// with the shape's `fillcolor`, semitransparent when its `v:fill` has an `opacity` below 1, and
 /// diagonal when the shape is turned. Only Word's watermark shape counts (its `id`), or text
 /// placed absolutely and centred both ways; other header WordArt (a logo or a title) is None.
+/// Whether a VML shape is a header's watermark, which the reader keeps as a setting, not an object.
+pub(crate) fn vml_is_watermark(shape: &El) -> bool {
+    vml_watermark(shape).is_some()
+}
+
 fn vml_watermark(shape: &El) -> Option<wordcraft_doc::Watermark> {
     let tp = shape.child("v:textpath")?;
     if tp.attr("on").is_some_and(|v| matches!(v, "f" | "false" | "0")) {
