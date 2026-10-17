@@ -93,10 +93,13 @@ path = "LICENSE-MIT"
 checksum = "c8167fdeeed46d3f244d3f85c5bf998ce889343691c32be2c61a8bc4b5c08333"
 license = "MIT"
 
+# krilla comes from the craft-libs checkout (the workspace's [patch.crates-io]), which vendors it
+# without its own licence file; the text it carries is the one beside pdf-writer's, byte for byte
+# (the checksum is the one this clarification always had).
 [krilla.clarify]
 license = "MIT OR Apache-2.0"
 [[krilla.clarify.git]]
-path = "LICENSE_MIT"
+path = "../../licenses/pdf-writer/LICENSE_MIT"
 checksum = "9d1eb142840c7acfd5511b4dd298cece3f0053f5809228906445cd8a3365592f"
 license = "MIT"
 
@@ -211,6 +214,14 @@ license = "MIT"
 [craft-ui.clarify]
 license = "MIT OR Apache-2.0"
 [[craft-ui.clarify.git]]
+path = "LICENSE-MIT"
+checksum = "2f42c0cafc8ad394d91373fe1f342aee5453850b151a51405c68cae9ada86d26"
+license = "MIT"
+
+# craft-pdf, the same repository: its package has no licence text of its own either.
+[craft-pdf.clarify]
+license = "MIT OR Apache-2.0"
+[[craft-pdf.clarify.git]]
 path = "LICENSE-MIT"
 checksum = "2f42c0cafc8ad394d91373fe1f342aee5453850b151a51405c68cae9ada86d26"
 license = "MIT"

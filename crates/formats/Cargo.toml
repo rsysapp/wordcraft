@@ -8,6 +8,12 @@ description = "WordCraft import/export: plain text, Markdown, HTML, RTF, OpenDoc
 [lints]
 workspace = true
 
+# embed: the ArtCraft link in the LaTeX export's header comment (docs/brand/LICENSE-brand.txt).
+# Off in the embed build, a modified version that carries no ArtCraft links; on through the
+# applications' `brand` feature (wordcraft-ui-egui, wordcraft-engine).
+[features]
+brand = []
+
 [dependencies]
 wordcraft-doc = { workspace = true }
 wordcraft-geom = { workspace = true }

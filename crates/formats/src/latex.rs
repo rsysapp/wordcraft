@@ -52,7 +52,11 @@ pub fn export(doc: &Document) -> String {
 
     let meta = &flow.meta;
     let mut o = String::new();
+    // embed: without `brand` (the embed build) the header names no ArtCraft site.
+    #[cfg(feature = "brand")]
     o.push_str("% Written by WordCraft (https://getartcraft.com/apps/wordcraft).\n");
+    #[cfg(not(feature = "brand"))]
+    o.push_str("% Written by WordCraft.\n");
     o.push_str("\\documentclass{article}\n");
     o.push_str("\\usepackage[T1]{fontenc}\n");
     if w.uses.ulem {

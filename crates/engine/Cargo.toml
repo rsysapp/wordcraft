@@ -8,6 +8,10 @@ description = "WordCraft engine: session, selection, undo, the command registry 
 [lints]
 workspace = true
 
+# embed: see wordcraft-formats' `brand`.
+[features]
+brand = ["wordcraft-formats/brand"]
+
 [dependencies]
 wordcraft-geom = { workspace = true }
 wordcraft-doc = { workspace = true }

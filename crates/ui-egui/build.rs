@@ -7,6 +7,12 @@
 //!   JSON says the entry was verified (`people_entry`).
 //!
 //! A missing or malformed file gives empty tables (or no names) and a warning.
+//!
+//! embed: the interface catalogs (`src/i18n/*.tsv`) are copied to `OUT_DIR/i18n`, which the crate
+//! includes instead of the sources. Without the `brand` feature (the embed build, a modified version
+//! that shows no ArtCraft names or links, docs/brand/LICENSE-brand.txt) the lines that name ArtCraft
+//! are left out of the copies: those strings are shown only with the feature, and a translation of
+//! one would carry its link into the module.
 
 use std::fmt::Write as _;
 
@@ -23,6 +29,40 @@ fn main() {
     let out = std::path::PathBuf::from(std::env::var_os("OUT_DIR").unwrap_or_default()).join("credits.rs");
     if let Err(e) = std::fs::write(&out, generate(&json, &people)) {
         println!("cargo::warning=writing {}: {e}", out.display());
+    }
+    catalogs();
+}
+
+/// The catalogs for the crate to include, without the ArtCraft lines unless `brand` is on.
+fn catalogs() {
+    let source = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/i18n");
+    let target = std::path::PathBuf::from(std::env::var_os("OUT_DIR").unwrap_or_default()).join("i18n");
+    println!("cargo::rerun-if-changed={}", source.display());
+    println!("cargo::rerun-if-env-changed=CARGO_FEATURE_BRAND");
+    let brand = std::env::var_os("CARGO_FEATURE_BRAND").is_some();
+    if let Err(e) = std::fs::create_dir_all(&target) {
+        println!("cargo::warning=creating {}: {e}", target.display());
+        return;
+    }
+    let Ok(entries) = std::fs::read_dir(&source) else {
+        println!("cargo::warning=reading {}: the catalogs are missing", source.display());
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.extension().and_then(|extension| extension.to_str()) != Some("tsv") {
+            continue;
+        }
+        let Some(name) = path.file_name() else { continue };
+        let Ok(text) = std::fs::read_to_string(&path) else {
+            println!("cargo::warning=reading {}", path.display());
+            continue;
+        };
+        let kept: String =
+            if brand { text } else { text.split_inclusive('\n').filter(|line| !line.to_ascii_lowercase().contains("artcraft")).collect() };
+        if let Err(e) = std::fs::write(target.join(name), kept) {
+            println!("cargo::warning=writing {}: {e}", target.join(name).display());
+        }
     }
 }
 
