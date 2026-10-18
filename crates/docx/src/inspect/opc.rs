@@ -85,6 +85,11 @@ impl Rels {
     pub(super) fn of_type<'a>(&'a self, kind: &'a str) -> impl Iterator<Item = &'a Rel> + 'a {
         self.by_id.values().filter(move |rel| is_type(&rel.kind, kind))
     }
+
+    /// embed: the relationship with this id (streams mode resolves link targets and parts by it).
+    pub(super) fn get(&self, id: &str) -> Option<&Rel> {
+        self.by_id.get(id)
+    }
 }
 
 /// Is `kind` the relationship type `full`, in its transitional or strict spelling? Exact, unlike the

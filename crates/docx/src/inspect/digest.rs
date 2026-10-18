@@ -22,6 +22,20 @@ impl Digest {
             Digest::Sha256(_) => 32,
         }
     }
+
+    /// embed: the identity as lowercase hex SHA-256, for streams mode: a short content's framed
+    /// bytes hashed, which is what [`Digest::Sha256`] would hold for it had it been longer.
+    pub(super) fn hex(&self) -> String {
+        let digest = match self {
+            Digest::Exact(bytes) => {
+                let mut sha = Sha256::default();
+                sha.update(bytes);
+                sha.finish()
+            }
+            Digest::Sha256(digest) => *digest,
+        };
+        digest.iter().map(|byte| format!("{byte:02x}")).collect()
+    }
 }
 
 /// Collects framed content: its bytes while short, a running SHA-256 after.

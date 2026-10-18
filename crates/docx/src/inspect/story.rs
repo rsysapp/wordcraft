@@ -14,6 +14,8 @@ use std::rc::Rc;
 use super::budget::{Budget, shared_string, table_room, table_sized, table_slot, tree_room, tree_slot, units, vector_room, vector_slot};
 use super::digest::{Digest, Hasher};
 use super::opc::{Canon, finish};
+use super::stream_extras::{self, CommentMark, Extra, Extras, TextBox};
+use super::streams::NoteKind;
 use super::xml::{XEl, XNode, is_space};
 
 /// Pieces at or above this are marks (`MARK_BASE + index`); below it, characters.
@@ -593,6 +595,22 @@ pub(super) fn walk(
     hiding: &StyleHiding,
     budget: &mut Budget,
 ) -> Result<Vec<Item>, String> {
+    walk_with(root, canon, tables, revisions, items_left, most_items, hiding, budget, None)
+}
+
+/// embed: [`walk`], recording streams mode's facts into `extras` when given.
+#[allow(clippy::too_many_arguments)]
+pub(super) fn walk_with(
+    root: &XEl,
+    canon: &Canon<'_>,
+    tables: &mut Tables,
+    revisions: &mut Revisions,
+    items_left: &mut usize,
+    most_items: u64,
+    hiding: &StyleHiding,
+    budget: &mut Budget,
+    extras: Option<&mut Extras>,
+) -> Result<Vec<Item>, String> {
     // Room for every item the tree can make, held and reserved once: a vector growing by doubling
     // holds three times its length while it moves.
     let room = most_items.min(units(*items_left));
@@ -610,6 +628,9 @@ pub(super) fn walk(
         hiding,
         paragraph_style: ParagraphStyle::default(),
         hiding_tables: 0,
+        extras,
+        origin: None,
+        boxes: 0,
     };
     let result = walker.root(root);
     let held = items_held(&walker.items);
@@ -649,6 +670,11 @@ struct Walker<'a, 'c> {
     paragraph_style: ParagraphStyle,
     /// How many of the tables around the current position have a style that may hide.
     hiding_tables: u32,
+    /// embed: streams mode's record; `None` for the save check, which then reads as upstream does.
+    extras: Option<&'a mut Extras>,
+    /// embed: streams mode: the origin of the paragraph being walked, and its text boxes so far.
+    origin: Option<u32>,
+    boxes: u32,
 }
 
 /// A property child of `el` named `name`, once at most, and where the schema puts it: every element
@@ -1134,8 +1160,63 @@ impl Walker<'_, '_> {
     }
 
     fn mark(&mut self, digest: Digest, info: impl FnOnce() -> MarkInfo, format: u32) -> Result<(), String> {
+        // embed: streams mode keeps each mark's digest, which the save check needs only as an id.
+        let hex = self.extras.is_some().then(|| digest.hex());
         let piece = self.tables.mark(digest, info)?;
-        self.push(piece, format)
+        self.push(piece, format)?;
+        if let (Some(extras), Some(hex)) = (self.extras.as_deref_mut(), hex) {
+            extras.digest(piece, || hex, self.budget)?;
+        }
+        Ok(())
+    }
+
+    /// embed: streams mode: record a fact about the item pushed last.
+    fn record(&mut self, extra: impl FnOnce(&Extras) -> Extra) -> Result<(), String> {
+        let Some(extras) = self.extras.as_deref_mut() else { return Ok(()) };
+        let index = self.items.len().saturating_sub(1);
+        let extra = extra(extras);
+        extras.record(index, extra, self.budget)
+    }
+
+    /// embed: streams mode: the text boxes in an object, each walked as a story of its own (the
+    /// object stays one opaque mark in the part's own items).
+    fn text_boxes(&mut self, el: &XEl) -> Result<(), String> {
+        if self.extras.is_none() {
+            return Ok(());
+        }
+        for content in stream_extras::text_boxes(el, self.budget)? {
+            let anchor = self.origin.unwrap_or(u32::MAX);
+            let ordinal = self.boxes;
+            self.boxes = self.boxes.saturating_add(1);
+            let room = stream_extras::item_bound(content, self.budget)?.min(units(*self.items_left));
+            self.budget.hold(room.saturating_mul(ITEM_BYTES))?;
+            let nested = Vec::with_capacity(usize::try_from(room).unwrap_or(0));
+            self.budget.release(room.saturating_mul(ITEM_BYTES).saturating_sub(items_held(&nested)));
+            let outer_items = std::mem::replace(&mut self.items, nested);
+            let outer_facts = self.extras.as_deref_mut().map(|extras| std::mem::take(&mut extras.by_item)).unwrap_or_default();
+            let outer_stack = std::mem::replace(&mut self.stack, vec![EMPTY]);
+            let outer_style = std::mem::take(&mut self.paragraph_style);
+            let outer_tables = std::mem::replace(&mut self.hiding_tables, 0);
+            let (outer_origin, outer_boxes) = (self.origin, self.boxes);
+            let walked = self.children(content, Place::Block, &[]);
+            let mut items = std::mem::replace(&mut self.items, outer_items);
+            let by_item = self.extras.as_deref_mut().map(|extras| std::mem::replace(&mut extras.by_item, outer_facts)).unwrap_or_default();
+            self.stack = outer_stack;
+            self.paragraph_style = outer_style;
+            self.hiding_tables = outer_tables;
+            (self.origin, self.boxes) = (outer_origin, outer_boxes);
+            let held = items_held(&items);
+            if let Err(error) = walked {
+                self.budget.release(held);
+                return Err(error);
+            }
+            items.shrink_to_fit();
+            self.budget.release(held.saturating_sub(items_held(&items)));
+            if let Some(extras) = self.extras.as_deref_mut() {
+                extras.text_boxes.push(TextBox { anchor, ordinal, items, by_item });
+            }
+        }
+        Ok(())
     }
 
     /// An element compared whole.
@@ -1171,7 +1252,27 @@ impl Walker<'_, '_> {
         let digest = finish(hasher, self.budget)?;
         let element = el.name.clone();
         // The id is copied only for a mark the tables do not have yet, which charges it.
-        self.mark(digest, || MarkInfo { element, comment: comment.map(str::to_string), kind, holds }, format)
+        self.mark(digest, || MarkInfo { element, comment: comment.map(str::to_string), kind, holds }, format)?;
+        // embed: streams mode: what the opaque element is, beyond its digest.
+        if self.extras.is_some() {
+            let id = || el.attr("w:id").unwrap_or("").to_string();
+            match &*el.name {
+                "w:footnoteReference" => self.record(|_| Extra::NoteReference(NoteKind::Footnote, id()))?,
+                "w:endnoteReference" => self.record(|_| Extra::NoteReference(NoteKind::Endnote, id()))?,
+                "w:commentRangeStart" if comment.is_some() => self.record(|_| Extra::Comment(CommentMark::Start, id()))?,
+                "w:commentRangeEnd" if comment.is_some() => self.record(|_| Extra::Comment(CommentMark::End, id()))?,
+                "w:commentReference" if comment.is_some() => self.record(|_| Extra::Comment(CommentMark::Reference, id()))?,
+                name if OBJECTS.contains(&name) => {
+                    let canon = self.canon;
+                    let dir = self.extras.as_deref().map(|extras| extras.dir.clone()).unwrap_or_default();
+                    let object = stream_extras::object(el, canon, &dir, self.budget)?;
+                    self.record(|_| object)?;
+                    self.text_boxes(el)?;
+                }
+                _ => {}
+            }
+        }
+        Ok(())
     }
 
     /// Text where only elements belong: white space is layout, anything else is kept as a mark.
@@ -1198,7 +1299,8 @@ impl Walker<'_, '_> {
         }
         let digest = finish(hasher, self.budget)?;
         let element = el.name.clone();
-        self.mark(digest, || MarkInfo { element, comment: None, kind, holds: Holds::default() }, format)
+        self.mark(digest, || MarkInfo { element, comment: None, kind, holds: Holds::default() }, format)?;
+        self.record(|_| Extra::Open)
     }
 
     fn end(&mut self, el: &XEl, kind: MarkKind) -> Result<(), String> {
@@ -1206,7 +1308,8 @@ impl Walker<'_, '_> {
         hasher.field(b'E', el.name.as_bytes());
         let digest = finish(hasher, self.budget)?;
         let element = el.name.clone();
-        self.mark(digest, || MarkInfo { element, comment: None, kind, holds: Holds::default() }, EMPTY)
+        self.mark(digest, || MarkInfo { element, comment: None, kind, holds: Holds::default() }, EMPTY)?;
+        self.record(|_| Extra::Close)
     }
 
     /// A tracked change's author and date, kept as texts.
@@ -1325,10 +1428,12 @@ impl Walker<'_, '_> {
         match &*root.name {
             "w:document" => {
                 self.start(root, &[], MarkKind::Plain, EMPTY)?;
+                self.record(|_| Extra::Root)?;
                 for node in &root.kids {
                     match node {
                         XNode::El(child) if &*child.name == "w:body" => {
                             self.start(child, &[], MarkKind::Plain, EMPTY)?;
+                            self.record(|_| Extra::Root)?;
                             self.children(child, Place::Block, &[])?;
                         }
                         XNode::El(child) => self.opaque(child, EMPTY)?,
@@ -1339,16 +1444,24 @@ impl Walker<'_, '_> {
             }
             "w:hdr" | "w:ftr" => {
                 self.start(root, &[], MarkKind::Plain, EMPTY)?;
+                self.record(|_| Extra::Root)?;
                 self.children(root, Place::Block, &[])
             }
             "w:footnotes" | "w:endnotes" => {
                 self.start(root, &[], MarkKind::Plain, EMPTY)?;
+                self.record(|_| Extra::Root)?;
                 for node in &root.kids {
                     match node {
                         XNode::El(child) if matches!(&*child.name, "w:footnote" | "w:endnote") => {
                             self.start(child, &[], MarkKind::Plain, EMPTY)?;
+                            self.record(|_| {
+                                let kind = if &*child.name == "w:footnote" { NoteKind::Footnote } else { NoteKind::Endnote };
+                                let separator = child.attr("w:type").is_some_and(|kind| kind != "normal");
+                                Extra::NoteStart { kind, id: child.attr("w:id").unwrap_or("").to_string(), separator }
+                            })?;
                             self.children(child, Place::Block, &[])?;
                             self.end(child, MarkKind::Plain)?;
+                            self.record(|_| Extra::NoteEnd)?;
                         }
                         XNode::El(child) => self.opaque(child, EMPTY)?,
                         XNode::Text(text) => self.stray(text)?,
@@ -1392,7 +1505,9 @@ impl Walker<'_, '_> {
                     digest,
                     || MarkInfo { element: Rc::from("w:sectPr"), comment: None, kind: MarkKind::Section, holds: Holds::default() },
                     format,
-                )
+                )?;
+                let canon = self.canon;
+                self.record(|extras| Extra::Section(stream_extras::section_refs(el, canon, &extras.dir)))
             }
             _ if empty_marker(el) => Ok(()),
             _ => self.opaque(el, EMPTY),
@@ -1409,6 +1524,7 @@ impl Walker<'_, '_> {
                 hasher.field(b'I', el.attr("w:instr").unwrap_or("").as_bytes());
                 let instruction = self.tables.content(finish(hasher, self.budget)?);
                 self.start(el, &[], MarkKind::SimpleField(instruction), EMPTY)?;
+                self.record(|_| Extra::SimpleField(el.attr("w:instr").unwrap_or("").to_string()))?;
                 self.children(el, Place::Inline, &[])?;
                 self.end(el, MarkKind::SimpleFieldEnd)
             }
@@ -1445,6 +1561,10 @@ impl Walker<'_, '_> {
     fn container(&mut self, el: &XEl, property_name: Option<&str>, place: Place, kind: MarkKind) -> Result<(), String> {
         let property = property_name.map(|name| leading(el, name, &[])).transpose()?.flatten();
         self.start(el, &[property], kind, EMPTY)?;
+        if &*el.name == "w:hyperlink" {
+            let canon = self.canon;
+            self.record(|extras| stream_extras::hyperlink(el, canon, &extras.dir))?;
+        }
         self.children(el, place, &[property])?;
         self.end(el, MarkKind::Plain)
     }
@@ -1467,8 +1587,19 @@ impl Walker<'_, '_> {
             None => hasher.field(b'-', &[]),
         }
         let digest = finish(hasher, self.budget)?;
+        // embed: streams mode: the control's properties as a format of their own.
+        let control = match self.extras.is_some() {
+            true => {
+                let value = self.tables.content(digest.clone());
+                Some(self.format(vec![Slot { name: "sdtPr", value, rev: None }], false, false))
+            }
+            false => None,
+        };
         let element = el.name.clone();
         self.mark(digest, || MarkInfo { element, comment: None, kind: MarkKind::Plain, holds: Holds::default() }, EMPTY)?;
+        if let Some(control) = control {
+            self.record(|_| Extra::ContentControl(control))?;
+        }
         for node in &el.kids {
             match node {
                 XNode::El(child) if is(child, properties) || is(child, end_properties) => {}
@@ -1500,6 +1631,11 @@ impl Walker<'_, '_> {
             None => None,
         };
         self.paragraph_style = ParagraphStyle { now: style_of(properties, self.budget)?, change: recorded };
+        // embed: streams mode: the paragraph's origin, for its text boxes and its mark.
+        let outer = (self.origin, self.boxes);
+        if let Some(extras) = self.extras.as_deref() {
+            (self.origin, self.boxes) = (extras.origin_of(p), 0);
+        }
         self.children(p, Place::Inline, &[properties])?;
         // The paragraph mark: its own tracked changes sit in `w:pPr/w:rPr`.
         let mark_properties = properties.map(|properties| trailing(properties, "w:rPr", &["w:sectPr", "w:pPrChange"])).transpose()?.flatten();
@@ -1518,6 +1654,11 @@ impl Walker<'_, '_> {
         slots.extend(self.slot("pPr", properties, "w:pPrChange", "w:pPr", &|child| is(child, mark_properties) || is(child, section))?);
         slots.extend(self.slot("pPr.rPr", mark_properties, "w:rPrChange", "w:rPr", &is_wrap)?);
         slots.extend(self.slot("pPr.sectPr", section, "w:sectPrChange", "w:sectPr", &|_| false)?);
+        // embed: streams mode: the section these properties end, as block-level ones would read.
+        let section_format = match (self.extras.is_some(), slots.iter().find(|slot| slot.name == "pPr.sectPr")) {
+            (true, Some(slot)) => Some(self.format(vec![Slot { name: "sectPr", ..slot.clone() }], false, false)),
+            _ => None,
+        };
         // A hidden mark hides the paragraph's end: its paragraph runs into the next.
         let mark_rev = slots.iter().find(|slot| slot.name == "pPr.rPr").and_then(|slot| slot.rev);
         let hiding = self.hiding(mark_properties, mark_rev.as_ref())?;
@@ -1528,6 +1669,12 @@ impl Walker<'_, '_> {
         let digest = finish(hasher, self.budget)?;
         let element = p.name.clone();
         self.mark(digest, || MarkInfo { element, comment: None, kind: MarkKind::Paragraph, holds: Holds::default() }, format)?;
+        let (canon, origin) = (self.canon, self.origin);
+        self.record(|extras| Extra::Paragraph {
+            origin: origin.unwrap_or(u32::MAX),
+            section: section.zip(section_format).map(|(section, format)| (format, stream_extras::section_refs(section, canon, &extras.dir))),
+        })?;
+        (self.origin, self.boxes) = outer;
         self.leave_to(depth);
         Ok(())
     }

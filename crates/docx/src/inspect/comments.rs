@@ -30,6 +30,16 @@ pub(super) struct Comment {
     pub done: bool,
     /// The comment this one answers (`w15:paraIdParent`).
     pub parent: Option<String>,
+    /// embed: streams mode only (`None` for the save check): its date and plain text.
+    pub detail: Option<Detail>,
+}
+
+/// embed: what streams mode shows of a comment besides what the save check compares.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct Detail {
+    pub date: Option<String>,
+    /// The text of its paragraphs' `w:t` elements, paragraphs joined by a line end.
+    pub text: String,
 }
 
 /// Comments by id.
@@ -37,15 +47,20 @@ pub(super) type Comments = BTreeMap<String, Comment>;
 
 /// The comments of `w:comments`, with their state from `w15:commentsEx`.
 pub(super) fn read(comments: &XEl, extended: Option<&XEl>, canon: &Canon<'_>, budget: &mut Budget) -> Result<Comments, String> {
+    read_with(comments, extended, canon, budget, false)
+}
+
+/// embed: [`read`], keeping each comment's date and text when `detailed` (streams mode).
+pub(super) fn read_with(comments: &XEl, extended: Option<&XEl>, canon: &Canon<'_>, budget: &mut Budget, detailed: bool) -> Result<Comments, String> {
     // The paragraph map lives only while reading: held, then released.
     budget.hold(table_room::<(String, Option<String>)>())?;
     let mut map_held = table_room::<(String, Option<String>)>();
-    let read = read_held(comments, extended, canon, budget, &mut map_held);
+    let read = read_held(comments, extended, canon, budget, &mut map_held, detailed);
     budget.release(map_held);
     read
 }
 
-fn read_held(comments: &XEl, extended: Option<&XEl>, canon: &Canon<'_>, budget: &mut Budget, map_held: &mut u64) -> Result<Comments, String> {
+fn read_held(comments: &XEl, extended: Option<&XEl>, canon: &Canon<'_>, budget: &mut Budget, map_held: &mut u64, detailed: bool) -> Result<Comments, String> {
     if &*comments.name != "w:comments" {
         return Err("a comments part without w:comments".into());
     }
@@ -94,7 +109,8 @@ fn read_held(comments: &XEl, extended: Option<&XEl>, canon: &Canon<'_>, budget: 
         if out.contains_key(id) {
             return Err(format!("two comments with id {id}"));
         }
-        let comment = Comment { author: author.to_string(), meta, content, done: false, parent: None };
+        let detail = if detailed { Some(detail_of(el, budget)?) } else { None };
+        let comment = Comment { author: author.to_string(), meta, content, done: false, parent: None, detail };
         out.insert(id.to_string(), comment);
     }
     let Some(extended) = extended else { return Ok(out) };
@@ -135,4 +151,35 @@ fn read_held(comments: &XEl, extended: Option<&XEl>, canon: &Canon<'_>, budget: 
         }
     }
     Ok(out)
+}
+
+/// embed: a comment's date and plain text, for streams mode, charged as they are copied.
+fn detail_of(comment: &XEl, budget: &mut Budget) -> Result<Detail, String> {
+    fn texts(el: &XEl, out: &mut String, depth: usize, budget: &mut Budget) -> Result<(), String> {
+        if depth > crate::xml::MAX_DEPTH {
+            return Ok(());
+        }
+        for child in el.els() {
+            budget.work(1)?;
+            if &*child.name == "w:t" {
+                for text in child.texts() {
+                    budget.hold(units(text.len()))?;
+                    out.push_str(text);
+                }
+            } else {
+                texts(child, out, depth + 1, budget)?;
+            }
+        }
+        Ok(())
+    }
+    let mut text = String::new();
+    for (index, paragraph) in comment.els().filter(|child| &*child.name == "w:p").enumerate() {
+        if index > 0 {
+            text.push('\n');
+        }
+        texts(paragraph, &mut text, 0, budget)?;
+    }
+    let date = comment.attr("w:date").map(|date| kept_value("a comment's w:date", date).map(str::to_string)).transpose()?;
+    budget.hold(units(date.as_ref().map_or(0, String::len)))?;
+    Ok(Detail { date, text })
 }

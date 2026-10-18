@@ -59,10 +59,15 @@ mod package;
 #[doc(hidden)]
 pub mod probe;
 mod story;
+// embed: Clauflow's version comparison reads the save check's streams, decoded.
+mod stream_extras;
+pub mod streams;
 mod xml;
 
 #[cfg(test)]
 mod tests;
+#[cfg(test)]
+mod streams_tests;
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -476,6 +481,20 @@ impl<'a> Side<'a> {
         budget: &mut Budget,
         unsettled_styles: &mut bool,
     ) -> Result<Side<'a>, String> {
+        Side::read_with(bytes, limits, names, tables, budget, unsettled_styles, None)
+    }
+
+    /// embed: [`Side::read`], recording streams mode's facts into `record` when given.
+    #[allow(clippy::too_many_arguments)]
+    fn read_with(
+        bytes: &'a [u8],
+        limits: &ReadLimits,
+        names: &mut Names,
+        tables: &mut Tables,
+        budget: &mut Budget,
+        unsettled_styles: &mut bool,
+        mut record: Option<&mut streams::SideRecord>,
+    ) -> Result<Side<'a>, String> {
         let mut package = StrictPackage::open(bytes, limits, budget)?;
         let mut limits = Limits { elements_left: limits.max_elements, max_depth: limits.max_depth.min(crate::xml::MAX_DEPTH) };
         let (all, all_held) = part_names(&package, budget)?;
@@ -560,8 +579,15 @@ impl<'a> Side<'a> {
                     }
                 };
                 let canon = Canon { rels: part_rels, bookmarks: Some(&marks) };
-                let items = story::walk(&parsed.root, &canon, tables, &mut revisions, &mut items_left, parsed.most_items, &hiding, budget)
+                let mut extras = match record.is_some() {
+                    true => Some(stream_extras::Extras::new(&parsed.root, name, budget).map_err(|error| format!("{name}: {error}"))?),
+                    false => None,
+                };
+                let items = story::walk_with(&parsed.root, &canon, tables, &mut revisions, &mut items_left, parsed.most_items, &hiding, budget, extras.as_mut())
                     .map_err(|error| format!("{name}: {error}"));
+                if let (Some(record), Some(extras)) = (record.as_deref_mut(), extras) {
+                    record.stories.insert(name.clone(), extras);
+                }
                 drop(parsed.root);
                 drop(marks);
                 budget.release(parsed.held.saturating_add(marks_held));
@@ -570,6 +596,11 @@ impl<'a> Side<'a> {
                 let parsed = parse_part(&mut package, name, names, &mut limits, budget)?;
                 let root = &parsed.root;
                 let canon = Canon { rels: part_rels, bookmarks: None };
+                if *name == settings
+                    && let Some(record) = record.as_deref_mut()
+                {
+                    record.settings = Some(streams::settings_of(root, &canon, budget)?);
+                }
                 let digest = if *name == settings {
                     canon.digest(root, &|child| !matches!(&*child.name, "w:rsids" | "w:trackRevisions"), budget)
                 } else if *name == core {
@@ -602,7 +633,7 @@ impl<'a> Side<'a> {
                     None => None,
                 };
                 let canon = Canon { rels: rels.get(part.as_str()).unwrap_or(&empty), bookmarks: None };
-                let read = comments::read(&parsed.root, extended.as_ref().map(|extended| &extended.root), &canon, budget)
+                let read = comments::read_with(&parsed.root, extended.as_ref().map(|extended| &extended.root), &canon, budget, record.is_some())
                     .map_err(|error| format!("{part}: {error}"));
                 budget.release(parsed.held.saturating_add(extended.map_or(0, |extended| extended.held)));
                 read?
@@ -611,6 +642,11 @@ impl<'a> Side<'a> {
             None => comments::Comments::new(),
         };
         tables.charge(budget)?;
+        if let Some(record) = record {
+            record.settings_part = settings.clone();
+            record.part_order = all.clone();
+            record.part_order.sort();
+        }
         drop(all);
         budget.release(all_held);
         package.finish(budget)?;
