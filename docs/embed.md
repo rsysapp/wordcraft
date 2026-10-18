@@ -389,16 +389,18 @@ sides never drift apart:
   its token is always answered. Two requests in the same frame are answered once, with the later
   token.
 - **`cause: 'user'`** (and `token: null`) is a zoom the person made inside the editor: Ctrl/⌘+wheel,
-  a trackpad pinch, Ctrl/⌘+plus or minus, or the view bar's own buttons. A gesture is reported at
-  each step it draws, so a pinch sends several.
+  a trackpad pinch, Ctrl/⌘+plus or minus, or the view bar's own buttons. While a wheel or pinch zoom
+  eases, `zoomChanged` is sent for each percent drawn, so the host can mirror it live; the last one
+  is the settled zoom.
 - **`percent`** is the zoom the pages are drawn at, rounded to a whole percentage. With
   `pageWidth: true` the page-width fit is on and `percent` is what that fit gave for the window.
   View mode starts with the fit on.
 - **A fit that follows the window is not repeated.** While `pageWidth` stays `true`, the percent
   moving because the canvas was resized sends nothing; read the canvas's size, or ask for
   `setZoom` again, to learn the new percentage.
-- **No event for the first reading.** The zoom a document opens with is the baseline: the first
-  `zoomChanged` after `open` is the first change (or the first `setZoom` answer).
+- **No event for the first reading.** The zoom a document opens with is the baseline, taken again
+  at every `open`: the first `zoomChanged` after an `open` is the first change (or the first
+  `setZoom` answer), never the open itself.
 - **View mode's command gate is unchanged.** The zoom is applied by the editor's host state; the
   commands view mode refuses stay refused.
 

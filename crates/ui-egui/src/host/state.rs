@@ -114,7 +114,7 @@ pub struct HostState {
     /// next open that asks for the stored display.
     pub(crate) clean_display: bool,
     /// The zoom the host was last in a position to know, `(percent, page-width fit)`. `None` until a
-    /// document is open: the first reading is the baseline, not a change.
+    /// document is open, and again after each open: the first reading is the baseline, not a change.
     last_zoom: Option<(u32, bool)>,
     /// The token of a `setZoom` not yet answered; the next frame's `zoomChanged` carries it.
     zoom_token: Option<u32>,
@@ -613,6 +613,9 @@ fn open(app: &mut WordApp, host: &mut HostState, name: &str, bytes: &[u8], optio
             app.canvas.scroll_to_doc = Some((0, 0.0));
             app.canvas.visible_page = None;
             host.last_page = None;
+            // The zoom the host was told belongs to the document being replaced: the new one's
+            // first reading is a baseline again. A pending `setZoom` token still gets its answer.
+            host.last_zoom = None;
             host.find_query.clear();
             host.find_anchor = None;
             // Marks belong to the document they were set on.
@@ -756,6 +759,40 @@ mod tests {
         h.run_steps(4);
         let events = bridge.take_events();
         assert!(!events.iter().any(|event| matches!(event, HostEvent::JumpNotFound { .. })), "{events:?}");
+    }
+
+    /// An open starts the new document's zoom from a fresh reading: what the host was last told
+    /// belongs to the document being replaced. Checked between the open and the frame's end, where
+    /// the new baseline is taken, since a host open does not change the zoom itself.
+    #[test]
+    fn an_open_forgets_the_zoom_the_host_was_last_told() {
+        use wordcraft_doc::Document;
+        use wordcraft_engine::Session;
+
+        use crate::host::{EmbedProfile, HostCommand};
+        use crate::{Services, WordApp};
+
+        let bridge = HostBridge::new();
+        let app = WordApp::new(Session::new(Document::new()), Services::default()).with_host(bridge.clone(), EmbedProfile::View);
+        let mut h = egui_kittest::Harness::builder().with_size(egui::vec2(1100.0, 800.0)).with_max_steps(12).build_ui_state(
+            |ui, app: &mut WordApp| {
+                let ctx = ui.ctx().clone();
+                app.logic(&ctx);
+                app.ui(ui);
+            },
+            app,
+        );
+        bridge.set_context(h.ctx.clone());
+        crate::host::prepare_context(&h.ctx);
+        h.run_steps(2);
+        let bytes = wordcraft_engine::io::save_bytes("a.docx", &Document::from_text("Clause 1.")).expect("writes");
+        bridge.send(HostCommand::Open { name: "a.docx".into(), bytes: bytes.clone(), options: Default::default() });
+        h.run_steps(4);
+        assert!(h.state().host.as_ref().is_some_and(|host| host.last_zoom.is_some()), "the first open's frames took a baseline");
+        bridge.send(HostCommand::Open { name: "a.docx".into(), bytes, options: Default::default() });
+        let ctx = h.ctx.clone();
+        super::before_frame(h.state_mut(), &ctx);
+        assert!(h.state().host.as_ref().is_some_and(|host| host.last_zoom.is_none()), "the second open dropped it");
     }
 
     #[test]
