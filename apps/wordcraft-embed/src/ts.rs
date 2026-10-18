@@ -52,6 +52,8 @@ export interface OpenOptions {
     display?: 'asStored' | 'final';
 }
 
+export type ZoomRequest = { zoom: number | 'pageWidth'; token: number };
+
 export type EditorEvent =
     | { type: 'opened'; pages: number }
     | { type: 'openFailed'; message: string }
@@ -66,6 +68,7 @@ export type EditorEvent =
     | { type: 'saveFailed'; message: string }
     | { type: 'commentRequested'; text: string; copyText: string; page: number | null; x: number; y: number }
     | { type: 'findRequested' }
+    | { type: 'zoomChanged'; percent: number; pageWidth: boolean; cause: 'user' | 'host'; token: number | null }
     | { type: 'redactionsPending'; marks: number }
     | { type: 'editRefused'; code: EditRefusalCode };
 
@@ -106,6 +109,7 @@ mod tests {
             "export interface EditorPermissions { acceptRejectChanges: boolean; organizePages: boolean; fillForms: boolean; redact: boolean; stamps: boolean; drawing: boolean; fullEditing?: boolean; }",
             "export type ModeRequest = | { mode: 'view' } | { mode: 'edit'; author: EditorAuthor; revisionDate: string; permissions: EditorPermissions };",
             "export interface OpenOptions { display?: 'asStored' | 'final'; }",
+            "export type ZoomRequest = { zoom: number | 'pageWidth'; token: number };",
             "export type EditorEvent = | { type: 'opened'; pages: number } | { type: 'openFailed'; message: string } \
              | { type: 'pageChanged'; page: number } \
              | { type: 'selection'; text: string; copyText: string; page: number | null; x: number; y: number } \
@@ -113,7 +117,9 @@ mod tests {
              | { type: 'modeChanged'; mode: 'view' | 'edit' } | { type: 'dirtyChanged'; dirty: boolean } \
              | { type: 'saveRequested'; bytes: Uint8Array; fileName: string } | { type: 'saveFailed'; message: string } \
              | { type: 'commentRequested'; text: string; copyText: string; page: number | null; x: number; y: number } \
-             | { type: 'findRequested' } | { type: 'redactionsPending'; marks: number } | { type: 'editRefused'; code: EditRefusalCode };",
+             | { type: 'findRequested' } \
+             | { type: 'zoomChanged'; percent: number; pageWidth: boolean; cause: 'user' | 'host'; token: number | null } \
+             | { type: 'redactionsPending'; marks: number } | { type: 'editRefused'; code: EditRefusalCode };",
             "export type EditRefusalCode = | 'command_not_allowed' | 'decision_not_allowed' | 'paragraph_break_not_supported' \
              | 'character_not_allowed' | 'outside_editable_story' | 'invalid_edit_session' \
              | 'unknown_command' | 'invalid_parameters' | 'not_available' | 'document_protected' \
@@ -154,6 +160,10 @@ mod tests {
             (
                 "setMode",
                 "#[wasm_bindgen(js_name = setMode)] pub fn set_mode(&self, #[wasm_bindgen(unchecked_param_type = \"ModeRequest\")] request: JsValue)",
+            ),
+            (
+                "setZoom",
+                "#[wasm_bindgen(js_name = setZoom)] pub fn set_zoom(&self, #[wasm_bindgen(unchecked_param_type = \"ZoomRequest\")] request: JsValue)",
             ),
             ("requestSave", "#[wasm_bindgen(js_name = requestSave)] pub fn request_save(&self) {"),
             ("applyRedactions", "#[wasm_bindgen(js_name = applyRedactions)] pub fn apply_redactions(&self) {"),

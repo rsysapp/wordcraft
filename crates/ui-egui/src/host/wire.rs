@@ -170,6 +170,43 @@ pub enum Display {
     Final,
 }
 
+/// `setZoom`'s request (embed API 0.3): a percentage, or the page-width fit, and the host's token,
+/// which the `zoomChanged` it causes carries back.
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ZoomRequest {
+    pub zoom: ZoomValue,
+    pub token: u32,
+}
+
+/// A whole percentage (10 to 500, checked by [`parse_zoom_request`]), or the fit that follows the
+/// window's width.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize)]
+#[serde(untagged)]
+pub enum ZoomValue {
+    Percent(u32),
+    Fit(FitWidth),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum FitWidth {
+    PageWidth,
+}
+
+/// The percentages the engine's `view.zoom` accepts.
+const ZOOM_PERCENT_RANGE: std::ops::RangeInclusive<u32> = 10..=500;
+
+pub fn parse_zoom_request(json: &str) -> Result<ZoomRequest, String> {
+    let request: ZoomRequest = serde_json::from_str(json).map_err(|error| format!("setZoom: {error}"))?;
+    if let ZoomValue::Percent(percent) = request.zoom
+        && !ZOOM_PERCENT_RANGE.contains(&percent)
+    {
+        return Err(format!("setZoom: zoom {percent} is outside 10 to 500"));
+    }
+    Ok(request)
+}
+
 pub fn parse_open_options(json: &str) -> Result<OpenOptions, String> {
     serde_json::from_str(json).map_err(|error| format!("open: {error}"))
 }
@@ -274,6 +311,27 @@ mod tests {
         assert_eq!(occurrence_index(0), Some(0));
         assert_eq!(occurrence_index(7), Some(7));
         assert_eq!(occurrence_index(u32::MAX), None, "the saturated value names no match");
+    }
+
+    #[test]
+    fn zoom_requests_take_a_whole_percentage_or_the_fit_and_a_token() {
+        assert_eq!(parse_zoom_request(r#"{"zoom":10,"token":0}"#), Ok(ZoomRequest { zoom: ZoomValue::Percent(10), token: 0 }));
+        assert_eq!(parse_zoom_request(r#"{"zoom":500,"token":4}"#), Ok(ZoomRequest { zoom: ZoomValue::Percent(500), token: 4 }));
+        assert_eq!(parse_zoom_request(r#"{"zoom":"pageWidth","token":4}"#), Ok(ZoomRequest { zoom: ZoomValue::Fit(FitWidth::PageWidth), token: 4 }));
+        for bad in [
+            r#"{"zoom":150.5,"token":1}"#,
+            r#"{"zoom":-100,"token":1}"#,
+            r#"{"zoom":null,"token":1}"#,
+            r#"{"zoom":"onePage","token":1}"#,
+            r#"{"zoom":100}"#,
+            r#"{"token":1}"#,
+            r#"{"zoom":100,"token":-1}"#,
+            r#"{"zoom":100,"token":1.5}"#,
+            r#"{"zoom":100,"token":4294967296}"#,
+            r#"{"zoom":1e21,"token":1}"#,
+        ] {
+            assert!(parse_zoom_request(bad).is_err(), "{bad}");
+        }
     }
 
     #[test]

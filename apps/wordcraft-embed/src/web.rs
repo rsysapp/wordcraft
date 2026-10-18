@@ -108,6 +108,18 @@ impl EmbeddedEditor {
         Ok(())
     }
 
+    /// Sets the zoom: a percentage from 10 to 500, or `'pageWidth'`. Answered by a `zoomChanged`
+    /// event with `cause: 'host'` and the request's `token`.
+    #[wasm_bindgen(js_name = setZoom)]
+    pub fn set_zoom(&self, #[wasm_bindgen(unchecked_param_type = "ZoomRequest")] request: JsValue) -> Result<(), JsValue> {
+        // Before `json_of`: `JSON.stringify` writes NaN and Infinity as null, which would be refused
+        // with a less helpful message.
+        check_counts(&request, &["zoom", "token"], "setZoom")?;
+        let request = wire::parse_zoom_request(&json_of(&request)?).map_err(|e| type_error(&e))?;
+        self.send(HostCommand::SetZoom(request));
+        Ok(())
+    }
+
     /// Serialises the document; answered by `saveRequested` or `saveFailed`.
     #[wasm_bindgen(js_name = requestSave)]
     pub fn request_save(&self) {

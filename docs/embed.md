@@ -153,7 +153,8 @@ editor.destroy();
 
 `EmbeddedEditor`'s methods are `static mount(canvas, options)`, `open(bytes, fileName, options?)`,
 `jumpTo(target)`, `setMarks(marks)`, `setTheme(theme)`, `setListener(listener)`, `destroy()` and,
-from API 0.2, `setMode(request: ModeRequest)`, `requestSave()` and `applyRedactions()`. The types,
+from API 0.2, `setMode(request: ModeRequest)`, `requestSave()` and `applyRedactions()` and, from API
+0.3, `setZoom(request: ZoomRequest)`. The types,
 as `wordcraft_embed.d.ts` declares them (the package script fails if a declaration is missing):
 
 ```ts
@@ -199,6 +200,8 @@ export type ModeRequest =
     | { mode: 'view' }
     | { mode: 'edit'; author: EditorAuthor; revisionDate: string; permissions: EditorPermissions };
 
+export type ZoomRequest = { zoom: number | 'pageWidth'; token: number };
+
 export type EditorEvent =
     | { type: 'opened'; pages: number }
     | { type: 'openFailed'; message: string }
@@ -213,6 +216,7 @@ export type EditorEvent =
     | { type: 'saveFailed'; message: string }
     | { type: 'commentRequested'; text: string; copyText: string; page: number | null; x: number; y: number }
     | { type: 'findRequested' }
+    | { type: 'zoomChanged'; percent: number; pageWidth: boolean; cause: 'user' | 'host'; token: number | null }
     | { type: 'redactionsPending'; marks: number }
     | { type: 'editRefused'; code: EditRefusalCode };
 
@@ -369,6 +373,34 @@ its own controls. Absent or `true` is API 0.2's bar. `viewBar` that is not a boo
 - **Edit mode needs the bar.** The edit strip lives in the view bar. `setMode({ mode: 'edit', ... })`
   on a bar-less editor is for hosts that do not edit in it; its edit controls are not drawn.
 - **View mode's command gate is unchanged.**
+
+### Zoom
+
+`setZoom({ zoom, token })` sets the zoom: a whole percentage from 10 to 500, or `'pageWidth'`, which
+fits the page to the canvas's width and keeps fitting while the window is resized. `token` is a
+whole number the host chooses. Anything else (a fraction, a percentage outside 10 to 500, another
+word, a missing or non-whole token) throws a `TypeError` and queues nothing.
+
+`{ type: 'zoomChanged', percent, pageWidth, cause, token }` tells the host the zoom, so the two
+sides never drift apart:
+
+- **`cause: 'host'`** answers a `setZoom` and carries its `token`. It is sent after the frame that
+  drew the new zoom, **even when nothing changed** (the same percentage again), so a host waiting on
+  its token is always answered. Two requests in the same frame are answered once, with the later
+  token.
+- **`cause: 'user'`** (and `token: null`) is a zoom the person made inside the editor: Ctrl/⌘+wheel,
+  a trackpad pinch, Ctrl/⌘+plus or minus, or the view bar's own buttons. A gesture is reported at
+  each step it draws, so a pinch sends several.
+- **`percent`** is the zoom the pages are drawn at, rounded to a whole percentage. With
+  `pageWidth: true` the page-width fit is on and `percent` is what that fit gave for the window.
+  View mode starts with the fit on.
+- **A fit that follows the window is not repeated.** While `pageWidth` stays `true`, the percent
+  moving because the canvas was resized sends nothing; read the canvas's size, or ask for
+  `setZoom` again, to learn the new percentage.
+- **No event for the first reading.** The zoom a document opens with is the baseline: the first
+  `zoomChanged` after `open` is the first change (or the first `setZoom` answer).
+- **View mode's command gate is unchanged.** The zoom is applied by the editor's host state; the
+  commands view mode refuses stay refused.
 
 ## Behaviour a host page relies on
 

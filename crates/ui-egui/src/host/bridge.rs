@@ -6,7 +6,7 @@ use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 use serde::Serialize;
 
-use super::wire::{JumpTarget, MarkSpec, ModeRequest, OpenOptions, ThemeSpec};
+use super::wire::{JumpTarget, MarkSpec, ModeRequest, OpenOptions, ThemeSpec, ZoomRequest};
 
 /// What a host page asks of the editor.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -26,6 +26,8 @@ pub enum HostCommand {
     SetMode(ModeRequest),
     /// Serialise the document; answered by `SaveRequested` or `SaveFailed`.
     RequestSave,
+    /// Set the zoom; answered by `ZoomChanged` carrying the request's token. Embed API 0.3.
+    SetZoom(ZoomRequest),
 }
 
 /// What the editor tells the host page; serialises to the embed API's `EditorEvent`.
@@ -79,10 +81,30 @@ pub enum HostEvent {
     },
     /// Ctrl/⌘+F (or Find) with no view bar: the host opens its own find. Embed API 0.3.
     FindRequested,
+    /// The zoom changed (embed API 0.3): `percent` is what is drawn, `page_width` tells the page-width
+    /// fit is on (the percent then follows the window). The host's own `setZoom` is answered with
+    /// `cause: Host` and its token; a zoom the person made inside the editor (Ctrl+wheel, pinch,
+    /// Ctrl+plus, the view bar) says `User` and has no token.
+    ZoomChanged {
+        percent: u32,
+        page_width: bool,
+        cause: Cause,
+        token: Option<u32>,
+    },
     /// An action refused in edit mode, once per action, by its stable code (`edit_mode::Refusal`).
     EditRefused {
         code: String,
     },
+}
+
+/// Who caused a change the host is told of: the person inside the editor, or the host's own call
+/// (which carries the host's token). Reused by every event that could otherwise echo the host's
+/// calls back at it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Cause {
+    User,
+    Host,
 }
 
 /// The mode in force, as `modeChanged` names it.
@@ -253,6 +275,14 @@ mod tests {
             // The bytes travel outside JSON (the embed crate sets them on the event object).
             (HostEvent::SaveRequested { file_name: "a.docx".into(), bytes: vec![1, 2] }, json!({"type": "saveRequested", "fileName": "a.docx"})),
             (HostEvent::FindRequested, json!({"type": "findRequested"})),
+            (
+                HostEvent::ZoomChanged { percent: 150, page_width: false, cause: Cause::Host, token: Some(7) },
+                json!({"type": "zoomChanged", "percent": 150, "pageWidth": false, "cause": "host", "token": 7}),
+            ),
+            (
+                HostEvent::ZoomChanged { percent: 98, page_width: true, cause: Cause::User, token: None },
+                json!({"type": "zoomChanged", "percent": 98, "pageWidth": true, "cause": "user", "token": null}),
+            ),
             (HostEvent::SaveFailed { message: "m".into() }, json!({"type": "saveFailed", "message": "m"})),
             (HostEvent::EditRefused { code: "command_not_allowed".into() }, json!({"type": "editRefused", "code": "command_not_allowed"})),
             (

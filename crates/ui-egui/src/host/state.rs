@@ -6,10 +6,10 @@ use egui::{Rect, Vec2};
 use wordcraft_doc::Pos;
 use wordcraft_engine::Selection;
 
-use super::bridge::{HostBridge, HostCommand, HostEvent};
+use super::bridge::{Cause, HostBridge, HostCommand, HostEvent};
 use super::marks::Marks;
 use super::text_match::{TextIndex, visible_fragment_text};
-use super::wire::{Display, JumpTarget, OpenOptions, ThemeSpec, occurrence_index, page_index};
+use super::wire::{Display, JumpTarget, OpenOptions, ThemeSpec, ZoomRequest, ZoomValue, occurrence_index, page_index};
 use crate::WordApp;
 
 /// Points left above a passage the host jumps to, so it does not sit on the view's edge. The PDF
@@ -113,6 +113,11 @@ pub struct HostState {
     /// The last open used `display: 'final'`: the markup view settings it changed are put back by the
     /// next open that asks for the stored display.
     pub(crate) clean_display: bool,
+    /// The zoom the host was last in a position to know, `(percent, page-width fit)`. `None` until a
+    /// document is open: the first reading is the baseline, not a change.
+    last_zoom: Option<(u32, bool)>,
+    /// The token of a `setZoom` not yet answered; the next frame's `zoomChanged` carries it.
+    zoom_token: Option<u32>,
 }
 
 impl HostState {
@@ -209,6 +214,8 @@ impl HostState {
             last_save: None,
             bar_rows: 1,
             clean_display: false,
+            last_zoom: None,
+            zoom_token: None,
         }
     }
 
@@ -255,6 +262,7 @@ pub(crate) fn before_frame(app: &mut WordApp, ctx: &egui::Context) {
             HostCommand::SetMode(request) => super::edit::set_mode(app, &mut host, request),
             // Answered here, before any later command of the frame changes the document or the mode.
             HostCommand::RequestSave => super::edit::save(app, &mut host),
+            HostCommand::SetZoom(request) => set_zoom(app, &mut host, &request),
         }
     }
     app.host = Some(host);
@@ -272,6 +280,52 @@ fn set_theme(app: &mut WordApp, host: &mut HostState, ctx: &egui::Context, theme
     host.dark = Some(theme.dark);
     // Re-apply the egui style this frame, even when only the accent changed.
     app.applied_theme = None;
+}
+
+/// The zoom the host asked for, applied to the view as host state: view mode's command gate is not
+/// consulted (and not widened). It mirrors what the engine's `view.zoom` sets: a percentage ends any
+/// fit; the page-width fit shows one page per row.
+fn set_zoom(app: &mut WordApp, host: &mut HostState, request: &ZoomRequest) {
+    let view = &mut app.session.view;
+    match request.zoom {
+        ZoomValue::Percent(percent) => {
+            view.zoom = percent as f32 / 100.0;
+            view.fit.clear();
+            view.multi_page = false;
+        }
+        ZoomValue::Fit(_) => {
+            view.fit = "pageWidth".into();
+            view.multi_page = false;
+            view.single_column = true;
+        }
+    }
+    // A wheel zoom still easing out would overwrite the host's value.
+    app.canvas.wheel.cancel();
+    super::view::keep_target_in_view(app);
+    host.zoom_token = Some(request.token);
+}
+
+/// Tell the host of a zoom change, after the frame that drew it. The host's own request is always
+/// answered, with its token, even when nothing changed (it may be waiting on the token). Otherwise a
+/// change of percent or fit is the person's, except the percent moving with the window under the
+/// page-width fit, which the host already knows is on.
+fn report_zoom(app: &WordApp, host: &mut HostState) {
+    let token = host.zoom_token.take();
+    if token.is_none() && !host.opened {
+        return;
+    }
+    let now = (super::view::displayed_percent_whole(app), app.session.view.fit == "pageWidth");
+    let before = host.last_zoom.replace(now);
+    let (percent, page_width) = now;
+    if let Some(token) = token {
+        host.bridge.emit(HostEvent::ZoomChanged { percent, page_width, cause: Cause::Host, token: Some(token) });
+        return;
+    }
+    let changed = before.is_some_and(|before| before != now);
+    let resized_by_the_fit = before.is_some_and(|(_, was_fitted)| was_fitted) && page_width;
+    if changed && !resized_by_the_fit {
+        host.bridge.emit(HostEvent::ZoomChanged { percent, page_width, cause: Cause::User, token: None });
+    }
 }
 
 pub(crate) fn after_frame(app: &mut WordApp, ctx: &egui::Context) {
@@ -293,6 +347,7 @@ pub(crate) fn after_frame(app: &mut WordApp, ctx: &egui::Context) {
         host.last_page = Some(page);
         host.bridge.emit(HostEvent::PageChanged { page: page_number(page) });
     }
+    report_zoom(app, &mut host);
     // Selecting is part of editing: no selection events in edit mode (embed API 0.2).
     if host.edit.is_none() {
         settle_selection(app, &mut host, ctx);

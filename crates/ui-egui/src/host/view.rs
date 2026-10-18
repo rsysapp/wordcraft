@@ -125,6 +125,12 @@ fn displayed_percent(app: &WordApp) -> f32 {
     if percent.is_finite() { percent.clamp(10.0, 500.0) } else { 100.0 }
 }
 
+/// [`displayed_percent`] as the whole percentage `zoomChanged` reports.
+pub(crate) fn displayed_percent_whole(app: &WordApp) -> u32 {
+    // Rounded and clamped to 10..=500 above, so the conversion cannot lose anything.
+    displayed_percent(app) as u32
+}
+
 /// Zoom in or out from what is on screen. While a fit is set the engine's stored zoom (the step's
 /// starting point) is stale, so a step from it could zoom the wrong way.
 fn step_zoom(app: &mut WordApp, command: &str) {
@@ -137,7 +143,7 @@ fn step_zoom(app: &mut WordApp, command: &str) {
 }
 
 /// A zoom moves every page: put the jump's target at the top again, so it stays in view.
-fn keep_target_in_view(app: &mut WordApp) {
+pub(crate) fn keep_target_in_view(app: &mut WordApp) {
     if let Some(target) = app.host.as_mut().and_then(|host| host.target_scroll()) {
         app.canvas.scroll_to_doc = Some(target);
     }

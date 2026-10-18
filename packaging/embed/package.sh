@@ -137,11 +137,14 @@ for want in \
   'setListener(listener: (event: EditorEvent) => void): void;' \
   'destroy(): void;' \
   'setMode(request: ModeRequest): void;' \
+  'setZoom(request: ZoomRequest): void;' \
   'requestSave(): void;' \
   'applyRedactions(): void;' \
   'export interface MountOptions' \
   'viewBar?: boolean;' \
   "{ type: 'findRequested' }" \
+  "{ type: 'zoomChanged'; percent: number; pageWidth: boolean; cause: 'user' | 'host'; token: number | null }" \
+  'export type ZoomRequest' \
   'export interface Theme' \
   'export type JumpTarget' \
   'export interface Mark' \
