@@ -54,6 +54,13 @@ export interface OpenOptions {
 
 export type ZoomRequest = { zoom: number | 'pageWidth'; token: number };
 
+export interface BlockRef {
+    part: string;
+    index: number;
+}
+
+export type ScrollRequest = { block: BlockRef; fraction: number; token: number };
+
 export type EditorEvent =
     | { type: 'opened'; pages: number }
     | { type: 'openFailed'; message: string }
@@ -69,6 +76,8 @@ export type EditorEvent =
     | { type: 'commentRequested'; text: string; copyText: string; page: number | null; x: number; y: number }
     | { type: 'findRequested' }
     | { type: 'zoomChanged'; percent: number; pageWidth: boolean; cause: 'user' | 'host'; token: number | null }
+    | { type: 'viewport'; top: BlockRef | null; fraction: number; visibleHeight: number; page: number; pages: number; cause: 'user' | 'host'; token: number | null }
+    | { type: 'blockNotFound'; block: BlockRef; token: number }
     | { type: 'redactionsPending'; marks: number }
     | { type: 'editRefused'; code: EditRefusalCode };
 
@@ -110,6 +119,8 @@ mod tests {
             "export type ModeRequest = | { mode: 'view' } | { mode: 'edit'; author: EditorAuthor; revisionDate: string; permissions: EditorPermissions };",
             "export interface OpenOptions { display?: 'asStored' | 'final'; }",
             "export type ZoomRequest = { zoom: number | 'pageWidth'; token: number };",
+            "export interface BlockRef { part: string; index: number; }",
+            "export type ScrollRequest = { block: BlockRef; fraction: number; token: number };",
             "export type EditorEvent = | { type: 'opened'; pages: number } | { type: 'openFailed'; message: string } \
              | { type: 'pageChanged'; page: number } \
              | { type: 'selection'; text: string; copyText: string; page: number | null; x: number; y: number } \
@@ -119,6 +130,8 @@ mod tests {
              | { type: 'commentRequested'; text: string; copyText: string; page: number | null; x: number; y: number } \
              | { type: 'findRequested' } \
              | { type: 'zoomChanged'; percent: number; pageWidth: boolean; cause: 'user' | 'host'; token: number | null } \
+             | { type: 'viewport'; top: BlockRef | null; fraction: number; visibleHeight: number; page: number; pages: number; cause: 'user' | 'host'; token: number | null } \
+             | { type: 'blockNotFound'; block: BlockRef; token: number } \
              | { type: 'redactionsPending'; marks: number } | { type: 'editRefused'; code: EditRefusalCode };",
             "export type EditRefusalCode = | 'command_not_allowed' | 'decision_not_allowed' | 'paragraph_break_not_supported' \
              | 'character_not_allowed' | 'outside_editable_story' | 'invalid_edit_session' \
@@ -164,6 +177,10 @@ mod tests {
             (
                 "setZoom",
                 "#[wasm_bindgen(js_name = setZoom)] pub fn set_zoom(&self, #[wasm_bindgen(unchecked_param_type = \"ZoomRequest\")] request: JsValue)",
+            ),
+            (
+                "scrollToBlock",
+                "#[wasm_bindgen(js_name = scrollToBlock)] pub fn scroll_to_block(&self, #[wasm_bindgen(unchecked_param_type = \"ScrollRequest\")] request: JsValue)",
             ),
             ("requestSave", "#[wasm_bindgen(js_name = requestSave)] pub fn request_save(&self) {"),
             ("applyRedactions", "#[wasm_bindgen(js_name = applyRedactions)] pub fn apply_redactions(&self) {"),

@@ -207,6 +207,33 @@ pub fn parse_zoom_request(json: &str) -> Result<ZoomRequest, String> {
     Ok(request)
 }
 
+/// A top-level block of the body, named as Clauflow's locations name it: the part and the origin
+/// index of the block's paragraph, a table by its first paragraph (`wordcraft_docx::facts::Locator`).
+#[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BlockRef {
+    pub part: String,
+    pub index: u32,
+}
+
+/// `scrollToBlock`'s request (embed API 0.3): put `fraction` (0 to 1) of the way down `block` at the
+/// top of the view. The `viewport` it causes carries the host's `token` back.
+#[derive(Clone, Debug, PartialEq, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ScrollRequest {
+    pub block: BlockRef,
+    pub fraction: f32,
+    pub token: u32,
+}
+
+pub fn parse_scroll_request(json: &str) -> Result<ScrollRequest, String> {
+    let request: ScrollRequest = serde_json::from_str(json).map_err(|error| format!("scrollToBlock: {error}"))?;
+    if !(0.0..=1.0).contains(&request.fraction) {
+        return Err(format!("scrollToBlock: fraction {} is outside 0 to 1", request.fraction));
+    }
+    Ok(request)
+}
+
 pub fn parse_open_options(json: &str) -> Result<OpenOptions, String> {
     serde_json::from_str(json).map_err(|error| format!("open: {error}"))
 }
@@ -331,6 +358,37 @@ mod tests {
             r#"{"zoom":1e21,"token":1}"#,
         ] {
             assert!(parse_zoom_request(bad).is_err(), "{bad}");
+        }
+    }
+
+    #[test]
+    fn scroll_requests_take_a_block_a_fraction_from_zero_to_one_and_a_token() {
+        let block = BlockRef { part: "word/document.xml".into(), index: 7 };
+        assert_eq!(
+            parse_scroll_request(r#"{"block":{"part":"word/document.xml","index":7},"fraction":0.25,"token":3}"#),
+            Ok(ScrollRequest { block: block.clone(), fraction: 0.25, token: 3 })
+        );
+        for edge in ["0", "1"] {
+            let json = format!(r#"{{"block":{{"part":"word/document.xml","index":7}},"fraction":{edge},"token":0}}"#);
+            assert!(parse_scroll_request(&json).is_ok(), "{json}");
+        }
+        for bad in [
+            r#"{"block":{"part":"p","index":1},"fraction":1.5,"token":1}"#,
+            r#"{"block":{"part":"p","index":1},"fraction":-0.1,"token":1}"#,
+            r#"{"block":{"part":"p","index":1},"fraction":null,"token":1}"#,
+            r#"{"block":{"part":"p","index":1},"fraction":"half","token":1}"#,
+            r#"{"block":{"part":"p","index":1},"fraction":0.5}"#,
+            r#"{"block":{"part":"p","index":1},"fraction":0.5,"token":-1}"#,
+            r#"{"block":{"part":"p","index":1},"fraction":0.5,"token":1.5}"#,
+            r#"{"block":{"part":"p","index":-1},"fraction":0.5,"token":1}"#,
+            r#"{"block":{"part":"p","index":1.5},"fraction":0.5,"token":1}"#,
+            r#"{"block":{"part":"p","index":4294967296},"fraction":0.5,"token":1}"#,
+            r#"{"block":{"part":7,"index":1},"fraction":0.5,"token":1}"#,
+            r#"{"block":{"index":1},"fraction":0.5,"token":1}"#,
+            r#"{"block":null,"fraction":0.5,"token":1}"#,
+            r#"{"fraction":0.5,"token":1}"#,
+        ] {
+            assert!(parse_scroll_request(bad).is_err(), "{bad}");
         }
     }
 

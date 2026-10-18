@@ -15,6 +15,8 @@ pub mod state;
 pub mod text_match;
 #[doc(hidden)]
 pub mod view;
+// embed: the view in document terms (embed API 0.3).
+pub(crate) mod viewport;
 pub mod wire;
 
 pub use bridge::{Cause, EditorMode, HostBridge, HostCommand, HostEvent, encode_for_host};
@@ -22,7 +24,7 @@ pub use bridge::{Cause, EditorMode, HostBridge, HostCommand, HostEvent, encode_f
 pub use profile::EmbedProfile;
 #[doc(hidden)]
 pub use state::HostState;
-pub use wire::{Display, FitWidth, JumpTarget, MarkSpec, MountOptions, OpenOptions, ThemeSpec, ZoomRequest, ZoomValue};
+pub use wire::{BlockRef, Display, FitWidth, JumpTarget, MarkSpec, MountOptions, OpenOptions, ScrollRequest, ThemeSpec, ZoomRequest, ZoomValue};
 
 /// Set up the context an embed build's app runs in; call it once the runner made the context.
 ///

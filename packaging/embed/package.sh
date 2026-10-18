@@ -138,6 +138,7 @@ for want in \
   'destroy(): void;' \
   'setMode(request: ModeRequest): void;' \
   'setZoom(request: ZoomRequest): void;' \
+  'scrollToBlock(request: ScrollRequest): void;' \
   'requestSave(): void;' \
   'applyRedactions(): void;' \
   'export interface MountOptions' \
@@ -145,6 +146,10 @@ for want in \
   "{ type: 'findRequested' }" \
   "{ type: 'zoomChanged'; percent: number; pageWidth: boolean; cause: 'user' | 'host'; token: number | null }" \
   'export type ZoomRequest' \
+  'export interface BlockRef' \
+  'export type ScrollRequest' \
+  "{ type: 'viewport'; top: BlockRef | null; fraction: number; visibleHeight: number; page: number; pages: number; cause: 'user' | 'host'; token: number | null }" \
+  "{ type: 'blockNotFound'; block: BlockRef; token: number }" \
   'export interface Theme' \
   'export type JumpTarget' \
   'export interface Mark' \

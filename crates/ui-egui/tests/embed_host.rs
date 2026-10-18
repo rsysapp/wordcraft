@@ -16,7 +16,7 @@ fn opening_a_word_document_answers_opened_and_page_one() {
     let count = pages(&mut h);
     assert!(count >= 3, "fixture too short: {count} pages");
     assert_eq!(events.first(), Some(&HostEvent::Opened { pages: count as u32 }), "{events:?}");
-    assert_eq!(events, vec![HostEvent::Opened { pages: count as u32 }, HostEvent::PageChanged { page: 1 }]);
+    assert_eq!(without_viewports(events), vec![HostEvent::Opened { pages: count as u32 }, HostEvent::PageChanged { page: 1 }]);
     assert!(h.state().session.view_only, "an opened document stays view-only");
     assert!(!h.state().session.dirty);
 }
@@ -45,18 +45,18 @@ fn no_page_changed_comes_before_the_first_opened() {
     // The first open: `opened` first, then its page.
     let events = open_doc(&mut h, &bridge, &clauses(120));
     let count = pages(&mut h) as u32;
-    assert_eq!(events, vec![HostEvent::Opened { pages: count }, HostEvent::PageChanged { page: 1 }]);
+    assert_eq!(without_viewports(events), vec![HostEvent::Opened { pages: count }, HostEvent::PageChanged { page: 1 }]);
     // And after it, page changes are reported as before.
     h.state_mut().canvas.scroll_to_doc = Some((2, 0.0));
     frames(&mut h, 4);
-    assert_eq!(bridge.take_events(), vec![HostEvent::PageChanged { page: 3 }]);
+    assert_eq!(without_viewports(bridge.take_events()), vec![HostEvent::PageChanged { page: 3 }]);
     bridge.send(HostCommand::JumpTo(JumpTarget::Page { page: 2 }));
     frames(&mut h, 4);
-    assert_eq!(bridge.take_events(), vec![HostEvent::PageChanged { page: 2 }]);
+    assert_eq!(without_viewports(bridge.take_events()), vec![HostEvent::PageChanged { page: 2 }]);
     // A second open: its `opened` comes before its page, which is reported again even though the
     // previous document was on another one.
     let events = open_doc(&mut h, &bridge, &clauses(120));
-    assert_eq!(events, vec![HostEvent::Opened { pages: count }, HostEvent::PageChanged { page: 1 }]);
+    assert_eq!(without_viewports(events), vec![HostEvent::Opened { pages: count }, HostEvent::PageChanged { page: 1 }]);
 }
 
 /// The same for a one-page document, whose page 1 is also the empty starting document's only page.
@@ -73,10 +73,10 @@ fn a_one_page_document_reports_its_page_only_after_opened() {
     assert!(!bridge.take_events().iter().any(|e| matches!(e, HostEvent::PageChanged { .. })));
     let events = open_doc(&mut h, &bridge, &clauses(1));
     assert_eq!(pages(&mut h), 1);
-    assert_eq!(events, vec![HostEvent::Opened { pages: 1 }, HostEvent::PageChanged { page: 1 }]);
+    assert_eq!(without_viewports(events), vec![HostEvent::Opened { pages: 1 }, HostEvent::PageChanged { page: 1 }]);
     // Opening it again reports its page again, after `opened`.
     let events = open_doc(&mut h, &bridge, &clauses(1));
-    assert_eq!(events, vec![HostEvent::Opened { pages: 1 }, HostEvent::PageChanged { page: 1 }]);
+    assert_eq!(without_viewports(events), vec![HostEvent::Opened { pages: 1 }, HostEvent::PageChanged { page: 1 }]);
 }
 
 #[test]
@@ -142,7 +142,7 @@ fn scrolling_to_another_page_reports_it_once() {
     open_doc(&mut h, &bridge, &clauses(120));
     h.state_mut().canvas.scroll_to_doc = Some((2, 0.0));
     frames(&mut h, 4);
-    assert_eq!(bridge.take_events(), vec![HostEvent::PageChanged { page: 3 }]);
+    assert_eq!(without_viewports(bridge.take_events()), vec![HostEvent::PageChanged { page: 3 }]);
     assert_eq!(h.state().canvas.visible_page, Some(2));
     frames(&mut h, 3);
     assert!(bridge.take_events().is_empty(), "pageChanged repeated without a change");
@@ -155,13 +155,13 @@ fn a_second_open_replaces_the_document_and_reports_page_one_again() {
     h.state_mut().canvas.scroll_to_doc = Some((2, 0.0));
     frames(&mut h, 4);
     // The view really was on page 3, so page 1 below is the open's doing.
-    assert_eq!(bridge.take_events(), vec![HostEvent::PageChanged { page: 3 }]);
+    assert_eq!(without_viewports(bridge.take_events()), vec![HostEvent::PageChanged { page: 3 }]);
     assert_eq!(h.state().canvas.visible_page, Some(2));
     // Several pages, so the previous document's scroll position still lands on a page of this one.
     let events = open_doc(&mut h, &bridge, &clauses(120));
     let count = pages(&mut h) as u32;
     assert!(count >= 3, "fixture too short: {count} pages");
-    assert_eq!(events, vec![HostEvent::Opened { pages: count }, HostEvent::PageChanged { page: 1 }]);
+    assert_eq!(without_viewports(events), vec![HostEvent::Opened { pages: count }, HostEvent::PageChanged { page: 1 }]);
     assert_eq!(h.state().canvas.visible_page, Some(0));
     assert!(h.state().session.view_only);
 }
@@ -173,7 +173,7 @@ fn a_newer_jump_replaces_a_waiting_one() {
     h.state_mut().canvas.scroll_to_doc = Some((2, 0.0));
     h.state_mut().canvas.scroll_to_doc = Some((1, 0.0));
     frames(&mut h, 4);
-    assert_eq!(bridge.take_events(), vec![HostEvent::PageChanged { page: 2 }]);
+    assert_eq!(without_viewports(bridge.take_events()), vec![HostEvent::PageChanged { page: 2 }]);
 }
 
 #[test]
@@ -187,7 +187,7 @@ fn a_jump_past_the_last_page_or_with_a_wild_offset_moves_nothing_and_never_panic
     }
     // Only real pages are ever reported.
     let count = pages(&mut h) as u32;
-    for event in bridge.take_events() {
+    for event in without_viewports(bridge.take_events()) {
         assert!(matches!(event, HostEvent::PageChanged { page } if (1..=count).contains(&page)), "{event:?}");
     }
 }
@@ -459,7 +459,7 @@ fn a_host_jump_wins_over_a_caret_scroll_from_the_same_frame() {
     h.state_mut().canvas.scroll_to_doc = Some((4, 0.0));
     frames(&mut h, 6);
     assert_eq!(h.state().canvas.visible_page, Some(4));
-    assert_eq!(bridge.take_events(), vec![HostEvent::PageChanged { page: 5 }]);
+    assert_eq!(without_viewports(bridge.take_events()), vec![HostEvent::PageChanged { page: 5 }]);
 }
 
 #[test]
@@ -496,7 +496,7 @@ fn a_scroll_animation_already_running_does_not_carry_the_view_off_a_host_jump() 
         h.step();
     }
     assert_eq!(h.state().canvas.visible_page, Some(1), "the animation moved the view off the jump");
-    let events = bridge.take_events();
+    let events = without_viewports(bridge.take_events());
     assert_eq!(events.last(), Some(&HostEvent::PageChanged { page: 2 }), "{events:?}");
 }
 
@@ -625,7 +625,7 @@ fn jumping_to_a_page_puts_its_top_at_the_top_of_the_view() {
     open_doc(&mut h, &bridge, &clauses(120));
     bridge.send(HostCommand::JumpTo(JumpTarget::Page { page: 3 }));
     frames(&mut h, 4);
-    assert_eq!(bridge.take_events(), vec![HostEvent::PageChanged { page: 3 }]);
+    assert_eq!(without_viewports(bridge.take_events()), vec![HostEvent::PageChanged { page: 3 }]);
     let app = h.state();
     let (page, view) = (app.canvas.page_rects[2], app.canvas.canvas_rect.expect("canvas"));
     assert!((page.min.y - view.min.y).abs() < 2.0, "page 3 top at {}, view top at {}", page.min.y, view.min.y);
@@ -643,7 +643,7 @@ fn jumping_to_text_selects_the_folded_match_and_scrolls_to_it() {
         let app = h.state_mut();
         app.session.layout().page_of(&app.session.sel.ordered().0).expect("laid out")
     };
-    let events = bridge.take_events();
+    let events = without_viewports(bridge.take_events());
     assert_eq!(events, vec![HostEvent::PageChanged { page: page as u32 + 1 }], "the passage's page is reported");
     assert!(!events.iter().any(|e| matches!(e, HostEvent::Selection { .. })), "a jump is not a person's selection");
     assert_eq!(page_target(&h), Some(page));
@@ -665,7 +665,7 @@ fn page_and_occurrence_narrow_a_text_jump() {
     frames(&mut h, 4);
     assert_eq!(h.state().session.sel.ordered().0, on_page_two[1]);
     assert_eq!(h.state().session.selected_text(), "The Supplier shall deliver");
-    assert_eq!(bridge.take_events(), vec![HostEvent::PageChanged { page: 2 }]);
+    assert_eq!(without_viewports(bridge.take_events()), vec![HostEvent::PageChanged { page: 2 }]);
     // Without a page, the occurrence counts through the whole document.
     bridge.send(HostCommand::JumpTo(text_target("the supplier shall deliver", None, 76)));
     frames(&mut h, 4);
@@ -774,7 +774,7 @@ fn commands_sent_before_the_first_frame_apply_in_order() {
     bridge.send(HostCommand::JumpTo(text_target("Clause 90.", None, 0)));
     let mut h = harness(app, 1.0);
     frames(&mut h, 4);
-    let events = bridge.take_events();
+    let events = without_viewports(bridge.take_events());
     assert!(matches!(events.first(), Some(HostEvent::Opened { .. })), "{events:?}");
     assert!(!events.iter().any(|e| matches!(e, HostEvent::JumpNotFound { .. })), "{events:?}");
     assert_eq!(h.state().session.selected_text(), "Clause 90.");
@@ -799,7 +799,7 @@ fn a_newer_host_jump_replaces_a_waiting_one() {
         app.session.layout().page_of(&Pos::body(29, 0)).expect("laid out")
     };
     assert_ne!(page, 3, "the fixture puts clause 30 on page 4, so this proves nothing");
-    assert_eq!(bridge.take_events(), vec![HostEvent::PageChanged { page: page as u32 + 1 }]);
+    assert_eq!(without_viewports(bridge.take_events()), vec![HostEvent::PageChanged { page: page as u32 + 1 }]);
     assert_eq!(h.state().session.selected_text(), "Clause 30.");
     // A newer jump that finds nothing replaces a waiting one too: the view stays where it was.
     let before = h.state().canvas.page_rects.clone();
@@ -846,7 +846,7 @@ fn a_jump_waiting_when_an_open_replaces_the_document_answers_jump_not_found() {
         frames(&mut h, 4);
         let count = pages(&mut h) as u32;
         assert_eq!(
-            bridge.take_events(),
+            without_viewports(bridge.take_events()),
             vec![HostEvent::JumpNotFound { target: target.clone() }, HostEvent::Opened { pages: count }, HostEvent::PageChanged { page: 1 }]
         );
         assert_eq!(h.state().canvas.visible_page, Some(0), "{target:?} was applied to the new document");
@@ -863,7 +863,7 @@ fn a_jump_waiting_when_an_open_replaces_the_document_answers_jump_not_found() {
     bridge.send(HostCommand::Open { name: "b.docx".into(), bytes: second.clone(), options: Default::default() });
     let mut h = harness(app, 1.0);
     frames(&mut h, 4);
-    let events = bridge.take_events();
+    let events = without_viewports(bridge.take_events());
     let (first, second) = (HostEvent::Opened { pages: 8 }, HostEvent::Opened { pages: pages(&mut h) as u32 });
     assert_eq!(events, vec![first, HostEvent::JumpNotFound { target: early }, second, HostEvent::PageChanged { page: 1 }]);
 }
@@ -884,7 +884,7 @@ fn an_open_clears_the_reported_selection_before_answering_the_waiting_jump() {
     frames(&mut h, 4);
     let count = pages(&mut h) as u32;
     assert_eq!(
-        bridge.take_events(),
+        without_viewports(bridge.take_events()),
         vec![HostEvent::SelectionCleared, HostEvent::JumpNotFound { target }, HostEvent::Opened { pages: count }, HostEvent::PageChanged { page: 1 }]
     );
 }
@@ -896,7 +896,7 @@ fn a_jump_waiting_when_an_open_fails_still_lands() {
     bridge.send(HostCommand::JumpTo(JumpTarget::Page { page: 4 }));
     bridge.send(HostCommand::Open { name: "broken.docx".into(), bytes: b"PK\x03\x04 broken".to_vec(), options: Default::default() });
     frames(&mut h, 4);
-    let events = bridge.take_events();
+    let events = without_viewports(bridge.take_events());
     assert!(matches!(events.as_slice(), [HostEvent::OpenFailed { .. }, HostEvent::PageChanged { page: 4 }]), "{events:?}");
 }
 
@@ -916,7 +916,7 @@ fn a_resize_keeps_the_jump_target_in_view() {
         assert!((page.min.y - view.min.y).abs() < 2.0, "{size:?}: page 3 top at {}, view top at {}", page.min.y, view.min.y);
         assert_eq!(page_target(&h), Some(2), "{size:?}: a resize is not a person scrolling");
     }
-    assert!(bridge.take_events().is_empty(), "the reported page stays 3");
+    assert!(without_viewports(bridge.take_events()).is_empty(), "the reported page stays 3");
     // A passage stays in view too.
     h.set_size(WINDOW);
     bridge.send(HostCommand::JumpTo(text_target("Clause 77.", None, 0)));

@@ -764,7 +764,7 @@ fn a_wheel_scroll_drops_the_page_target_and_the_host_follows_what_is_visible() {
     let visible = h.state().canvas.visible_page.expect("a visible page");
     assert!(visible < 2, "the wheel did not scroll up (visible page {visible})");
     assert_eq!(bar_page(&h), Some(visible + 1));
-    let events = bridge.take_events();
+    let events = without_viewports(bridge.take_events());
     assert_eq!(events.last(), Some(&wordcraft_ui_egui::host::HostEvent::PageChanged { page: visible as u32 + 1 }), "{events:?}");
 }
 

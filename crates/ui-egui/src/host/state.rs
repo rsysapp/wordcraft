@@ -9,7 +9,7 @@ use wordcraft_engine::Selection;
 use super::bridge::{Cause, HostBridge, HostCommand, HostEvent};
 use super::marks::Marks;
 use super::text_match::{TextIndex, visible_fragment_text};
-use super::wire::{Display, JumpTarget, OpenOptions, ThemeSpec, ZoomRequest, ZoomValue, occurrence_index, page_index};
+use super::wire::{Display, JumpTarget, OpenOptions, ScrollRequest, ThemeSpec, ZoomRequest, ZoomValue, occurrence_index, page_index};
 use crate::WordApp;
 
 /// Points left above a passage the host jumps to, so it does not sit on the view's edge. The PDF
@@ -118,6 +118,9 @@ pub struct HostState {
     last_zoom: Option<(u32, bool)>,
     /// The token of a `setZoom` not yet answered; the next frame's `zoomChanged` carries it.
     zoom_token: Option<u32>,
+    /// The open document's locator, the token of a `scrollToBlock` not yet answered and the last view
+    /// told to the host (embed API 0.3).
+    pub(crate) viewport: super::viewport::ViewportState,
 }
 
 impl HostState {
@@ -216,6 +219,7 @@ impl HostState {
             clean_display: false,
             last_zoom: None,
             zoom_token: None,
+            viewport: Default::default(),
         }
     }
 
@@ -263,6 +267,7 @@ pub(crate) fn before_frame(app: &mut WordApp, ctx: &egui::Context) {
             // Answered here, before any later command of the frame changes the document or the mode.
             HostCommand::RequestSave => super::edit::save(app, &mut host),
             HostCommand::SetZoom(request) => set_zoom(app, &mut host, &request),
+            HostCommand::ScrollToBlock(request) => scroll_to_block(app, &mut host, &request),
         }
     }
     app.host = Some(host);
@@ -303,6 +308,50 @@ fn set_zoom(app: &mut WordApp, host: &mut HostState, request: &ZoomRequest) {
     app.canvas.wheel.cancel();
     super::view::keep_target_in_view(app);
     host.zoom_token = Some(request.token);
+}
+
+/// Put a fraction of the block the host named at the top of the view, as a page jump does, but
+/// selecting nothing. The `viewport` that follows carries the request's token; a block the document
+/// lacks is answered `blockNotFound` at once and moves nothing.
+fn scroll_to_block(app: &mut WordApp, host: &mut HostState, request: &ScrollRequest) {
+    let Some((page, y)) = super::viewport::target(app, &mut host.viewport, &request.block, request.fraction) else {
+        host.bridge.emit(HostEvent::BlockNotFound { block: request.block.clone(), token: request.token });
+        return;
+    };
+    app.canvas.scroll_to_doc = Some((page, y));
+    host.aim(page, y);
+    host.viewport.scroll_token = Some(request.token);
+}
+
+/// Tell the host where the view is, after the frame that drew it, when it changed. Its own
+/// `scrollToBlock` is answered once its scroll has landed, with its token, even when the view was
+/// already there (it may be waiting on the token); the first reading after an open is `Host` without
+/// one; any other change is the person's (or the pages moving under them: a resize, a layout).
+fn report_viewport(app: &mut WordApp, host: &mut HostState) {
+    if !host.opened {
+        return;
+    }
+    // The canvas took the scroll this frame: the view measured below is the one it landed on.
+    let landed = host.viewport.scroll_token.is_some() && app.canvas.scroll_to_doc.is_none();
+    // Not drawn yet: asked again next frame, the token still waiting.
+    let Some(reading) = super::viewport::read(app, &mut host.viewport) else { return };
+    let (reading, key) = reading.rounded();
+    let first = host.viewport.last.is_none();
+    let changed = host.viewport.last.replace(key.clone()) != Some(key);
+    let token = if landed { host.viewport.scroll_token.take() } else { None };
+    if !(changed || token.is_some()) {
+        return;
+    }
+    let cause = if token.is_some() || first { Cause::Host } else { Cause::User };
+    host.bridge.emit(HostEvent::Viewport {
+        top: reading.top,
+        fraction: reading.fraction,
+        visible_height: reading.visible_height,
+        page: reading.page,
+        pages: reading.pages,
+        cause,
+        token,
+    });
 }
 
 /// Tell the host of a zoom change, after the frame that drew it. The host's own request is always
@@ -348,6 +397,7 @@ pub(crate) fn after_frame(app: &mut WordApp, ctx: &egui::Context) {
         host.bridge.emit(HostEvent::PageChanged { page: page_number(page) });
     }
     report_zoom(app, &mut host);
+    report_viewport(app, &mut host);
     // Selecting is part of editing: no selection events in edit mode (embed API 0.2).
     if host.edit.is_none() {
         settle_selection(app, &mut host, ctx);
@@ -602,6 +652,8 @@ fn open(app: &mut WordApp, host: &mut HostState, name: &str, bytes: &[u8], optio
             host.file_open = true;
             host.file_name = name.to_string();
             app.session.set_document(doc);
+            let part_names = wordcraft_docx::facts::part_names(bytes).ok();
+            host.viewport.opened(&app.session.doc, app.session.content_version(), part_names);
             apply_display(app, host, options.display);
             // A new document starts clean; `dirtyChanged` reports its edits from here.
             host.opened_version = app.session.content_version();

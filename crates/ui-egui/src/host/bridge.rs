@@ -6,10 +6,10 @@ use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 use serde::Serialize;
 
-use super::wire::{JumpTarget, MarkSpec, ModeRequest, OpenOptions, ThemeSpec, ZoomRequest};
+use super::wire::{BlockRef, JumpTarget, MarkSpec, ModeRequest, OpenOptions, ScrollRequest, ThemeSpec, ZoomRequest};
 
 /// What a host page asks of the editor.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq)]
 pub enum HostCommand {
     /// Open a document, replacing the open one; answered by `Opened` or `OpenFailed`.
     Open { name: String, bytes: Vec<u8>, options: OpenOptions },
@@ -28,6 +28,9 @@ pub enum HostCommand {
     RequestSave,
     /// Set the zoom; answered by `ZoomChanged` carrying the request's token. Embed API 0.3.
     SetZoom(ZoomRequest),
+    /// Put a fraction of a block at the top of the view; answered by `Viewport` carrying the
+    /// request's token, or `BlockNotFound`. Embed API 0.3.
+    ScrollToBlock(ScrollRequest),
 }
 
 /// What the editor tells the host page; serialises to the embed API's `EditorEvent`.
@@ -90,6 +93,27 @@ pub enum HostEvent {
         page_width: bool,
         cause: Cause,
         token: Option<u32>,
+    },
+    /// Where the view is, in document terms (embed API 0.3): `top` is the top-level body block at the
+    /// top of the view (`None` when none is named), `fraction` how much of it lies above the view's
+    /// top (0 to 1), `visible_height` the view's height in document points, `page` the 1-based page at
+    /// the top of the view and `pages` the page count. Sent once per frame at most, when one of them
+    /// changed. A scroll the host asked for (`scrollToBlock`) is answered with `cause: Host` and its
+    /// token; the first one after `Opened` is `Host` without a token; any other is the person's
+    /// (`User`).
+    Viewport {
+        top: Option<BlockRef>,
+        fraction: f32,
+        visible_height: f32,
+        page: u32,
+        pages: u32,
+        cause: Cause,
+        token: Option<u32>,
+    },
+    /// `scrollToBlock` named a block the open document does not have (or has no layout for).
+    BlockNotFound {
+        block: BlockRef,
+        token: u32,
     },
     /// An action refused in edit mode, once per action, by its stable code (`edit_mode::Refusal`).
     EditRefused {
@@ -282,6 +306,35 @@ mod tests {
             (
                 HostEvent::ZoomChanged { percent: 98, page_width: true, cause: Cause::User, token: None },
                 json!({"type": "zoomChanged", "percent": 98, "pageWidth": true, "cause": "user", "token": null}),
+            ),
+            (
+                HostEvent::Viewport {
+                    top: Some(BlockRef { part: "word/document.xml".into(), index: 12 }),
+                    fraction: 0.5,
+                    visible_height: 600.0,
+                    page: 2,
+                    pages: 9,
+                    cause: Cause::Host,
+                    token: Some(3),
+                },
+                json!({
+                    "type": "viewport",
+                    "top": {"part": "word/document.xml", "index": 12},
+                    "fraction": 0.5,
+                    "visibleHeight": 600.0,
+                    "page": 2,
+                    "pages": 9,
+                    "cause": "host",
+                    "token": 3
+                }),
+            ),
+            (
+                HostEvent::Viewport { top: None, fraction: 0.0, visible_height: 600.0, page: 1, pages: 1, cause: Cause::User, token: None },
+                json!({"type": "viewport", "top": null, "fraction": 0.0, "visibleHeight": 600.0, "page": 1, "pages": 1, "cause": "user", "token": null}),
+            ),
+            (
+                HostEvent::BlockNotFound { block: BlockRef { part: "word/document.xml".into(), index: 999 }, token: 4 },
+                json!({"type": "blockNotFound", "block": {"part": "word/document.xml", "index": 999}, "token": 4}),
             ),
             (HostEvent::SaveFailed { message: "m".into() }, json!({"type": "saveFailed", "message": "m"})),
             (HostEvent::EditRefused { code: "command_not_allowed".into() }, json!({"type": "editRefused", "code": "command_not_allowed"})),

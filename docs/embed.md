@@ -154,7 +154,7 @@ editor.destroy();
 `EmbeddedEditor`'s methods are `static mount(canvas, options)`, `open(bytes, fileName, options?)`,
 `jumpTo(target)`, `setMarks(marks)`, `setTheme(theme)`, `setListener(listener)`, `destroy()` and,
 from API 0.2, `setMode(request: ModeRequest)`, `requestSave()` and `applyRedactions()` and, from API
-0.3, `setZoom(request: ZoomRequest)`. The types,
+0.3, `setZoom(request: ZoomRequest)` and `scrollToBlock(request: ScrollRequest)`. The types,
 as `wordcraft_embed.d.ts` declares them (the package script fails if a declaration is missing):
 
 ```ts
@@ -202,6 +202,13 @@ export type ModeRequest =
 
 export type ZoomRequest = { zoom: number | 'pageWidth'; token: number };
 
+export interface BlockRef {
+    part: string;
+    index: number;
+}
+
+export type ScrollRequest = { block: BlockRef; fraction: number; token: number };
+
 export type EditorEvent =
     | { type: 'opened'; pages: number }
     | { type: 'openFailed'; message: string }
@@ -217,6 +224,8 @@ export type EditorEvent =
     | { type: 'commentRequested'; text: string; copyText: string; page: number | null; x: number; y: number }
     | { type: 'findRequested' }
     | { type: 'zoomChanged'; percent: number; pageWidth: boolean; cause: 'user' | 'host'; token: number | null }
+    | { type: 'viewport'; top: BlockRef | null; fraction: number; visibleHeight: number; page: number; pages: number; cause: 'user' | 'host'; token: number | null }
+    | { type: 'blockNotFound'; block: BlockRef; token: number }
     | { type: 'redactionsPending'; marks: number }
     | { type: 'editRefused'; code: EditRefusalCode };
 
@@ -402,6 +411,55 @@ sides never drift apart:
   at every `open`: the first `zoomChanged` after an `open` is the first change (or the first
   `setZoom` answer), never the open itself.
 - **View mode's command gate is unchanged.** The zoom is applied by the editor's host state; the
+  commands view mode refuses stay refused.
+
+### Viewport and scrollToBlock
+
+`{ type: 'viewport', top, fraction, visibleHeight, page, pages, cause, token }` tells the host where
+the view is in document terms, so two editors can be kept scrolled level without comparing pixels:
+
+- **`top`** is the top-level block of the body at the top of the view, as `{ part, index }`: the
+  part name of the package (`word/document.xml`) and the origin index of the block's paragraph, the
+  same names Clauflow's locations use. A table is named by its first paragraph. `null` when the block
+  has no such name (a paragraph made while editing), and then `fraction` is 0.
+- **`fraction`** is how much of that block lies above the top of the view, from 0 (its first line is
+  at the top) to 1 (its last line has just gone), rounded to a thousandth. A block cut by a page
+  break counts as one block, from its first line to its last.
+- **`visibleHeight`** is the height of the view in document points (layout points, 1/72 inch): how
+  much of the document it shows, so it grows as the zoom falls.
+- **`page`** is the 1-based page at the top of the view and **`pages`** the page count.
+- **When.** After `opened`, once the document is drawn: the first `viewport` after an `open` is
+  `cause: 'host'` with `token: null`, the baseline. After that one is sent after a frame in which
+  `top`, `fraction` (to a thousandth), `page`, `pages` or `visibleHeight` (to a tenth) changed, at
+  most one per frame; a view that did not change sends nothing. A resize or a layout settling is a
+  change too, and is not told apart from the person scrolling.
+- **`cause: 'user'`** (and `token: null`) is any change that does not answer a `scrollToBlock`: the
+  wheel, a trackpad, the scroll bar, a drag, a key, a zoom, a resize, the view bar's page controls,
+  and also what the host's other calls cause (`jumpTo`, `setZoom`, entering edit mode, which takes
+  room from the view). The editor does not tell those apart; a host that must tell its own calls
+  apart uses `scrollToBlock` and its token.
+- **`cause: 'host'` with a `token`** answers `scrollToBlock`.
+
+`scrollToBlock({ block, fraction, token })` puts `fraction` (0 to 1) of the block `block` names at
+the top of the view, with nothing selected and no margin above it. `block` may name any body
+paragraph, including one in a table: the whole top-level block is scrolled to. `token` is a whole
+number the host chooses, and `fraction` a number from 0 to 1; anything else (a missing field, a
+`fraction` outside 0 to 1, a fractional or negative `index` or `token`) throws a `TypeError` and
+queues nothing.
+
+- **The request is always answered, once, with its token.** After the frame that scrolled, a
+  `viewport` with `cause: 'host'` and the request's `token` is sent **even when the view did not
+  change** (the same place again), so a host waiting on its token is answered, and the token is not
+  left to be taken by the person's next scroll. Two requests in one frame are answered once, with
+  the later token. Only the answer to the host's own request carries a token, so a host that ignores
+  `viewport` events with its own tokens never mistakes its scroll for the person's.
+- **`blockNotFound`.** A block the open document does not have (no such part or index, nothing open,
+  or a block with nothing laid out, such as wording the clean display removed) moves nothing and is
+  answered `{ type: 'blockNotFound', block, token }`, with the request's `token` and no `viewport`.
+- **Placing is exact for one editor, approximate for two.** `top` and `fraction` read from one
+  editor and sent to the same editor put the view back where it was. Between two different documents
+  the host maps the blocks; the editors only agree on what a block and a fraction of it are.
+- **View mode's command gate is unchanged.** The scroll is applied by the editor's host state; the
   commands view mode refuses stay refused.
 
 ## Behaviour a host page relies on

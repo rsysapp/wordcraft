@@ -226,6 +226,15 @@ fn first_origin(table: &Table, depth: usize) -> Option<wordcraft_doc::Origin> {
     })
 }
 
+/// The package's part names, sorted: what [`Locator::new`] takes, read from the archive's entry
+/// list alone (nothing is inflated or parsed), for a caller that already holds the model.
+pub fn part_names(bytes: &[u8]) -> Result<Vec<String>, DocxError> {
+    let mut names = crate::package::entry_order(bytes)?;
+    // The package keeps its parts in a sorted map; origins count parts in that order.
+    names.sort();
+    Ok(names)
+}
+
 /// The model of `bytes` and the package's part names, sorted: what [`Locator::new`] takes. The
 /// package is opened twice, as [`paragraph_facts`] does, and only the names are kept.
 pub fn read_with_part_names(bytes: &[u8], limits: &ReadLimits) -> Result<(Document, Vec<String>), DocxError> {
@@ -811,6 +820,14 @@ mod tests {
             text_run("Closing paragraph.")
         );
         test_package::custom(&body)
+    }
+
+    #[test]
+    fn the_part_names_from_the_entry_list_are_the_packages_sorted_names() {
+        let bytes = sample_with_table();
+        let (_, from_package) = read_with_part_names(&bytes, &LIMITS).unwrap();
+        assert_eq!(part_names(&bytes).unwrap(), from_package);
+        assert!(part_names(b"not a zip").is_err());
     }
 
     #[test]

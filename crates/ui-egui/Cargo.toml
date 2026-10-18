@@ -23,6 +23,8 @@ wordcraft-fonts = { workspace = true }
 wordcraft-layout = { workspace = true }
 wordcraft-render = { workspace = true }
 wordcraft-engine = { workspace = true }
+# embed: the save inspector over edit mode's saves, and the paragraph locator behind viewport and scrollToBlock.
+wordcraft-docx = { workspace = true }
 wordcraft-zotero = { workspace = true }
 egui = { workspace = true }
 serde = { workspace = true }
@@ -49,7 +51,6 @@ js-sys = "0.3"
 
 [dev-dependencies]
 egui_kittest = { workspace = true, features = ["wgpu", "snapshot"] }
-wordcraft-docx = { workspace = true } # embed: the save inspector over edit mode's saves
 zip = { workspace = true }
 
 [build-dependencies]

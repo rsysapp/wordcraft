@@ -262,3 +262,23 @@ pub fn laid_out_text(h: &mut Harness<'_, WordApp>) -> String {
     }
     out
 }
+
+/// A wheel or trackpad scroll of `dy` points over the canvas's centre (negative scrolls down, as
+/// egui reports it); the pointer is moved there first and the wheel event sent after a frame.
+pub fn wheel(h: &mut Harness<'_, WordApp>, dy: f32) {
+    let canvas = h.state().canvas.canvas_rect.expect("the canvas was drawn");
+    h.event(egui::Event::PointerMoved(canvas.center()));
+    frames(h, 1);
+    h.event(egui::Event::MouseWheel {
+        unit: egui::MouseWheelUnit::Point,
+        delta: egui::vec2(0.0, dy),
+        phase: egui::TouchPhase::Move,
+        modifiers: egui::Modifiers::NONE,
+    });
+}
+
+/// `events` without the `viewport` ones: tests of page, jump and mode events say nothing of where
+/// the view is, which `embed_viewport.rs` pins.
+pub fn without_viewports(events: Vec<HostEvent>) -> Vec<HostEvent> {
+    events.into_iter().filter(|event| !matches!(event, HostEvent::Viewport { .. })).collect()
+}

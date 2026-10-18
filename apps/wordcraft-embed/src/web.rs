@@ -120,6 +120,23 @@ impl EmbeddedEditor {
         Ok(())
     }
 
+    /// Puts `fraction` (0 to 1) of the top-level block `block` names at the top of the view.
+    /// Answered by a `viewport` event with `cause: 'host'` and the request's `token`, or by
+    /// `blockNotFound` with the same token.
+    #[wasm_bindgen(js_name = scrollToBlock)]
+    pub fn scroll_to_block(&self, #[wasm_bindgen(unchecked_param_type = "ScrollRequest")] request: JsValue) -> Result<(), JsValue> {
+        // Before `json_of`, as in `setZoom`: NaN and Infinity would read as null there.
+        check_counts(&request, &["token"], "scrollToBlock")?;
+        if request.is_object() {
+            let block =
+                js_sys::Reflect::get(&request, &JsValue::from_str("block")).map_err(|_| type_error("scrollToBlock: block could not be read"))?;
+            check_counts(&block, &["index"], "scrollToBlock")?;
+        }
+        let request = wire::parse_scroll_request(&json_of(&request)?).map_err(|e| type_error(&e))?;
+        self.send(HostCommand::ScrollToBlock(request));
+        Ok(())
+    }
+
     /// Serialises the document; answered by `saveRequested` or `saveFailed`.
     #[wasm_bindgen(js_name = requestSave)]
     pub fn request_save(&self) {

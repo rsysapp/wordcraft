@@ -49,7 +49,9 @@ fn editing(accept_reject_changes: bool) -> (Harness<'static, WordApp>, HostBridg
     let (mut harness, bridge) = opened();
     bridge.send(edit(accept_reject_changes));
     harness.run_steps(2);
-    assert_eq!(bridge.take_events(), vec![HostEvent::ModeChanged { mode: EditorMode::Edit }]);
+    // The edit strip takes room from the canvas, so the view's height changes and a `viewport`
+    // says so (`embed_viewport.rs`); the mode change is what this is about.
+    assert_eq!(common::without_viewports(bridge.take_events()), vec![HostEvent::ModeChanged { mode: EditorMode::Edit }]);
     (harness, bridge)
 }
 
@@ -129,7 +131,7 @@ fn a_too_large_open_leaves_edit_mode_and_leaves_nothing_to_edit() {
     bridge.send(HostCommand::OpenTooLarge { name: "huge.docx".into(), len: MAX_OPEN_BYTES + 1 });
     harness.run_steps(2);
     assert_eq!(
-        bridge.take_events(),
+        common::without_viewports(bridge.take_events()),
         vec![HostEvent::ModeChanged { mode: EditorMode::View }, HostEvent::OpenFailed { message: TOO_LARGE.to_string() }]
     );
     bridge.send(edit(true));
