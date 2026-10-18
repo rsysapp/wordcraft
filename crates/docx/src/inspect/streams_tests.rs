@@ -334,6 +334,30 @@ fn a_renamed_header_part_leaves_paragraph_and_section_formats_equal() {
 }
 
 #[test]
+fn a_paragraph_moved_to_another_list_keeps_its_paragraph_format() {
+    // Clauflow compares numbering by label and position; w:numPr is not paragraph formatting.
+    let item = |list: u32| {
+        format!(r#"<w:p><w:pPr><w:numPr><w:ilvl w:val="0"/><w:numId w:val="{list}"/></w:numPr><w:jc w:val="both"/></w:pPr>{}</w:p>"#, text("Price"))
+    };
+    let (left, right) = (package(&item(1)), package(&item(2)));
+    let pair = read_pair(&left, &right, &default_limits(left.len(), right.len())).unwrap();
+    let ends = |streams: &Streams| -> Vec<FormatId> {
+        streams.stories[0]
+            .items
+            .iter()
+            .filter_map(|item| match item {
+                StreamItem::ParagraphEnd { props, .. } => Some(*props),
+                _ => None,
+            })
+            .collect()
+    };
+    assert_eq!(ends(&pair.left), ends(&pair.right));
+    let justified = package(&item(1).replace("both", "center"));
+    let pair = read_pair(&left, &justified, &default_limits(left.len(), justified.len())).unwrap();
+    assert_ne!(ends(&pair.left), ends(&pair.right), "other paragraph properties still count");
+}
+
+#[test]
 fn hyperlink_targets_are_readable() {
     let link = r#"<w:hyperlink r:id="rId7"><w:r><w:t>terms</w:t></w:r></w:hyperlink><w:hyperlink w:anchor="clause4"><w:r><w:t>clause 4</w:t></w:r></w:hyperlink>"#;
     let bytes = Docx::new(&para(link)).rel(("rId7", rt::HYPERLINK, "https://contoh.test/terms", true)).zip();

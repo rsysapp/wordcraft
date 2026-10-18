@@ -32,6 +32,9 @@ pub struct ParagraphFacts {
     pub label: Option<String>,
     /// The list (`numId`) and level, when the paragraph is a list item.
     pub list: Option<(u32, u8)>,
+    /// The abstract list (`abstractNumId`) whose counters the label follows: lists sharing one
+    /// count together, so a restart through another list keeps it.
+    pub abstract_list: Option<u32>,
     /// 0 for Heading 1 … 8, from the resolved paragraph properties.
     pub outline_level: Option<u8>,
     /// The text of runs that would not be seen: hidden, coloured like what is behind them
@@ -266,6 +269,7 @@ impl<'a> Walk<'a> {
             origin: origin.index,
             label,
             list: numbering.map(|numbering| (numbering.num, numbering.level)),
+            abstract_list: numbering.and_then(|numbering| doc.numbering.abstract_of(numbering.num)).map(|list| list.id),
             outline_level: resolved.outline_level.filter(|level| *level < 9),
             concealed,
         });
@@ -293,6 +297,15 @@ mod tests {
         assert_eq!(labels, vec![Some("1."), Some("1.1"), Some("1.2"), Some("2.")]);
         assert_eq!(facts[1].list, Some((1, 1)));
         assert_eq!(facts[0].list, Some((1, 0)));
+    }
+
+    #[test]
+    fn a_restart_through_another_list_keeps_the_abstract_list_its_counters_follow() {
+        let bytes = test_package::restarted(&[(0, "Definitions"), (0, "Price")], 1, 5);
+        let facts = paragraph_facts(&bytes, &LIMITS).unwrap();
+        let seen: Vec<(Option<&str>, Option<(u32, u8)>, Option<u32>)> =
+            facts.iter().map(|fact| (fact.label.as_deref(), fact.list, fact.abstract_list)).collect();
+        assert_eq!(seen, vec![(Some("1."), Some((1, 0)), Some(0)), (Some("5."), Some((2, 0)), Some(0))]);
     }
 
     #[test]
@@ -458,6 +471,25 @@ mod tests {
 
         pub fn numbered(items: &[(u8, &str)]) -> Vec<u8> {
             zip(&list_items(items), None)
+        }
+
+        /// List items in list 1, the one at `restart` in list 2: the same abstract list, its
+        /// first level started again at `start`.
+        pub fn restarted(items: &[(u8, &str)], restart: usize, start: u32) -> Vec<u8> {
+            let body: String = items
+                .iter()
+                .enumerate()
+                .map(|(index, (level, text))| {
+                    let list = if index == restart { 2 } else { 1 };
+                    format!(
+                        r#"<w:p><w:pPr><w:numPr><w:ilvl w:val="{level}"/><w:numId w:val="{list}"/></w:numPr></w:pPr><w:r><w:t>{text}</w:t></w:r></w:p>"#
+                    )
+                })
+                .collect();
+            let nums = format!(
+                r#"<w:num w:numId="2"><w:abstractNumId w:val="0"/><w:lvlOverride w:ilvl="0"><w:startOverride w:val="{start}"/></w:lvlOverride></w:num>"#
+            );
+            build(&body, None, "", &nums)
         }
 
         pub fn with_header(body: &[(u8, &str)], header: &[(u8, &str)]) -> Vec<u8> {

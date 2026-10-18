@@ -1653,11 +1653,15 @@ impl Walker<'_, '_> {
         }
         let is_wrap = |child: &XEl| WrapKind::of_run_level(&child.name).is_some();
         let mut slots = Vec::new();
-        slots.extend(self.slot("pPr", properties, "w:pPrChange", "w:pPr", &|child| is(child, mark_properties) || is(child, section))?);
+        // embed: streams mode: numbering is compared by its label and position, so `w:numPr` is
+        // not paragraph formatting there.
+        let streams = self.extras.is_some();
+        slots.extend(self.slot("pPr", properties, "w:pPrChange", "w:pPr", &|child| {
+            is(child, mark_properties) || is(child, section) || (streams && &*child.name == "w:numPr")
+        })?);
         slots.extend(self.slot("pPr.rPr", mark_properties, "w:rPrChange", "w:rPr", &is_wrap)?);
         // embed: streams mode: a section's header and footer references are compared by their
         // slot, so which part holds a header is not formatting.
-        let streams = self.extras.is_some();
         slots.extend(self.slot("pPr.sectPr", section, "w:sectPrChange", "w:sectPr", &|child| streams && is_header_or_footer_reference(child))?);
         // embed: streams mode: the section these properties end, as block-level ones would read.
         let section_format = match (self.extras.is_some(), slots.iter().find(|slot| slot.name == "pPr.sectPr")) {
