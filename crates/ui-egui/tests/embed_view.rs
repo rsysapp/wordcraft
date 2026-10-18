@@ -234,7 +234,8 @@ fn the_comments_pane_cannot_rewrite_a_comment() {
         frames(&mut h, 2);
         h.get_by_role(Role::MultilineTextInput).type_text(" changed");
         frames(&mut h, 2);
-        h.key_press(egui::Key::Escape);
+        // Leaving the field writes the draft back; Escape would throw it away (upstream, #1348).
+        h.key_press(egui::Key::Tab);
         frames(&mut h, 3);
         (before, doc_json(&h))
     };

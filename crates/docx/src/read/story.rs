@@ -227,8 +227,8 @@ impl Reader<'_> {
                             props.drop_cap_font = cap_font;
                         }
                         first.append(p);
-        // embed: two `w:p` elements made one paragraph, which neither origin names.
-        first.origin = None;
+                        // embed: two `w:p` elements made one paragraph, which neither origin names.
+                        first.origin = None;
                         first.props = props;
                         out.push(para_block(first));
                         continue;
