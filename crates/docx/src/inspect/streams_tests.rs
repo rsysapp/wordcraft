@@ -381,3 +381,20 @@ fn reports_work_and_memory_spent() {
     let pair = read_pair(&bytes, &bytes, &default_limits(bytes.len(), bytes.len())).unwrap();
     assert!(pair.work_spent > 0 && pair.peak_memory > 0);
 }
+
+#[test]
+fn sha256_hex_names_bytes_as_lowercase_hex() {
+    assert_eq!(sha256_hex(b"abc"), "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad");
+}
+
+#[test]
+fn a_refusal_for_memory_says_so_in_the_words_exported() {
+    let bytes = package(&para(&text("Rent is due monthly.")));
+    let limits = StreamLimits { memory: 1_000, ..default_limits(bytes.len(), bytes.len()) };
+    let error = read_pair(&bytes, &bytes, &limits).err().unwrap();
+    let message = match error {
+        crate::inspect::InspectError::Base(message) | crate::inspect::InspectError::Edited(message) => message,
+    };
+    assert!(message.contains(TOO_MUCH_MEMORY), "{message}");
+    assert_ne!(TOO_MUCH_MEMORY, TOO_MUCH_WORK);
+}

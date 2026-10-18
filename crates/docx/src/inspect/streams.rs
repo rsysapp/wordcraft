@@ -194,6 +194,16 @@ pub(super) struct SideRecord {
     pub part_order: Vec<String>,
 }
 
+/// The words a refusal for want of work or memory contains, so a caller can tell the two apart.
+pub const TOO_MUCH_WORK: &str = super::budget::TOO_MUCH_WORK;
+pub const TOO_MUCH_MEMORY: &str = super::budget::TOO_MUCH_MEMORY;
+
+/// The SHA-256 of `bytes`, lowercase hex: how Clauflow names a file it compared.
+pub fn sha256_hex(bytes: &[u8]) -> String {
+    use sha2::Digest;
+    sha2::Sha256::digest(bytes).iter().map(|byte| format!("{byte:02x}")).collect()
+}
+
 /// Both packages decoded. Errors name the side as [`super::inspect`] does: the left package is
 /// the base, the right the edited one.
 pub fn read_pair(left: &[u8], right: &[u8], limits: &StreamLimits) -> Result<StreamPair, InspectError> {
