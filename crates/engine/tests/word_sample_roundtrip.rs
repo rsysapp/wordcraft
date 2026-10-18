@@ -107,6 +107,9 @@ fn problems(base: &[u8], saved: &[u8]) -> Vec<String> {
         resolved,
         altered_revisions,
         untracked_changes,
+        // Per-part breakdowns of `untracked_changes` and `resolved`, which are checked below.
+        untracked_by_part: _,
+        resolved_by_part: _,
         losses,
         too_many_changes,
         added_parts,
