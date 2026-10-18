@@ -82,6 +82,9 @@ pub(super) enum Extra {
         media: Vec<String>,
         alt: Option<String>,
     },
+    /// What an opaque element's digest hides that a comparison reads as text (`StreamItem::Opaque`
+    /// `detail`). Kept per item: identical elements share one digest.
+    Detail(String),
 }
 
 impl Extra {
@@ -94,9 +97,11 @@ impl Extra {
             Extra::Hyperlink { target, anchor } => {
                 units(target.as_ref().map_or(0, String::len)).saturating_add(units(anchor.as_ref().map_or(0, String::len)))
             }
-            Extra::SimpleField(text) | Extra::NoteStart { id: text, .. } | Extra::NoteReference(_, text) | Extra::Comment(_, text) => {
-                units(text.len())
-            }
+            Extra::SimpleField(text)
+            | Extra::NoteStart { id: text, .. }
+            | Extra::NoteReference(_, text)
+            | Extra::Comment(_, text)
+            | Extra::Detail(text) => units(text.len()),
             Extra::Object { media, alt, .. } => {
                 media.iter().fold(units(alt.as_ref().map_or(0, String::len)), |held, part| held.saturating_add(units(part.len()).saturating_add(24)))
             }

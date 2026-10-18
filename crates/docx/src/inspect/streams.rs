@@ -217,6 +217,13 @@ pub enum StreamItem {
     Opaque {
         element: String,
         digest: String,
+        /// What the digest hides and a comparison needs to read the element as text: a `w:br`'s
+        /// `w:type` as written (none when it has none), and the glyph the document model stores
+        /// for a `w:sym` (none when the model drops it).
+        detail: Option<String>,
+        /// The item sits inside a tracked deletion (or the source of a move), so it is not in
+        /// the text with every change accepted.
+        deleted: bool,
     },
 }
 
@@ -475,6 +482,13 @@ impl Decoder<'_> {
         Ok(found)
     }
 
+    /// Whether a tracked deletion, or the source of a move, is anywhere around an item: the
+    /// document model's rule for a deleted run (`CharProps::del`).
+    fn deleted(&self, wraps: u32, budget: &mut Budget) -> Result<bool, String> {
+        budget.work(1)?;
+        Ok(self.tables.wraps_of(wraps).iter().any(|wrap| matches!(wrap.kind, WrapKind::Del | WrapKind::MoveFrom)))
+    }
+
     fn format(&mut self, id: u32, budget: &mut Budget) -> Result<FormatFacts, String> {
         if let Some(facts) = self.formats.get(&id) {
             return Ok(facts.clone());
@@ -593,7 +607,12 @@ impl Decoder<'_> {
                     "w:tbl" => StreamItem::TableStart { props },
                     "w:tr" => StreamItem::RowStart { props, revision: self.revision(item.wraps, Level::Row, budget)? },
                     "w:tc" => StreamItem::CellStart { props, revision: self.revision(item.wraps, Level::Cell, budget)? },
-                    element => StreamItem::Opaque { element: element.to_string(), digest: digest(item.piece) },
+                    element => StreamItem::Opaque {
+                        element: element.to_string(),
+                        digest: digest(item.piece),
+                        detail: None,
+                        deleted: self.deleted(item.wraps, budget)?,
+                    },
                 }),
                 // A container's end says nothing its start did not, except for those it closes.
                 (_, Some(Extra::Close)) => match &*mark.element {
@@ -604,7 +623,15 @@ impl Decoder<'_> {
                     "w:sdt" => Some(StreamItem::ContentControlEnd),
                     _ => None,
                 },
-                _ => Some(StreamItem::Opaque { element: mark.element.to_string(), digest: digest(item.piece) }),
+                (_, fact) => Some(StreamItem::Opaque {
+                    element: mark.element.to_string(),
+                    digest: digest(item.piece),
+                    detail: match fact {
+                        Some(Extra::Detail(detail)) => Some(detail.clone()),
+                        _ => None,
+                    },
+                    deleted: self.deleted(item.wraps, budget)?,
+                }),
             };
             if let Some(decoded) = decoded {
                 out.push(decoded, budget)?;
@@ -658,7 +685,9 @@ fn item_strings(item: &StreamItem) -> u64 {
             revision(changed).saturating_add(format_revision.as_ref().map_or(0, format_revision_strings))
         }
         StreamItem::RowStart { revision: changed, .. } | StreamItem::CellStart { revision: changed, .. } => revision(changed),
-        StreamItem::Opaque { element, digest } => budget::units(element.len().saturating_add(digest.len())),
+        StreamItem::Opaque { element, digest, detail, .. } => {
+            budget::units(element.len().saturating_add(digest.len()).saturating_add(detail.as_ref().map_or(0, String::len)))
+        }
         StreamItem::Object { digest, media, alt, .. } => {
             media.iter().fold(budget::units(digest.len().saturating_add(alt.as_ref().map_or(0, String::len))), |held, media| {
                 held.saturating_add(budget::units(media.part.len().saturating_add(media.sha256.len()).saturating_add(48)))

@@ -1269,6 +1269,18 @@ impl Walker<'_, '_> {
             match &*el.name {
                 "w:footnoteReference" => self.record(|_| Extra::NoteReference(NoteKind::Footnote, id()))?,
                 "w:endnoteReference" => self.record(|_| Extra::NoteReference(NoteKind::Endnote, id()))?,
+                "w:br" => {
+                    if let Some(kind) = el.attr("w:type") {
+                        self.record(|_| Extra::Detail(kind.to_string()))?;
+                    }
+                }
+                "w:sym" => {
+                    // As the document model reads it (`read_run_child`): a code below U+0020 is dropped.
+                    let glyph = el.attr("w:char").and_then(|code| u32::from_str_radix(code.trim(), 16).ok()).and_then(char::from_u32);
+                    if let Some(glyph) = glyph.filter(|glyph| u32::from(*glyph) >= 0x20) {
+                        self.record(|_| Extra::Detail(glyph.to_string()))?;
+                    }
+                }
                 "w:commentRangeStart" if comment.is_some() => self.record(|_| Extra::Comment(CommentMark::Start, id()))?,
                 "w:commentRangeEnd" if comment.is_some() => self.record(|_| Extra::Comment(CommentMark::End, id()))?,
                 "w:commentReference" if comment.is_some() => self.record(|_| Extra::Comment(CommentMark::Reference, id()))?,

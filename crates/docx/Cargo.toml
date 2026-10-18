@@ -24,6 +24,8 @@ hmac = { workspace = true }
 base64 = { workspace = true }
 getrandom = { workspace = true }
 zeroize = { workspace = true }
+# embed: the fingerprint of a paragraph's text is sent to the host as JSON.
+serde = { workspace = true }
 
 # The browser's `crypto.getRandomValues` for the salts and keys of encrypted saves.
 [target.'cfg(all(target_arch = "wasm32", target_os = "unknown"))'.dependencies]

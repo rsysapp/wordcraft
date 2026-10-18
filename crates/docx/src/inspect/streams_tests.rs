@@ -458,6 +458,42 @@ fn pictures_name_their_media_and_alternative_text() {
     assert_eq!(Some(&media[0].sha256), streams.parts.get("word/media/image1.png"));
 }
 
+/// The opaque items of the body's first story, in order.
+fn opaque_items(streams: &Streams) -> Vec<(&str, Option<&str>, bool)> {
+    streams.stories[0]
+        .items
+        .iter()
+        .filter_map(|item| match item {
+            StreamItem::Opaque { element, detail, deleted, .. } => Some((element.as_str(), detail.as_deref(), *deleted)),
+            _ => None,
+        })
+        .collect()
+}
+
+#[test]
+fn a_break_item_names_its_type() {
+    let body = para(r#"<w:r><w:t>a</w:t><w:br w:type="page"/><w:br w:type="column"/><w:br/><w:t>b</w:t></w:r>"#);
+    let streams = read_one(&package(&body));
+    assert_eq!(opaque_items(&streams), vec![("w:br", Some("page"), false), ("w:br", Some("column"), false), ("w:br", None, false)]);
+}
+
+#[test]
+fn a_symbol_item_carries_the_glyph_the_model_stores() {
+    let body = para(r#"<w:r><w:sym w:font="Wingdings" w:char="F0FC"/><w:sym w:char="0041"/><w:sym w:char="0007"/></w:r>"#);
+    let streams = read_one(&package(&body));
+    // The model drops a symbol below U+0020, so its item has no glyph.
+    assert_eq!(opaque_items(&streams), vec![("w:sym", Some("\u{F0FC}"), false), ("w:sym", Some("A"), false), ("w:sym", None, false)]);
+}
+
+#[test]
+fn an_item_inside_a_tracked_deletion_says_so() {
+    let deleted = format!(r#"<w:del w:id="8" w:author="{}" w:date="{}"><w:r><w:tab/><w:br w:type="page"/></w:r></w:del>"#, ANA.0, ANA.1);
+    let moved_from = format!(r#"<w:moveFrom w:id="7" w:author="{}" w:date="{}"><w:r><w:tab/></w:r></w:moveFrom>"#, ANA.0, ANA.1);
+    let body = para(&format!("<w:r><w:tab/></w:r>{deleted}{moved_from}{}", ins(ANA, "kept")));
+    let streams = read_one(&package(&body));
+    assert_eq!(opaque_items(&streams), vec![("w:tab", None, false), ("w:tab", None, true), ("w:br", Some("page"), true), ("w:tab", None, true)]);
+}
+
 #[test]
 fn settings_report_track_changes_and_ignore_rsids() {
     let with = |track: bool, rsid: &str| {
