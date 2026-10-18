@@ -2033,6 +2033,18 @@ impl Scanner<'_> {
         let differs = field.seen.iter().any(|revs| *revs != field.begin);
         if !nested_in_instr && (differs || field.has_frame) {
             let Field { begin, buf, first, has_frame, seen, .. } = field;
+            // A tracked change held only by an item with no text (an empty run leaves no unit to carry
+            // it) still makes the field around this one a range, as the reader's buffered items do.
+            if let Some(parent) = story.fields.iter_mut().rev().find(|parent| !parent.range)
+                && !parent.spilled
+                && parent.result
+            {
+                for rev in &seen {
+                    if parent.seen.len() < 2 && !parent.seen.contains(rev) {
+                        parent.seen.push(rev.clone());
+                    }
+                }
+            }
             let outside = std::mem::replace(&mut story.rev, begin);
             emit(story, b, object(locked(first.or(last), lock, None)));
             let begun = std::mem::replace(&mut story.rev, outside);
@@ -3584,6 +3596,17 @@ mod tests {
             );
             scans_as_read(&bytes);
         }
+    }
+
+    /// A simple field inside another, holding a tracked insertion whose run has no text: the inner
+    /// field is a range (the change is not the field's own) and so is the one around it, as the
+    /// reader makes them, though no unit carries the change (found by the generated stories).
+    #[test]
+    fn a_tracked_change_with_no_text_inside_nested_simple_fields_keeps_both_ranges() {
+        let inner = r#"<w:fldSimple w:instr=" DATE "><w:ins w:id="5" w:author="A"><w:r><w:t/></w:r></w:ins></w:fldSimple>"#;
+        let body = format!(r#"<w:p><w:fldSimple w:instr=" DATE ">{inner}</w:fldSimple></w:p><w:p><w:r><w:t>x</w:t></w:r></w:p>"#);
+        let scanned = scans_as_read(&package(&body, &[], &[]));
+        assert_eq!(body_paragraph(&scanned, 0).text(), OBJ.to_string().repeat(4));
     }
 
     /// A field's result buffers at most MAX_FIELD_ITEMS of the reader's items (a `w:t` is one,
