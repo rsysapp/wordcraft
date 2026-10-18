@@ -173,8 +173,19 @@ impl HostState {
     }
 
     /// Look for the marks not yet found in this document and layout; `true` while some remain.
-    pub(crate) fn resolve_marks(&mut self, doc: &wordcraft_doc::Document, rev: u64, layout: &std::sync::Arc<wordcraft_layout::DocLayout>) -> bool {
-        self.marks.resolve(&mut self.index, doc, rev, layout)
+    pub(crate) fn resolve_marks(
+        &mut self,
+        doc: &wordcraft_doc::Document,
+        rev: u64,
+        content_version: u64,
+        layout: &std::sync::Arc<wordcraft_layout::DocLayout>,
+    ) -> bool {
+        let locator = self.viewport.locator_for(doc, content_version);
+        let pending = self.marks.resolve(&mut self.index, doc, rev, layout, locator);
+        if let Some(ids) = self.marks.take_refused() {
+            self.bridge.emit(HostEvent::LocationMismatch { ids });
+        }
+        pending
     }
 
     /// The editor moved the selection itself (open, jump, find, page buttons): not a person's

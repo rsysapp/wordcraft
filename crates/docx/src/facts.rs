@@ -171,6 +171,36 @@ pub fn model_offset(paragraph: &Paragraph, accepted_utf16: u32) -> Option<usize>
     found.or((units_before == target).then_some(after_last_kept))
 }
 
+/// Where a range of accepted text that ends at UTF-16 offset `accepted_utf16` (exclusive) ends in
+/// the model, as a byte offset into `paragraph.text`: just after the last kept unit before it.
+/// [`model_offset`] answers where the unit *at* the offset starts, which skips a deletion that
+/// follows the range, so a range ending just before a tracked deletion would swallow the deleted
+/// wording. Offset 0 is an empty range at [`model_offset`]'s answer. `None` past the end of the
+/// accepted text. A unit inside a field's result, or an object, ends at the end of that field or
+/// object, as it starts at its start.
+pub fn model_end_offset(paragraph: &Paragraph, accepted_utf16: u32) -> Option<usize> {
+    if accepted_utf16 == 0 {
+        return model_offset(paragraph, 0);
+    }
+    let last_unit = usize::try_from(accepted_utf16).ok()?.checked_sub(1)?;
+    let mut units_before = 0usize;
+    let mut found = None;
+    for_each_accepted(paragraph, |piece, _, end| {
+        let units = piece.encode_utf16().count();
+        // A marker has no unit of its own.
+        if units == 0 {
+            return ControlFlow::Continue(());
+        }
+        if last_unit < units_before.saturating_add(units) {
+            found = Some(end);
+            return ControlFlow::Break(());
+        }
+        units_before = units_before.saturating_add(units);
+        ControlFlow::Continue(())
+    });
+    found
+}
+
 /// Finds body paragraphs by (part name, `Origin.index`), what Clauflow's locations name.
 pub struct Locator {
     /// (part index, `Origin.index`) → the paragraph's path, for every body paragraph.
@@ -678,6 +708,26 @@ mod tests {
         assert_eq!(model_offset(paragraph, 12), Some(18));
         assert_eq!(model_offset(paragraph, 23), Some(29));
         assert_eq!(model_offset(paragraph, 24), None);
+    }
+
+    #[test]
+    fn a_range_ends_after_its_last_kept_unit_not_after_a_following_deletion() {
+        // "Rent is due [thirty]sixty days.": "sixty" is accepted units 12..17.
+        let document = rent_paragraph();
+        let paragraph = first_paragraph(&document);
+        assert_eq!(model_end_offset(paragraph, 17), Some(23), "just after sixty");
+        assert_eq!(model_end_offset(paragraph, 12), Some(12), "just after the space, before the deleted thirty");
+        assert_eq!(model_offset(paragraph, 12), Some(18), "while a start skips the deletion");
+        assert_eq!(model_end_offset(paragraph, 0), Some(0));
+        assert_eq!(model_end_offset(paragraph, 23), Some(29));
+        assert_eq!(model_end_offset(paragraph, 24), None);
+        // A trailing deletion is never part of the range.
+        let trailing = document_of(&[format!("{}{}", text_run("abc"), deleted_run("def"))]);
+        assert_eq!(model_end_offset(first_paragraph(&trailing), 3), Some(3));
+        // Units are UTF-16, offsets bytes: "é😀" is 3 units, 6 bytes.
+        let wide = document_of(&[format!("{}{}{}", text_run("é😀"), deleted_run("x"), text_run("y"))]);
+        assert_eq!(model_end_offset(first_paragraph(&wide), 3), Some(6));
+        assert_eq!(model_end_offset(first_paragraph(&wide), 4), Some(8));
     }
 
     #[test]

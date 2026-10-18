@@ -12,6 +12,7 @@ use serde::de::Error as _;
 use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::Number;
 use wordcraft_doc::props::Rgb;
+use wordcraft_docx::facts::Fingerprint;
 
 use crate::theme::c32;
 
@@ -58,17 +59,53 @@ pub enum JumpTarget {
     },
 }
 
-/// A passage the host wants highlighted.
+/// A passage the host wants highlighted: by its words (API 0.2, `text`) or by where it is (API 0.3,
+/// `at`); exactly one of the two, checked by [`parse_marks`].
 #[derive(Clone, Debug, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct MarkSpec {
     pub id: String,
-    pub text: String,
-    /// 1-based; `None` searches every page.
+    #[serde(default)]
+    pub text: Option<String>,
+    /// API 0.3: the paragraph and range to mark, instead of `text`.
+    #[serde(default)]
+    pub at: Option<LocationSpec>,
+    /// 1-based; `None` searches every page. Applies to a text mark only: a location names its place.
     #[serde(default, deserialize_with = "saturating_optional_u32")]
     pub page: Option<u32>,
     /// `#rrggbbaa` (or `#rrggbb`); checked by [`parse_marks`].
     pub color: String,
+    #[serde(default)]
+    pub style: MarkStyle,
+}
+
+/// Where a mark is (embed API 0.3): a body paragraph named as the comparison names it (part and
+/// origin index, a table by its first paragraph), the fingerprint of that paragraph's accepted text,
+/// and a range of that text. The fingerprint is how the editor knows it found the paragraph the host
+/// meant; a mark whose paragraph differs is never painted but reported (`locationMismatch`).
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LocationSpec {
+    pub block: BlockRef,
+    pub fingerprint: Fingerprint,
+    /// UTF-16 offsets into the paragraph's accepted text (`wordcraft_docx::facts::accepted_text`).
+    /// Both `None` is the whole paragraph; `from == to` is the place between two characters, which
+    /// only a bar shows. A huge offset saturates to `u32::MAX` and is reported like any offset past
+    /// the end of the text.
+    #[serde(default, deserialize_with = "saturating_optional_u32")]
+    pub from: Option<u32>,
+    #[serde(default, deserialize_with = "saturating_optional_u32")]
+    pub to: Option<u32>,
+}
+
+/// How a mark is drawn (embed API 0.3). A fill is API 0.2's look.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum MarkStyle {
+    #[default]
+    Fill,
+    Outline,
+    Bar,
 }
 
 /// The host's theme: dark or light chrome, and its accent with the text colour on it.
@@ -266,12 +303,23 @@ pub fn parse_jump_target(json: &str) -> Result<JumpTarget, String> {
 /// `Mark[]` from the host's JSON. Marks beyond [`MAX_MARKS`] are ignored (the first ones are kept),
 /// as the embed API says, so a long list still paints its first part.
 pub fn parse_marks(json: &str) -> Result<Vec<MarkSpec>, String> {
+    parse_marks_counting(json).map(|(marks, _)| marks)
+}
+
+/// [`parse_marks`] and how many marks past [`MAX_MARKS`] were ignored, which the host is told
+/// (`marksDropped`). A mark has `text` or `at`, never both and never neither.
+pub fn parse_marks_counting(json: &str) -> Result<(Vec<MarkSpec>, u32), String> {
     let mut marks: Vec<MarkSpec> = serde_json::from_str(json).map_err(|error| format!("setMarks: {error}"))?;
+    let dropped = u32::try_from(marks.len().saturating_sub(MAX_MARKS)).unwrap_or(u32::MAX);
     marks.truncate(MAX_MARKS);
     if let Some(bad) = marks.iter().find(|mark| parse_color(&mark.color).is_none()) {
         return Err(format!("setMarks: mark {:?} has colour {:?}; expected #rrggbbaa", bad.id, bad.color));
     }
-    Ok(marks)
+    if let Some(bad) = marks.iter().find(|mark| mark.text.is_some() == mark.at.is_some()) {
+        let what = if bad.text.is_some() { "both text and at" } else { "neither text nor at" };
+        return Err(format!("setMarks: mark {:?} has {what}; expected one of them", bad.id));
+    }
+    Ok((marks, dropped))
 }
 
 /// `setMode`'s request (embed API 0.2).
@@ -529,7 +577,17 @@ mod tests {
     #[test]
     fn marks_need_hex_colours_and_whole_pages() {
         let marks = parse_marks(r##"[{"id":"t1","text":"Clause 1","page":null,"color":"#ffd60080"}]"##).unwrap();
-        assert_eq!(marks, vec![MarkSpec { id: "t1".into(), text: "Clause 1".into(), page: None, color: "#ffd60080".into() }]);
+        assert_eq!(
+            marks,
+            vec![MarkSpec {
+                id: "t1".into(),
+                text: Some("Clause 1".into()),
+                at: None,
+                page: None,
+                color: "#ffd60080".into(),
+                style: MarkStyle::Fill
+            }]
+        );
         let paged = parse_marks(r##"[{"id":"t2","text":"x","page":2,"color":"#00ff00"}]"##).unwrap();
         assert_eq!(paged[0].page, Some(2));
         assert!(parse_marks(r#"[{"id":"t1","text":"x","page":null,"color":"yellow"}]"#).unwrap_err().contains("t1"));

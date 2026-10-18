@@ -155,7 +155,8 @@ editor.destroy();
 `jumpTo(target)`, `setMarks(marks)`, `setTheme(theme)`, `setListener(listener)`, `destroy()` and,
 from API 0.2, `setMode(request: ModeRequest)`, `requestSave()` and `applyRedactions()` and, from API
 0.3, `setZoom(request: ZoomRequest)`, `scrollToBlock(request: ScrollRequest)` and
-`locate(request: LocateRequest)`. The types,
+`locate(request: LocateRequest)`; `setMarks` takes `EditorMark[]` from API 0.3 (a 0.2 `Mark[]` still
+type-checks and behaves as before). The types,
 as `wordcraft_embed.d.ts` declares them (the package script fails if a declaration is missing):
 
 ```ts
@@ -181,6 +182,15 @@ export interface Mark {
     page: number | null;
     color: string;
 }
+
+export interface LocationSpec {
+    block: BlockRef;
+    fingerprint: { length: number; hash: string };
+    from?: number | null;
+    to?: number | null;
+}
+
+export type EditorMark = { id: string; color: string; style?: 'fill' | 'outline' | 'bar'; page?: number | null } & ({ text: string } | { at: LocationSpec });
 
 export interface EditorAuthor {
     id: string;
@@ -230,6 +240,8 @@ export type EditorEvent =
     | { type: 'viewport'; top: BlockRef | null; fraction: number; visibleHeight: number; page: number; pages: number; cause: 'user' | 'host'; token: number | null }
     | { type: 'blockNotFound'; block: BlockRef; token: number }
     | { type: 'located'; positions: (number | null)[]; height: number; token: number }
+    | { type: 'locationMismatch'; ids: string[] }
+    | { type: 'marksDropped'; count: number }
     | { type: 'redactionsPending'; marks: number }
     | { type: 'editRefused'; code: EditRefusalCode };
 
@@ -494,6 +506,53 @@ changes beside the view. The answer is one `{ type: 'located', positions, height
   or `index` that is not a whole number of zero or more throws a `TypeError` and queues nothing.
 - **View mode's command gate is unchanged.** The positions are read by the editor's host state.
 
+### Marks by location
+
+A mark names a place instead of words: `{ id, color, style?, at: { block, fingerprint, from?, to? } }`
+in place of `text`. A mark has `text` (API 0.2) or `at`, never both and never neither; either mixes
+freely with the other in one `setMarks`. This is how a host marks the passages of a comparison it
+made elsewhere: the words may occur twice, or have changed, and a location still lands on the right
+paragraph.
+
+- **`block`** names a body paragraph as `locate` and `viewport` name blocks: the part and the origin
+  index of the paragraph (a table by its first paragraph; any paragraph inside a table is found by
+  its own index).
+- **`fingerprint`** is what the editor checks before it paints anything: `length`, the paragraph's
+  length in UTF-16 units, and `hash`, the first 16 hex digits of the SHA-256 of its text with every
+  tracked change accepted, runs of spaces and tabs collapsed to one space and the ends trimmed (the
+  comparison engine's fingerprint of a block's text). If the paragraph at `block` has another
+  fingerprint the mark is **not painted**.
+- **`from` and `to`** are UTF-16 offsets into that same accepted text, `from` inclusive and `to`
+  exclusive, so a range counts the wording the clean display shows and never a tracked deletion: a
+  mark after a deleted run lands on the right words, and a range ending just before a deletion does
+  not include it. Both absent (or `null`) is the whole paragraph. An absent `from` is 0 and an absent
+  `to` is the paragraph's length. `from == to` is a place between two characters, which only a bar
+  shows. A range that is backwards or ends past the text is refused like a fingerprint that differs.
+- **`style`** is `fill` (the default, API 0.2's look: the colour as sent, over the words), `outline`
+  (the same rectangles as a 1.5 pixel line in the colour at full opacity, unfilled) or `bar` (a
+  3 pixel strip in the left margin, in the colour at full opacity). The bar's width is in screen
+  pixels at any zoom. A bar with a range runs beside the lines of the range; with `from == to` beside
+  the line the place is on; with no range at all beside the whole top-level block the paragraph
+  belongs to, so a location in a table shows as one bar beside the table (one per page when the block
+  crosses a page break). `fill` and `outline` show nothing for an empty range.
+- **`locationMismatch`.** Once every mark of a `setMarks` has been placed, the host is sent one
+  `{ type: 'locationMismatch', ids }` naming, in the host's order, each location mark that was
+  refused: its block is not in the open document, its fingerprint differs, or its range lies outside
+  the text. Nothing is sent when none was refused. The ids are not told again when the pages are laid
+  out again (a zoom, a resize). A mark is never painted on the nearest paragraph instead.
+- **Clicking** a mark of any style or kind sends `markActivated` with its id, topmost last, as for a
+  text mark. A bar is only three pixels wide.
+- **`page`** applies to a text mark only; a location names its own place.
+- **`marksDropped`.** `setMarks` keeps the first 2,000 marks. When it was given more, the host is
+  sent `{ type: 'marksDropped', count }` with the number ignored, so a host cannot paint a long
+  comparison believing all of it shows.
+- **View mode's command gate is unchanged.** Marks are placed by the editor's host state from the
+  document's layout; nothing is selected and no command is run. As before, marks are hidden while the
+  document is edited.
+- **Numbers.** `from`, `to`, the block's `index` and the fingerprint's `length` follow the same rule
+  as pages: a whole number of zero or more, else a `TypeError` and nothing queued; a huge one is
+  merely past the end of any paragraph and is reported like one.
+
 ## Behaviour a host page relies on
 
 - Call the module's default export (`init`) before `EmbeddedEditor.mount`. `mount` applies the
@@ -557,7 +616,7 @@ changes beside the view. The answer is one `{ type: 'located', positions, height
 
 ## Limits
 
-- `setMarks` keeps the first 2,000 marks (`MAX_MARKS`) and ignores the rest.
+- `setMarks` keeps the first 2,000 marks (`MAX_MARKS`) and ignores the rest; `marksDropped` says how many.
 - `locate` takes at most 10,000 blocks (`MAX_LOCATE_BLOCKS`); more throws a `TypeError`.
 - Passages are at most 256 KiB of UTF-8 as sent (`MAX_RAW_PASSAGE_BYTES`, checked before anything
   is folded) and 10,000 characters once folded (`MAX_NEEDLE_CHARS`): a longer mark is skipped, a

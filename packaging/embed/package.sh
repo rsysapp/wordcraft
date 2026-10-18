@@ -132,7 +132,7 @@ for want in \
   'static mount(canvas: HTMLCanvasElement, options: MountOptions): Promise<EmbeddedEditor>;' \
   'open(bytes: Uint8Array, fileName: string, options?: OpenOptions' \
   'jumpTo(target: JumpTarget): void;' \
-  'setMarks(marks: Mark[]): void;' \
+  'setMarks(marks: EditorMark[]): void;' \
   'setTheme(theme: Theme): void;' \
   'setListener(listener: (event: EditorEvent) => void): void;' \
   'destroy(): void;' \
@@ -156,6 +156,10 @@ for want in \
   'export interface Theme' \
   'export type JumpTarget' \
   'export interface Mark' \
+  'export interface LocationSpec' \
+  'export type EditorMark' \
+  "{ type: 'locationMismatch'; ids: string[] }" \
+  "{ type: 'marksDropped'; count: number }" \
   'export interface EditorAuthor' \
   'export interface EditorPermissions' \
   'export type ModeRequest' \

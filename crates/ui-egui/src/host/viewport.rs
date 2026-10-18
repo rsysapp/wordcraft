@@ -90,7 +90,7 @@ impl ViewportState {
 
     /// The locator for `doc` as it is now: edits move paragraphs, so a locator made at the open is
     /// remade once the content differs from the version it was made for.
-    fn locator_for(&mut self, doc: &Document, content_version: u64) -> Option<&Locator> {
+    pub(crate) fn locator_for(&mut self, doc: &Document, content_version: u64) -> Option<&Locator> {
         if self.locator.is_some() && self.locator_version != content_version {
             self.locator = Some(Locator::new(doc, &self.part_names));
             self.locator_version = content_version;
@@ -172,13 +172,12 @@ fn caret_edge(layout: &DocLayout, starts: &[f32], path: &Path, offset: usize, bo
     absolute(starts, caret.page, if bottom { caret.top + caret.height } else { caret.top })
 }
 
-/// The top and the bottom of the top-level body block `block` on the stacked axis. A paragraph runs
-/// from its first line to its last. A table runs from the highest first line of its first row's
-/// cells to the lowest last line of its last row's cells (the cells of a row differ in height). A
-/// block with nothing laid out (wording the clean display removed) has no bounds.
-fn block_bounds(doc: &Document, layout: &DocLayout, starts: &[f32], block: usize) -> Option<(f32, f32)> {
+/// Where the first and the last lines of the top-level body block `block` are: the positions in the
+/// text from which the top is read (the first line's start, one per cell of a table's first row,
+/// each cell's first paragraph) and the bottom (the last line's end, one per cell of the last row).
+fn block_edges(doc: &Document, block: usize) -> Option<(Vec<(Path, usize)>, Vec<(Path, usize)>)> {
     let index = u32::try_from(block).ok()?;
-    let (tops, bottoms): (Vec<(Path, usize)>, Vec<(Path, usize)>) = match &**doc.body.get(block)? {
+    Some(match &**doc.body.get(block)? {
         Block::Para(paragraph) => (vec![(Path::top(block), 0)], vec![(Path::top(block), paragraph.text.len())]),
         Block::Table(table) => {
             let cells_of = |row: Option<&wordcraft_doc::Row>, row_index: usize, from_end: bool| -> Vec<(Path, usize)> {
@@ -196,7 +195,25 @@ fn block_bounds(doc: &Document, layout: &DocLayout, starts: &[f32], block: usize
             let last_row = table.rows.len().saturating_sub(1);
             (cells_of(table.rows.first(), 0, false), cells_of(table.rows.get(last_row), last_row, true))
         }
-    };
+    })
+}
+
+/// The first and the last position of the text of the top-level body block `block`, in document
+/// order: what a range over the whole block runs between (marks by location, embed API 0.3). `None`
+/// for a block without a paragraph.
+pub(crate) fn block_span(doc: &Document, block: usize) -> Option<(Pos, Pos)> {
+    let (tops, bottoms) = block_edges(doc, block)?;
+    let (first, first_offset) = tops.into_iter().next()?;
+    let (last, last_offset) = bottoms.into_iter().next_back()?;
+    Some((Pos { story: StoryRef::Body, path: first, off: first_offset }, Pos { story: StoryRef::Body, path: last, off: last_offset }))
+}
+
+/// The top and the bottom of the top-level body block `block` on the stacked axis. A paragraph runs
+/// from its first line to its last. A table runs from the highest first line of its first row's
+/// cells to the lowest last line of its last row's cells (the cells of a row differ in height). A
+/// block with nothing laid out (wording the clean display removed) has no bounds.
+fn block_bounds(doc: &Document, layout: &DocLayout, starts: &[f32], block: usize) -> Option<(f32, f32)> {
+    let (tops, bottoms) = block_edges(doc, block)?;
     let top = tops.iter().filter_map(|(path, offset)| caret_edge(layout, starts, path, *offset, false)).reduce(f32::min)?;
     let bottom = bottoms.iter().filter_map(|(path, offset)| caret_edge(layout, starts, path, *offset, true)).reduce(f32::max)?;
     Some((top, bottom.max(top)))

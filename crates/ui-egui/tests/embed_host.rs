@@ -980,7 +980,7 @@ fn amber() -> egui::Color32 {
 }
 
 fn mark(id: &str, text: &str) -> MarkSpec {
-    MarkSpec { id: id.into(), text: text.into(), page: None, color: AMBER.into() }
+    MarkSpec { id: id.into(), text: Some(text.into()), at: None, page: None, color: AMBER.into(), style: Default::default() }
 }
 
 fn mark_on(id: &str, text: &str, page: u32) -> MarkSpec {
@@ -1308,7 +1308,9 @@ fn a_large_mark_set_finds_what_a_search_per_mark_finds() {
                     Some(page) => Some(wordcraft_ui_egui::host::wire::page_index(page, pages)?),
                     None => None,
                 };
-                index.find_where(&m.text, |start, _| on_page.is_none_or(|p| layout.page_of(start) == Some(p)), 0).map(|(start, _)| start)
+                index
+                    .find_where(m.text.as_deref().unwrap_or_default(), |start, _| on_page.is_none_or(|p| layout.page_of(start) == Some(p)), 0)
+                    .map(|(start, _)| start)
             })
             .collect()
     };

@@ -29,6 +29,15 @@ export interface Mark {
     color: string;
 }
 
+export interface LocationSpec {
+    block: BlockRef;
+    fingerprint: { length: number; hash: string };
+    from?: number | null;
+    to?: number | null;
+}
+
+export type EditorMark = { id: string; color: string; style?: 'fill' | 'outline' | 'bar'; page?: number | null } & ({ text: string } | { at: LocationSpec });
+
 export interface EditorAuthor {
     id: string;
     name: string;
@@ -81,6 +90,8 @@ export type EditorEvent =
     | { type: 'viewport'; top: BlockRef | null; fraction: number; visibleHeight: number; page: number; pages: number; cause: 'user' | 'host'; token: number | null }
     | { type: 'blockNotFound'; block: BlockRef; token: number }
     | { type: 'located'; positions: (number | null)[]; height: number; token: number }
+    | { type: 'locationMismatch'; ids: string[] }
+    | { type: 'marksDropped'; count: number }
     | { type: 'redactionsPending'; marks: number }
     | { type: 'editRefused'; code: EditRefusalCode };
 
@@ -117,6 +128,8 @@ mod tests {
             "export interface Theme { dark: boolean; accent: string; accentContent: string; }",
             "export type JumpTarget = | { kind: 'page'; page: number } | { kind: 'text'; text: string; page: number | null; occurrence: number };",
             "export interface Mark { id: string; text: string; page: number | null; color: string; }",
+            "export interface LocationSpec { block: BlockRef; fingerprint: { length: number; hash: string }; from?: number | null; to?: number | null; }",
+            "export type EditorMark = { id: string; color: string; style?: 'fill' | 'outline' | 'bar'; page?: number | null } & ({ text: string } | { at: LocationSpec });",
             "export interface EditorAuthor { id: string; name: string; }",
             "export interface EditorPermissions { acceptRejectChanges: boolean; organizePages: boolean; fillForms: boolean; redact: boolean; stamps: boolean; drawing: boolean; fullEditing?: boolean; }",
             "export type ModeRequest = | { mode: 'view' } | { mode: 'edit'; author: EditorAuthor; revisionDate: string; permissions: EditorPermissions };",
@@ -137,6 +150,8 @@ mod tests {
              | { type: 'viewport'; top: BlockRef | null; fraction: number; visibleHeight: number; page: number; pages: number; cause: 'user' | 'host'; token: number | null } \
              | { type: 'blockNotFound'; block: BlockRef; token: number } \
              | { type: 'located'; positions: (number | null)[]; height: number; token: number } \
+             | { type: 'locationMismatch'; ids: string[] } \
+             | { type: 'marksDropped'; count: number } \
              | { type: 'redactionsPending'; marks: number } | { type: 'editRefused'; code: EditRefusalCode };",
             "export type EditRefusalCode = | 'command_not_allowed' | 'decision_not_allowed' | 'paragraph_break_not_supported' \
              | 'character_not_allowed' | 'outside_editable_story' | 'invalid_edit_session' \
@@ -164,7 +179,7 @@ mod tests {
             ),
             (
                 "setMarks",
-                "#[wasm_bindgen(js_name = setMarks)] pub fn set_marks(&self, #[wasm_bindgen(unchecked_param_type = \"Mark[]\")] marks: JsValue)",
+                "#[wasm_bindgen(js_name = setMarks)] pub fn set_marks(&self, #[wasm_bindgen(unchecked_param_type = \"EditorMark[]\")] marks: JsValue)",
             ),
             (
                 "setTheme",

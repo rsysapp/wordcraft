@@ -86,9 +86,13 @@ impl EmbeddedEditor {
 
     /// Replaces every host mark. An empty array clears them.
     #[wasm_bindgen(js_name = setMarks)]
-    pub fn set_marks(&self, #[wasm_bindgen(unchecked_param_type = "Mark[]")] marks: JsValue) -> Result<(), JsValue> {
+    pub fn set_marks(&self, #[wasm_bindgen(unchecked_param_type = "EditorMark[]")] marks: JsValue) -> Result<(), JsValue> {
         check_mark_pages(&marks)?;
-        let marks = wire::parse_marks(&json_of(&marks)?).map_err(|e| type_error(&e))?;
+        let (marks, dropped) = wire::parse_marks_counting(&json_of(&marks)?).map_err(|e| type_error(&e))?;
+        // Queued before the marks, so the host hears of the cut together with the first frame that follows.
+        if dropped > 0 && !self.destroyed.get() {
+            self.bridge.emit(HostEvent::MarksDropped { count: dropped });
+        }
         self.send(HostCommand::SetMarks(marks));
         Ok(())
     }
@@ -397,6 +401,25 @@ fn check_mark_pages(marks: &JsValue) -> Result<(), JsValue> {
     for index in 0..count {
         let mark = js_sys::Reflect::get_u32(marks, index).map_err(|_| type_error(&format!("setMarks: mark {index} could not be read")))?;
         check_counts(&mark, &["page"], "setMarks")?;
+        check_location_counts(&mark)?;
+    }
+    Ok(())
+}
+
+/// `check_counts` for the numbers of a mark's location (`at`): its offsets, the block's index and
+/// the fingerprint's length. A mark without `at` has nothing to check.
+fn check_location_counts(mark: &JsValue) -> Result<(), JsValue> {
+    if !mark.is_object() {
+        return Ok(());
+    }
+    let at = js_sys::Reflect::get(mark, &JsValue::from_str("at")).map_err(|_| type_error("setMarks: at could not be read"))?;
+    if !at.is_object() {
+        return Ok(());
+    }
+    check_counts(&at, &["from", "to"], "setMarks")?;
+    for (key, numbers) in [("block", "index"), ("fingerprint", "length")] {
+        let inner = js_sys::Reflect::get(&at, &JsValue::from_str(key)).map_err(|_| type_error(&format!("setMarks: at.{key} could not be read")))?;
+        check_counts(&inner, &[numbers], "setMarks")?;
     }
     Ok(())
 }

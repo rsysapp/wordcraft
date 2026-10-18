@@ -128,6 +128,17 @@ pub enum HostEvent {
         height: f32,
         token: u32,
     },
+    /// Marks placed by location (embed API 0.3) that were not painted: their paragraph is not in the
+    /// open document, or its accepted text differs from the fingerprint the host sent (a different
+    /// file than the one compared), or their range lies outside it. Sent once per `setMarks`, with
+    /// the ids in the host's order, when every mark has been placed.
+    LocationMismatch {
+        ids: Vec<String>,
+    },
+    /// `setMarks` was given more marks than the editor keeps (2,000); `count` is how many were ignored.
+    MarksDropped {
+        count: u32,
+    },
     /// An action refused in edit mode, once per action, by its stable code (`edit_mode::Refusal`).
     EditRefused {
         code: String,
@@ -353,6 +364,8 @@ mod tests {
                 HostEvent::Located { positions: vec![Some(12.5), None, Some(800.0)], height: 1584.0, token: 5 },
                 json!({"type": "located", "positions": [12.5, null, 800.0], "height": 1584.0, "token": 5}),
             ),
+            (HostEvent::LocationMismatch { ids: vec!["a".into(), "b".into()] }, json!({"type": "locationMismatch", "ids": ["a", "b"]})),
+            (HostEvent::MarksDropped { count: 5 }, json!({"type": "marksDropped", "count": 5})),
             (HostEvent::SaveFailed { message: "m".into() }, json!({"type": "saveFailed", "message": "m"})),
             (HostEvent::EditRefused { code: "command_not_allowed".into() }, json!({"type": "editRefused", "code": "command_not_allowed"})),
             (

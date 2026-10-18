@@ -25,7 +25,8 @@ pub use profile::EmbedProfile;
 #[doc(hidden)]
 pub use state::HostState;
 pub use wire::{
-    BlockRef, Display, FitWidth, JumpTarget, LocateRequest, MarkSpec, MountOptions, OpenOptions, ScrollRequest, ThemeSpec, ZoomRequest, ZoomValue,
+    BlockRef, Display, FitWidth, JumpTarget, LocateRequest, LocationSpec, MarkSpec, MarkStyle, MountOptions, OpenOptions, ScrollRequest, ThemeSpec,
+    ZoomRequest, ZoomValue,
 };
 
 /// Set up the context an embed build's app runs in; call it once the runner made the context.

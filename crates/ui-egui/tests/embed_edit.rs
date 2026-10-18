@@ -408,7 +408,14 @@ fn shows_no_edit_strip_in_view_mode() {
 #[test]
 fn hides_host_marks_while_editing_and_shows_them_again_in_view_mode() {
     let (mut harness, bridge) = opened();
-    bridge.send(HostCommand::SetMarks(vec![MarkSpec { id: "m".into(), text: "Rent".into(), page: None, color: "#ffe2006b".into() }]));
+    bridge.send(HostCommand::SetMarks(vec![MarkSpec {
+        id: "m".into(),
+        text: Some("Rent".into()),
+        at: None,
+        page: None,
+        color: "#ffe2006b".into(),
+        style: Default::default(),
+    }]));
     harness.run_steps(4);
     let marks = |harness: &Harness<'static, WordApp>| harness.state().host.as_ref().unwrap().mark_rects().len();
     assert_eq!(marks(&harness), 1, "the mark is painted in view mode");
