@@ -3,10 +3,14 @@
 //! runs a reader would not see. Paragraphs are named by part and origin, as the save check's
 //! decoded streams name them (`inspect::streams`).
 
+use std::collections::HashMap;
+use std::rc::Rc;
+
 use wordcraft_doc::numbering::Counters;
 use wordcraft_doc::props::{Rgb, TextColor};
-use wordcraft_doc::styles::PartSet;
-use wordcraft_doc::{Block, CharProps, Document, ParaProps, PartKind, StoryRef};
+use wordcraft_doc::styles::{PartSet, TableStyleProps};
+use wordcraft_doc::table::Table;
+use wordcraft_doc::{Block, Blocks, CharProps, Document, MAX_TABLE_DEPTH, ParaProps, Paragraph, PartKind, StoryRef};
 
 use crate::package::Package;
 use crate::{DocxError, ReadLimits};
@@ -59,30 +63,153 @@ pub fn paragraph_facts(bytes: &[u8], limits: &ReadLimits) -> Result<Vec<Paragrap
     stories.extend(doc.parts.iter().filter_map(|(id, part)| rank(part.kind).map(|rank| (rank, StoryRef::Part(*id)))));
     // Stable: parts of one kind stay in the model's order.
     stories.sort_by_key(|(rank, _)| *rank);
-    let mut out = Vec::new();
+    let mut walk = Walk::new(&doc, &part_names);
     for (_, story) in stories {
-        story_facts(&doc, &part_names, story, &mut out);
+        // One story's lists count on their own, as layout counts them.
+        walk.counters = Counters::default();
+        if let Some(blocks) = doc.story(story) {
+            walk.blocks(blocks, None, 0)?;
+        }
     }
-    Ok(out)
+    Ok(walk.out)
 }
 
-/// One story's paragraphs, with list counters of its own (as layout counts them).
-fn story_facts(doc: &Document, part_names: &[String], story: StoryRef, out: &mut Vec<ParagraphFacts>) {
-    let mut counters = Counters::default();
-    for path in doc.para_paths(story) {
-        let Some(paragraph) = doc.para(story, &path) else { continue };
-        let resolved = doc.styles.resolve_para(&paragraph.props);
+/// The most work a reading may take, in the units [`Walk::charge`] counts: the model's style and
+/// list lookups scan every style or list, so a file with many of each and many runs is refused
+/// rather than ground through (the save check has the same limit, `inspect::MAX_WORK`).
+const MAX_WORK: u64 = 400_000_000;
+
+/// What the table cell a paragraph is in gives its text, as layout gives it: the innermost
+/// cell's table style formatting for its region (header row, bands, …), and what is painted
+/// behind the cell (its own shading, else its table style region's, else its table's, else the
+/// cell around its table).
+struct InCell {
+    para: ParaProps,
+    chr: CharProps,
+    fill: Option<Rgb>,
+}
+
+/// One walk over the stories, in document order.
+struct Walk<'a> {
+    doc: &'a Document,
+    part_names: &'a [String],
+    counters: Counters,
+    /// Table styles with their chains merged, by id.
+    table_styles: HashMap<&'a str, Option<Rc<TableStyleProps>>>,
+    /// Style chain lengths, by id.
+    chains: HashMap<&'a str, u64>,
+    work_left: u64,
+    out: Vec<ParagraphFacts>,
+}
+
+impl<'a> Walk<'a> {
+    fn new(doc: &'a Document, part_names: &'a [String]) -> Walk<'a> {
+        Walk { doc, part_names, counters: Counters::default(), table_styles: HashMap::new(), chains: HashMap::new(), work_left: MAX_WORK, out: Vec::new() }
+    }
+
+    fn charge(&mut self, units: u64) -> Result<(), DocxError> {
+        self.work_left = self.work_left.checked_sub(units).ok_or_else(|| DocxError::Limit("paragraph facts: too many style and list lookups".into()))?;
+        Ok(())
+    }
+
+    /// One scan of the style sheet.
+    fn style_scan(&self) -> u64 {
+        u64::try_from(self.doc.styles.styles.len()).unwrap_or(u64::MAX).saturating_add(1)
+    }
+
+    /// Charge resolving through style `id`'s chain (a scan per style in it), learning the chain's
+    /// length the first time.
+    fn charge_chain(&mut self, id: Option<&'a str>) -> Result<(), DocxError> {
+        let id = id.unwrap_or("Normal");
+        let length = match self.chains.get(id) {
+            Some(length) => *length,
+            None => {
+                // The chain is at most 32 styles (`StyleSheet::chain`).
+                self.charge(self.style_scan().saturating_mul(33))?;
+                let length = u64::try_from(self.doc.styles.chain(id).len()).unwrap_or(u64::MAX);
+                self.chains.insert(id, length);
+                length
+            }
+        };
+        self.charge(self.style_scan().saturating_mul(length.saturating_add(1)))
+    }
+
+    /// Charge a list label: each of the few levels it reads scans the lists and abstract lists.
+    fn charge_label(&mut self) -> Result<(), DocxError> {
+        let numbering = &self.doc.numbering;
+        let scan = u64::try_from(numbering.nums.len().saturating_add(numbering.abstracts.len())).unwrap_or(u64::MAX).saturating_add(1);
+        self.charge(scan.saturating_mul(24))
+    }
+
+    fn table_style(&mut self, id: &'a str) -> Result<Option<Rc<TableStyleProps>>, DocxError> {
+        if let Some(found) = self.table_styles.get(id) {
+            return Ok(found.clone());
+        }
+        self.charge(self.style_scan().saturating_mul(33))?;
+        let found = self.doc.styles.table_style(id).map(Rc::new);
+        self.table_styles.insert(id, found.clone());
+        Ok(found)
+    }
+
+    /// Paragraphs and tables, to the depth the model lists paragraphs to (`Document::para_paths`).
+    fn blocks(&mut self, blocks: &'a Blocks, cell: Option<&InCell>, depth: usize) -> Result<(), DocxError> {
+        if depth > MAX_TABLE_DEPTH {
+            return Ok(());
+        }
+        for block in blocks {
+            match block.as_ref() {
+                Block::Para(paragraph) => self.paragraph(paragraph, cell)?,
+                Block::Table(table) => self.table(table, cell, depth)?,
+            }
+        }
+        Ok(())
+    }
+
+    fn table(&mut self, table: &'a Table, outer: Option<&InCell>, depth: usize) -> Result<(), DocxError> {
+        let style = match table.props.style.as_deref() {
+            Some(id) => self.table_style(id)?,
+            None => None,
+        };
+        for (row_index, row) in table.rows.iter().enumerate() {
+            // Grid columns are counted from the row's first cell, as layout counts them.
+            let mut column = 0usize;
+            for cell in &row.cells {
+                let (mut para, mut chr, mut region_fill) = (ParaProps::default(), CharProps::default(), None);
+                if let Some(style) = &style {
+                    let region = PartSet::of_cell(&table.props.look, style.parts.band_size.unwrap_or(1), (row_index, table.rows.len()), (column, cell.span(), table.cols()));
+                    para = style.para.clone();
+                    // Lowest precedence first (ECMA-376 §17.7.6).
+                    for part in region.iter() {
+                        let format = style.part(part);
+                        chr.overlay(&format.chr);
+                        para.align = format.align.or(para.align);
+                        region_fill = format.fill.or(region_fill);
+                    }
+                }
+                let fill = cell.props.shading.or(region_fill).or(table.props.shading).or(outer.and_then(|outer| outer.fill));
+                self.blocks(&cell.blocks, Some(&InCell { para, chr, fill }), depth.saturating_add(1))?;
+                column = column.saturating_add(cell.span());
+            }
+        }
+        Ok(())
+    }
+
+    fn paragraph(&mut self, paragraph: &'a Paragraph, cell: Option<&InCell>) -> Result<(), DocxError> {
+        let doc = self.doc;
+        let style = paragraph.props.style.as_deref();
+        self.charge_chain(style)?;
+        let resolved = doc.styles.resolve_para_in(&paragraph.props, cell.map(|cell| &cell.para));
         let numbering = paragraph.props.numbering.or(resolved.numbering).filter(|numbering| numbering.num != 0);
         // Counted even for a paragraph left out, so the labels after it stay right.
-        let label = numbering.and_then(|numbering| counters.next_label(&doc.numbering, numbering.num, numbering.level)).map(|(text, _)| text);
-        let Some(origin) = paragraph.origin else { continue };
-        let Some(part) = usize::try_from(origin.part).ok().and_then(|index| part_names.get(index)) else { continue };
-        let style = paragraph.props.style.as_deref();
-        let cell = in_cell(doc, story, &path.0);
-        let resolved = match &cell {
-            Some(cell) => doc.styles.resolve_para_in(&paragraph.props, Some(&cell.para)),
-            None => resolved,
+        let label = match numbering {
+            Some(numbering) => {
+                self.charge_label()?;
+                self.counters.next_label(&doc.numbering, numbering.num, numbering.level).map(|(text, _)| text)
+            }
+            None => None,
         };
+        let Some(origin) = paragraph.origin else { return Ok(()) };
+        let Some(part) = usize::try_from(origin.part).ok().and_then(|index| self.part_names.get(index)) else { return Ok(()) };
         let mut concealed: Vec<(Conceal, String)> = Vec::new();
         // How the run before was concealed: neighbouring runs concealed the same way are one passage.
         let mut previous: Option<Conceal> = None;
@@ -94,12 +221,14 @@ fn story_facts(doc: &Document, part_names: &[String], story: StoryRef, out: &mut
             if text.is_empty() {
                 continue;
             }
-            let character = doc.styles.resolve_char_in(style, cell.as_ref().map(|cell| &cell.chr), &run.props);
+            self.charge_chain(style)?;
+            self.charge_chain(run.props.style.as_deref())?;
+            let character = doc.styles.resolve_char_in(style, cell.map(|cell| &cell.chr), &run.props);
             let behind = character
                 .highlight
                 .or(character.shading)
                 .or(resolved.shading)
-                .or(cell.as_ref().and_then(|cell| cell.fill))
+                .or(cell.and_then(|cell| cell.fill))
                 .or(doc.settings.page_color)
                 .unwrap_or(Rgb(255, 255, 255));
             let conceal = if character.hidden {
@@ -118,59 +247,16 @@ fn story_facts(doc: &Document, part_names: &[String], story: StoryRef, out: &mut
             }
             previous = conceal;
         }
-        out.push(ParagraphFacts {
-            part: part.to_string(),
+        self.out.push(ParagraphFacts {
+            part: part.clone(),
             origin: origin.index,
             label,
             list: numbering.map(|numbering| (numbering.num, numbering.level)),
             outline_level: resolved.outline_level.filter(|level| *level < 9),
             concealed,
         });
+        Ok(())
     }
-}
-
-/// What the table cell a paragraph is in gives its text, as layout gives it: the innermost
-/// cell's table style formatting for its region (header row, bands, …), and what is painted
-/// behind the cell (its own shading, else its table style region's, else its table's, else the
-/// cell around its table).
-struct InCell {
-    para: ParaProps,
-    chr: CharProps,
-    fill: Option<Rgb>,
-}
-
-/// The cell holding the paragraph at `path` (`[block, row, cell, block, …]`), if any.
-fn in_cell(doc: &Document, story: StoryRef, path: &[u32]) -> Option<InCell> {
-    let mut blocks = doc.story(story)?;
-    let mut found: Option<InCell> = None;
-    let mut rest = path;
-    while let [block, row_index, cell_index, tail @ ..] = rest {
-        let index = |at: &u32| usize::try_from(*at).ok();
-        let Block::Table(table) = blocks.get(index(block)?)?.as_ref() else { return found };
-        let row = table.rows.get(index(row_index)?)?;
-        let cell_at = index(cell_index)?;
-        let cell = row.cells.get(cell_at)?;
-        // Grid columns are counted from the row's first cell, as layout counts them.
-        let column: usize = row.cells.iter().take(cell_at).map(|cell| cell.span()).sum();
-        let style = table.props.style.as_deref().and_then(|id| doc.styles.table_style(id));
-        let (mut para, mut chr, mut region_fill) = (ParaProps::default(), CharProps::default(), None);
-        if let Some(style) = &style {
-            let region = PartSet::of_cell(&table.props.look, style.parts.band_size.unwrap_or(1), (index(row_index)?, table.rows.len()), (column, cell.span(), table.cols()));
-            para = style.para.clone();
-            // Lowest precedence first (ECMA-376 §17.7.6).
-            for part in region.iter() {
-                let format = style.part(part);
-                chr.overlay(&format.chr);
-                para.align = format.align.or(para.align);
-                region_fill = format.fill.or(region_fill);
-            }
-        }
-        let outer = found.as_ref().and_then(|outer| outer.fill);
-        found = Some(InCell { para, chr, fill: cell.props.shading.or(region_fill).or(table.props.shading).or(outer) });
-        blocks = &cell.blocks;
-        rest = tail;
-    }
-    found
 }
 
 /// The largest difference between two colours' channels.
@@ -253,6 +339,36 @@ mod tests {
     }
 
     #[test]
+    fn an_inner_cell_without_shading_sits_on_the_cell_around_it() {
+        let bytes = test_package::nested_in_black_cell("Black in a black cell");
+        let facts = paragraph_facts(&bytes, &LIMITS).unwrap();
+        let fact = facts.iter().find(|fact| !fact.concealed.is_empty()).unwrap();
+        assert_eq!(fact.concealed, vec![(Conceal::Colour, "Black in a black cell".into())]);
+    }
+
+    #[test]
+    fn style_lookups_past_the_work_limit_are_refused() {
+        // Runs name character styles among many (the reader keeps about 10,000): each lookup
+        // scans them all.
+        let bytes = test_package::many_styles(10_000, 50_000);
+        assert!(matches!(paragraph_facts(&bytes, &LIMITS), Err(DocxError::Limit(_))));
+    }
+
+    #[test]
+    fn a_long_ordinary_agreement_is_read_within_the_limit() {
+        let facts = paragraph_facts(&test_package::many_styles(300, 100_000), &LIMITS).unwrap();
+        assert_eq!(facts.len(), 1);
+        let facts = paragraph_facts(&test_package::many_lists(50, 20_000), &LIMITS).unwrap();
+        assert_eq!(facts.len(), 20_000);
+    }
+
+    #[test]
+    fn list_lookups_past_the_work_limit_are_refused() {
+        let bytes = test_package::many_lists(9_000, 50_000);
+        assert!(matches!(paragraph_facts(&bytes, &LIMITS), Err(DocxError::Limit(_))));
+    }
+
+    #[test]
     fn origins_and_parts_name_the_paragraphs() {
         let bytes = test_package::numbered(&[(0, "One"), (0, "Two")]);
         let facts = paragraph_facts(&bytes, &LIMITS).unwrap();
@@ -277,10 +393,10 @@ mod tests {
         const REL: &str = "http://schemas.openxmlformats.org/officeDocument/2006/relationships";
 
         fn zip(body: &str, header: Option<&str>) -> Vec<u8> {
-            zip_styled(body, header, "")
+            build(body, header, "", "")
         }
 
-        fn zip_styled(body: &str, header: Option<&str>, extra_styles: &str) -> Vec<u8> {
+        fn build(body: &str, header: Option<&str>, extra_styles: &str, extra_nums: &str) -> Vec<u8> {
             let header_type = r#"<Override PartName="/word/header1.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.header+xml"/>"#;
             let types = format!(
                 r#"<?xml version="1.0" encoding="UTF-8"?><Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"><Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/><Default Extension="xml" ContentType="application/xml"/><Override PartName="/word/document.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.document.main+xml"/><Override PartName="/word/styles.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.styles+xml"/><Override PartName="/word/numbering.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.numbering+xml"/>{}</Types>"#,
@@ -296,7 +412,7 @@ mod tests {
                 r#"<w:styles {W}><w:style w:type="paragraph" w:default="1" w:styleId="Normal"><w:name w:val="Normal"/><w:rPr><w:sz w:val="22"/></w:rPr></w:style><w:style w:type="paragraph" w:styleId="Heading1"><w:name w:val="heading 1"/><w:basedOn w:val="Normal"/><w:pPr><w:outlineLvl w:val="0"/></w:pPr></w:style>{extra_styles}</w:styles>"#
             );
             let numbering = format!(
-                r#"<w:numbering {W}><w:abstractNum w:abstractNumId="0"><w:lvl w:ilvl="0"><w:start w:val="1"/><w:numFmt w:val="decimal"/><w:lvlText w:val="%1."/></w:lvl><w:lvl w:ilvl="1"><w:start w:val="1"/><w:numFmt w:val="decimal"/><w:lvlText w:val="%1.%2"/></w:lvl></w:abstractNum><w:num w:numId="1"><w:abstractNumId w:val="0"/></w:num></w:numbering>"#
+                r#"<w:numbering {W}><w:abstractNum w:abstractNumId="0"><w:lvl w:ilvl="0"><w:start w:val="1"/><w:numFmt w:val="decimal"/><w:lvlText w:val="%1."/></w:lvl><w:lvl w:ilvl="1"><w:start w:val="1"/><w:numFmt w:val="decimal"/><w:lvlText w:val="%1.%2"/></w:lvl></w:abstractNum><w:num w:numId="1"><w:abstractNumId w:val="0"/></w:num>{extra_nums}</w:numbering>"#
             );
             let mut entries = vec![
                 ("[Content_Types].xml".to_string(), types.into_bytes()),
@@ -345,7 +461,7 @@ mod tests {
                 row(header),
                 row(body)
             );
-            zip_styled(&table, None, style)
+            build(&table, None, style, "")
         }
 
         /// One row of cells, each `(fill, font colour, text)`.
@@ -355,6 +471,27 @@ mod tests {
                 .map(|(fill, colour, text)| cell(text, &format!(r#"<w:shd w:val="clear" w:fill="{fill}"/>"#), &format!(r#"<w:color w:val="{colour}"/>"#)))
                 .collect();
             zip(&format!("<w:tbl><w:tblPr/><w:tblGrid><w:gridCol/><w:gridCol/></w:tblGrid><w:tr>{cells}</w:tr></w:tbl><w:p/>"), None)
+        }
+
+        /// A table in a black cell; the inner cell has no shading of its own.
+        pub fn nested_in_black_cell(text: &str) -> Vec<u8> {
+            let inner = format!("<w:tbl><w:tblPr/><w:tblGrid><w:gridCol/></w:tblGrid><w:tr>{}</w:tr></w:tbl><w:p/>", cell(text, "", r#"<w:color w:val="000000"/>"#));
+            let outer = format!(r#"<w:tbl><w:tblPr/><w:tblGrid><w:gridCol/></w:tblGrid><w:tr><w:tc><w:tcPr><w:shd w:val="clear" w:fill="000000"/></w:tcPr>{inner}</w:tc></w:tr></w:tbl><w:p/>"#);
+            zip(&outer, None)
+        }
+
+        /// `styles` character styles, and `runs` runs each in one of them.
+        pub fn many_styles(styles: usize, runs: usize) -> Vec<u8> {
+            let extra: String = (0..styles).map(|index| format!(r#"<w:style w:type="character" w:styleId="C{index}"><w:name w:val="c{index}"/></w:style>"#)).collect();
+            let body: String = (0..runs).map(|index| format!(r#"<w:r><w:rPr><w:rStyle w:val="C{}"/></w:rPr><w:t>x</w:t></w:r>"#, styles - 1 - index % styles)).collect();
+            build(&format!("<w:p>{body}</w:p>"), None, &extra, "")
+        }
+
+        /// `lists` lists, and `items` paragraphs in the last of them.
+        pub fn many_lists(lists: usize, items: usize) -> Vec<u8> {
+            let nums: String = (2..lists + 2).map(|id| format!(r#"<w:num w:numId="{id}"><w:abstractNumId w:val="0"/></w:num>"#)).collect();
+            let body: String = (0..items).map(|_| format!(r#"<w:p><w:pPr><w:numPr><w:ilvl w:val="0"/><w:numId w:val="{}"/></w:numPr></w:pPr></w:p>"#, lists + 1)).collect();
+            build(&body, None, "", &nums)
         }
 
         pub fn runs(runs: &[(&str, &str)]) -> Vec<u8> {
