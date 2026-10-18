@@ -663,7 +663,10 @@ fn jump(app: &mut WordApp, host: &mut HostState, target: JumpTarget, frame: u64)
         Some((page, y)) => {
             app.canvas.scroll_to_doc = Some((page, y));
             host.aim(page, y);
-            host.note_programmatic_selection(&app.session.sel);
+            // A location jump leaves the selection as it was, so there is no new one to forget.
+            if !matches!(target, JumpTarget::Location { .. }) {
+                host.note_programmatic_selection(&app.session.sel);
+            }
             host.pending_jump = Some(PendingJump { target, displaced, replaced, frame });
         }
         None => {
@@ -679,7 +682,8 @@ fn jump(app: &mut WordApp, host: &mut HostState, target: JumpTarget, frame: u64)
 }
 
 /// Where `target` is: (page index, points below its top to put at the top of the view). A text
-/// jump selects its passage (as find does; not reported to the host as a person's selection).
+/// jump selects its passage (as find does; not reported to the host as a person's selection); a
+/// location jump selects nothing and puts its place in the middle of the view.
 fn find_target(app: &mut WordApp, host: &mut HostState, target: &JumpTarget) -> Option<(usize, f32)> {
     let layout = app.session.layout();
     let pages = layout.pages.len();
@@ -706,6 +710,15 @@ fn find_target(app: &mut WordApp, host: &mut HostState, target: &JumpTarget) -> 
             app.session.page_hint = caret.page;
             // `max` also turns a NaN into 0; the canvas keeps the offset within the page.
             Some((caret.page, (caret.top - JUMP_MARGIN_PT).max(0.0)))
+        }
+        JumpTarget::Location { at } => {
+            // The same resolution as a location mark's, fingerprint included.
+            let content_version = app.session.content_version();
+            let locator = host.viewport.locator_for(&app.session.doc, content_version);
+            let place = super::marks::resolve_location(&app.session.doc, locator, at)?.start;
+            let hint = layout.page_of(&place).unwrap_or(0);
+            let caret = layout.caret_on(&place, hint)?;
+            super::viewport::centred(app, caret.page, caret.top)
         }
     }
 }

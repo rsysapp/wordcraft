@@ -284,6 +284,23 @@ pub(crate) fn target(app: &mut WordApp, viewport: &mut ViewportState, block: &Bl
     on_page(&starts, top + fraction.clamp(0.0, 1.0) * (bottom - top))
 }
 
+/// The scroll that puts the point `top` below the top of page `page` in the middle of the view, as
+/// the page and the points below its top that `scroll_to_doc` takes: half the view's height above it,
+/// on the stacked axis, so a place near a page's top is centred too. A place nearer the start of the
+/// document than half a view stops at the start. `None` when the pages are not on that axis.
+pub(crate) fn centred(app: &mut WordApp, page: usize, top: f32) -> Option<(usize, f32)> {
+    let layout = app.session.layout();
+    let starts = page_starts(&layout);
+    let scale = app.canvas.scale;
+    // Before the canvas is drawn the view has no height to take half of.
+    let half_view = match app.canvas.canvas_rect {
+        Some(canvas) if scale.is_finite() && scale > 0.0 => canvas.height() / scale / 2.0,
+        _ => 0.0,
+    };
+    // `max` also turns a NaN into 0.
+    on_page(&starts, (absolute(&starts, page, top)? - half_view).max(0.0))
+}
+
 /// The top of each of `blocks` on the stacked axis `read` and `target` use, in the request's order
 /// (`None` for a block the document lacks or has nothing laid out for), and the height of all the
 /// pages on that axis. The layout is taken once for the whole request.

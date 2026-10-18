@@ -174,7 +174,8 @@ export interface Theme {
 
 export type JumpTarget =
     | { kind: 'page'; page: number }
-    | { kind: 'text'; text: string; page: number | null; occurrence: number };
+    | { kind: 'text'; text: string; page: number | null; occurrence: number }
+    | { kind: 'location'; at: LocationSpec };
 
 export interface Mark {
     id: string;
@@ -552,6 +553,31 @@ paragraph.
 - **Numbers.** `from`, `to`, the block's `index` and the fingerprint's `length` follow the same rule
   as pages: a whole number of zero or more, else a `TypeError` and nothing queued; a huge one is
   merely past the end of any paragraph and is reported like one.
+
+### Jump to a location
+
+`jumpTo({ kind: 'location', at })` shows a place the host knows by location, where a text jump would
+have to search for words that may occur twice or have changed. `at` is a mark's `at` (see Marks by
+location): `{ block, fingerprint, from?, to? }`.
+
+- **Centred, selecting nothing.** The place goes to the middle of the view: the top of the line the
+  range starts on is put half the view's height below the top of the view, so a place within half a
+  view of the start of the document stops with the document's start at the top. The selection is left
+  as it was, whether the person made it or none exists, and a reported selection stays reported. A
+  text jump, by contrast, selects its passage.
+- **Where.** The start of the range (`from`); with `from` absent, the start of the paragraph. `to`
+  only has to be valid.
+- **Verified.** The location is resolved exactly as a mark's is: the paragraph at `block` must have
+  the `fingerprint`, and the range must lie inside its accepted text. If not, or when `block` is not
+  in the open document, nothing moves and the host is sent `{ type: 'jumpNotFound', target }` with the
+  target echoed, as for any jump that finds nothing. The jump is never made to a nearby paragraph.
+- **The view it causes.** The `viewport` event that follows says `cause: 'host'` and `token: null`,
+  as for any `jumpTo`; a host that syncs two views should not take it for the reviewer scrolling.
+  Only `scrollToBlock` answers with a token.
+- **A newer jump replaces one still waiting**, as for the other kinds, and the same limits and number
+  rules as marks apply to `from`, `to`, `index` and `length`.
+- **View mode's command gate is unchanged.** The jump is made by the editor's host state; no command
+  is run.
 
 ## Behaviour a host page relies on
 

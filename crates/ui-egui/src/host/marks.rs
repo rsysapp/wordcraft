@@ -195,18 +195,26 @@ impl Marks {
     }
 }
 
-/// The rectangles (page index, page-space rectangle) of a location mark, or `None` when the mark is
-/// refused: no paragraph is named so, its accepted text is not the one the fingerprint names (the
-/// host compared another file than the one open), or the range does not lie inside that text. A
-/// mark that is valid but shows nothing (an empty range as a fill or an outline, wording the clean
-/// display left out) has no rectangles.
-fn place_location(
-    doc: &Document,
-    layout: &DocLayout,
-    locator: Option<&Locator>,
-    at: &LocationSpec,
-    style: MarkStyle,
-) -> Option<Vec<(usize, wordcraft_geom::Rect)>> {
+/// A location that names the paragraph the host meant: resolved once, for marks and for jumps, so
+/// the two cannot disagree on what a location refers to.
+pub(crate) struct ResolvedLocation<'a> {
+    pub(crate) path: wordcraft_doc::Path,
+    pub(crate) paragraph: &'a wordcraft_doc::Paragraph,
+    /// The range in UTF-16 units of the accepted text, the paragraph's whole text when none was named.
+    pub(crate) from: u32,
+    pub(crate) to: u32,
+    /// Neither end was named.
+    pub(crate) whole: bool,
+    /// Model positions: where the range's first unit stands, and just after its last.
+    pub(crate) start: Pos,
+    pub(crate) end: Pos,
+}
+
+/// The paragraph a location names, verified, with its range as model positions; `None` when no
+/// paragraph is named so, its accepted text is not the one the fingerprint names (the host compared
+/// another file than the one open), or the range does not lie inside that text. This is the only
+/// place that checks the fingerprint: a location that fails it is neither painted nor jumped to.
+pub(crate) fn resolve_location<'a>(doc: &'a Document, locator: Option<&Locator>, at: &LocationSpec) -> Option<ResolvedLocation<'a>> {
     let path = locator?.path(&at.block.part, at.block.index)?;
     let paragraph = doc.para(StoryRef::Body, &path)?;
     if fingerprint(&accepted_text(paragraph)) != at.fingerprint {
@@ -223,6 +231,21 @@ fn place_location(
     // a deletion that follows the range is not part of it.
     let start = position(model_offset(paragraph, from)?);
     let end = position(model_end_offset(paragraph, to)?);
+    Some(ResolvedLocation { path, paragraph, from, to, whole, start, end })
+}
+
+/// The rectangles (page index, page-space rectangle) of a location mark, or `None` when the mark is
+/// refused (see [`resolve_location`]). A mark that is valid but shows nothing (an empty range as a
+/// fill or an outline, wording the clean display left out) has no rectangles.
+fn place_location(
+    doc: &Document,
+    layout: &DocLayout,
+    locator: Option<&Locator>,
+    at: &LocationSpec,
+    style: MarkStyle,
+) -> Option<Vec<(usize, wordcraft_geom::Rect)>> {
+    let ResolvedLocation { path, paragraph, from, to, whole, start, end } = resolve_location(doc, locator, at)?;
+    let position = |off: usize| Pos { story: StoryRef::Body, path: path.clone(), off };
     let words = |a: &Pos, b: &Pos| -> Vec<(usize, wordcraft_geom::Rect)> {
         layout.selection_rects(doc, a, b, 0).into_iter().filter(|(_, rect)| usable(rect)).collect()
     };

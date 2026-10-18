@@ -6,7 +6,7 @@ mod common;
 use common::*;
 use wordcraft_doc::Path;
 use wordcraft_docx::facts::{accepted_text, fingerprint};
-use wordcraft_ui_egui::host::{BlockRef, HostCommand, HostEvent, LocationSpec, MarkSpec, MarkStyle};
+use wordcraft_ui_egui::host::{BlockRef, Cause, HostCommand, HostEvent, JumpTarget, LocationSpec, MarkSpec, MarkStyle};
 
 const GREEN: &str = "#16a34a4d";
 
@@ -344,4 +344,186 @@ fn a_range_after_non_ascii_text_is_painted_on_its_words() {
     assert_eq!(rects.len(), 1);
     assert_close_to_words(&mut h, &rects[0], 0, 8..16);
     assert_eq!(selected_words_under(&mut h, 0, &rects[0]), "Rent due");
+}
+
+// ---- jumps to a location (embed API 0.3) ----
+
+const BODY_PART: &str = "word/document.xml";
+
+fn location_jump(index: u32, text_of_block: &str, from: Option<u32>, to: Option<u32>) -> JumpTarget {
+    JumpTarget::Location { at: LocationSpec { block: BlockRef { part: BODY_PART.into(), index }, fingerprint: fingerprint(text_of_block), from, to } }
+}
+
+#[test]
+fn a_location_jump_centres_the_place_and_selects_nothing() {
+    let (mut h, bridge) = embed_app();
+    open_doc(&mut h, &bridge, &clauses(120));
+    let text = paragraph_text(&h, 90);
+    let selection_before = h.state().session.sel.clone();
+    bridge.send(HostCommand::JumpTo(location_jump(90, &text, Some(0), Some(0))));
+    frames(&mut h, 4);
+    assert_eq!(h.state().session.sel, selection_before);
+    let middle = h.state().canvas.canvas_rect.expect("the canvas was drawn").center().y;
+    let place = screen_of(&mut h, &wordcraft_doc::Pos::body(90, 0));
+    assert!((place.y - middle).abs() < 80.0, "centred: {} vs {}", place.y, middle);
+}
+
+#[test]
+fn a_location_jump_without_a_range_goes_to_the_start_of_the_paragraph() {
+    let (mut h, bridge) = embed_app();
+    open_doc(&mut h, &bridge, &clauses(120));
+    let text = paragraph_text(&h, 60);
+    bridge.send(HostCommand::JumpTo(location_jump(60, &text, None, None)));
+    frames(&mut h, 4);
+    let middle = h.state().canvas.canvas_rect.expect("the canvas was drawn").center().y;
+    let place = screen_of(&mut h, &wordcraft_doc::Pos::body(60, 0));
+    assert!((place.y - middle).abs() < 80.0, "centred: {} vs {}", place.y, middle);
+}
+
+#[test]
+fn a_location_jump_near_the_top_of_the_document_stops_at_the_top() {
+    let (mut h, bridge) = embed_app();
+    open_doc(&mut h, &bridge, &clauses(120));
+    let text = paragraph_text(&h, 1);
+    bridge.send(HostCommand::JumpTo(location_jump(1, &text, None, None)));
+    frames(&mut h, 4);
+    let view = h.state().canvas.canvas_rect.expect("the canvas was drawn");
+    let place = screen_of(&mut h, &wordcraft_doc::Pos::body(1, 0));
+    // Half a view above the place is before the start of the document, so the view stays at the start
+    // and the place is where it stands there: above the middle.
+    assert!(place.y > view.min.y && place.y < view.center().y - 80.0, "the view cannot go above the document: {} in {view:?}", place.y);
+}
+
+#[test]
+fn a_location_jump_leaves_a_selection_the_person_made_alone() {
+    let (mut h, bridge) = embed_app();
+    open_doc(&mut h, &bridge, &clauses(120));
+    let (from, to) = (wordcraft_doc::Pos::body(2, 0), wordcraft_doc::Pos::body(2, 6));
+    drag_select(&mut h, &bridge, &from, &to);
+    frames(&mut h, 4);
+    let selection_before = h.state().session.sel.clone();
+    assert_ne!(selection_before.anchor, selection_before.focus, "something is selected");
+    bridge.take_events();
+    let text = paragraph_text(&h, 90);
+    bridge.send(HostCommand::JumpTo(location_jump(90, &text, Some(0), Some(6))));
+    frames(&mut h, 4);
+    assert_eq!(h.state().session.sel, selection_before);
+    let events = bridge.take_events();
+    assert!(!events.contains(&HostEvent::SelectionCleared), "the person's selection stays: {events:?}");
+    assert!(!events.iter().any(|event| matches!(event, HostEvent::JumpNotFound { .. })), "{events:?}");
+}
+
+#[test]
+fn a_location_jump_is_reported_as_the_hosts_own_move() {
+    let (mut h, bridge) = embed_app();
+    open_doc(&mut h, &bridge, &clauses(120));
+    bridge.take_events();
+    let text = paragraph_text(&h, 90);
+    bridge.send(HostCommand::JumpTo(location_jump(90, &text, Some(0), Some(6))));
+    frames(&mut h, 6);
+    let events = bridge.take_events();
+    let viewports: Vec<_> = events.iter().filter(|event| matches!(event, HostEvent::Viewport { .. })).collect();
+    assert!(!viewports.is_empty(), "the view moved, so the host hears of it");
+    assert!(viewports.iter().all(|event| matches!(event, HostEvent::Viewport { cause: Cause::Host, token: None, .. })), "{viewports:?}");
+}
+
+#[test]
+fn a_location_jump_with_a_wrong_fingerprint_is_not_found() {
+    let (mut h, bridge) = embed_app();
+    open_doc(&mut h, &bridge, &clauses(20));
+    bridge.take_events();
+    let target = location_jump(5, "Not this.", None, None);
+    bridge.send(HostCommand::JumpTo(target.clone()));
+    frames(&mut h, 3);
+    assert!(bridge.take_events().contains(&HostEvent::JumpNotFound { target }));
+}
+
+#[test]
+fn a_location_jump_that_is_not_found_moves_nothing() {
+    let (mut h, bridge) = embed_app();
+    open_doc(&mut h, &bridge, &clauses(120));
+    bridge.send(HostCommand::JumpTo(JumpTarget::Page { page: 2 }));
+    frames(&mut h, 4);
+    let selection_before = h.state().session.sel.clone();
+    let scroll_before = h.state().canvas.visible_page;
+    bridge.take_events();
+    let text = paragraph_text(&h, 100);
+    let unknown_block = location_jump(999, &text, None, None);
+    let wrong_part = JumpTarget::Location {
+        at: LocationSpec { block: BlockRef { part: "word/other.xml".into(), index: 100 }, fingerprint: fingerprint(&text), from: None, to: None },
+    };
+    for target in [location_jump(100, "Not this.", None, None), unknown_block, wrong_part] {
+        bridge.send(HostCommand::JumpTo(target.clone()));
+        frames(&mut h, 4);
+        let events = bridge.take_events();
+        assert!(events.contains(&HostEvent::JumpNotFound { target: target.clone() }), "{target:?}: {events:?}");
+        assert!(!events.iter().any(|event| matches!(event, HostEvent::Viewport { .. })), "nothing moved: {events:?}");
+    }
+    assert_eq!(h.state().session.sel, selection_before);
+    assert_eq!(h.state().canvas.visible_page, scroll_before);
+}
+
+#[test]
+fn a_location_jump_with_a_bad_range_is_not_found() {
+    let (mut h, bridge) = embed_app();
+    open_doc(&mut h, &bridge, &clauses(20));
+    let text = paragraph_text(&h, 5);
+    let length = fingerprint(&text).length;
+    for (from, to) in [(Some(8), Some(3)), (Some(0), Some(length + 1)), (Some(length + 1), None), (Some(u32::MAX), Some(u32::MAX))] {
+        bridge.take_events();
+        let target = location_jump(5, &text, from, to);
+        bridge.send(HostCommand::JumpTo(target.clone()));
+        frames(&mut h, 3);
+        assert!(bridge.take_events().contains(&HostEvent::JumpNotFound { target }), "{from:?}..{to:?}");
+    }
+}
+
+#[test]
+fn a_location_jump_agrees_with_the_mark_on_the_same_location() {
+    // Marks and jumps share one resolution: whatever a mark refuses, a jump refuses.
+    let (mut h, bridge) = embed_app();
+    open_doc(&mut h, &bridge, &clauses(20));
+    let text = paragraph_text(&h, 5);
+    bridge.take_events();
+    bridge.send(HostCommand::SetMarks(vec![location_mark("stale", 5, "Other.", None, None, MarkStyle::Fill)]));
+    settle_marks(&mut h);
+    let target = location_jump(5, "Other.", None, None);
+    bridge.send(HostCommand::JumpTo(target.clone()));
+    frames(&mut h, 3);
+    let events = bridge.take_events();
+    assert!(events.contains(&HostEvent::LocationMismatch { ids: vec!["stale".into()] }), "{events:?}");
+    assert!(events.contains(&HostEvent::JumpNotFound { target }), "{events:?}");
+    let _ = text;
+}
+
+#[test]
+fn a_range_after_a_deletion_is_jumped_to_on_its_words() {
+    let (mut h, bridge) = embed_app_open_final(&tracked_lease_docx());
+    let accepted = accepted_text(&first_body_paragraph(&h));
+    bridge.take_events();
+    let target = location_jump(0, &accepted, Some(12), Some(17));
+    bridge.send(HostCommand::JumpTo(target.clone()));
+    frames(&mut h, 4);
+    assert!(!bridge.take_events().contains(&HostEvent::JumpNotFound { target }));
+}
+
+#[test]
+fn a_location_jump_parses() {
+    use wordcraft_ui_egui::host::wire::parse_jump_target;
+    let target =
+        parse_jump_target(r#"{"kind":"location","at":{"block":{"part":"word/document.xml","index":4},"fingerprint":{"length":3,"hash":"ab"}}}"#)
+            .unwrap();
+    let JumpTarget::Location { at } = target else { panic!("{target:?}") };
+    assert_eq!((at.block.index, at.from, at.to, at.fingerprint.length), (4, None, None, 3));
+    let huge = parse_jump_target(
+        r#"{"kind":"location","at":{"block":{"part":"p","index":0},"fingerprint":{"length":1,"hash":"00"},"from":1e30,"to":null}}"#,
+    )
+    .unwrap();
+    assert!(matches!(huge, JumpTarget::Location { at } if at.from == Some(u32::MAX) && at.to.is_none()));
+    assert!(parse_jump_target(r#"{"kind":"location"}"#).is_err());
+    // A location jump goes back to the host as it came, in `jumpNotFound`.
+    let json = serde_json::to_value(location_jump(4, "x", Some(1), None)).unwrap();
+    assert_eq!(json["kind"], "location");
+    assert_eq!(json["at"]["block"]["index"], 4);
+    assert_eq!(json["at"]["from"], 1);
 }

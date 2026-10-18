@@ -155,6 +155,7 @@ for want in \
   "{ type: 'blockNotFound'; block: BlockRef; token: number }" \
   'export interface Theme' \
   'export type JumpTarget' \
+  "{ kind: 'location'; at: LocationSpec }" \
   'export interface Mark' \
   'export interface LocationSpec' \
   'export type EditorMark' \

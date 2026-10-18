@@ -41,8 +41,9 @@ fn saturating_optional_u32<'de, D: Deserializer<'de>>(deserializer: D) -> Result
     Ok(Option::<Whole>::deserialize(deserializer)?.map(|whole| whole.0))
 }
 
-/// Where to jump: a page (1-based), or a passage of text (`occurrence` is 0-based, among the
-/// matches on `page`, or in the whole document when `page` is null).
+/// Where to jump: a page (1-based), a passage of text (`occurrence` is 0-based, among the matches on
+/// `page`, or in the whole document when `page` is null), or (API 0.3) a verified location, which is
+/// centred in the view and selects nothing.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "camelCase")]
 pub enum JumpTarget {
@@ -56,6 +57,9 @@ pub enum JumpTarget {
         page: Option<u32>,
         #[serde(deserialize_with = "saturating_u32")]
         occurrence: u32,
+    },
+    Location {
+        at: LocationSpec,
     },
 }
 
@@ -83,7 +87,7 @@ pub struct MarkSpec {
 /// origin index, a table by its first paragraph), the fingerprint of that paragraph's accepted text,
 /// and a range of that text. The fingerprint is how the editor knows it found the paragraph the host
 /// meant; a mark whose paragraph differs is never painted but reported (`locationMismatch`).
-#[derive(Clone, Debug, PartialEq, Eq, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct LocationSpec {
     pub block: BlockRef,
@@ -92,9 +96,9 @@ pub struct LocationSpec {
     /// Both `None` is the whole paragraph; `from == to` is the place between two characters, which
     /// only a bar shows. A huge offset saturates to `u32::MAX` and is reported like any offset past
     /// the end of the text.
-    #[serde(default, deserialize_with = "saturating_optional_u32")]
+    #[serde(default, deserialize_with = "saturating_optional_u32", skip_serializing_if = "Option::is_none")]
     pub from: Option<u32>,
-    #[serde(default, deserialize_with = "saturating_optional_u32")]
+    #[serde(default, deserialize_with = "saturating_optional_u32", skip_serializing_if = "Option::is_none")]
     pub to: Option<u32>,
 }
 

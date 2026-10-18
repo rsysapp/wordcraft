@@ -20,7 +20,8 @@ export interface Theme {
 
 export type JumpTarget =
     | { kind: 'page'; page: number }
-    | { kind: 'text'; text: string; page: number | null; occurrence: number };
+    | { kind: 'text'; text: string; page: number | null; occurrence: number }
+    | { kind: 'location'; at: LocationSpec };
 
 export interface Mark {
     id: string;
@@ -126,7 +127,7 @@ mod tests {
         for decl in [
             "export interface MountOptions { mode: 'view'; theme: Theme; viewBar?: boolean; }",
             "export interface Theme { dark: boolean; accent: string; accentContent: string; }",
-            "export type JumpTarget = | { kind: 'page'; page: number } | { kind: 'text'; text: string; page: number | null; occurrence: number };",
+            "export type JumpTarget = | { kind: 'page'; page: number } | { kind: 'text'; text: string; page: number | null; occurrence: number } | { kind: 'location'; at: LocationSpec };",
             "export interface Mark { id: string; text: string; page: number | null; color: string; }",
             "export interface LocationSpec { block: BlockRef; fingerprint: { length: number; hash: string }; from?: number | null; to?: number | null; }",
             "export type EditorMark = { id: string; color: string; style?: 'fill' | 'outline' | 'bar'; page?: number | null } & ({ text: string } | { at: LocationSpec });",
