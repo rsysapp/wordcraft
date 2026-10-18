@@ -73,6 +73,8 @@ export type ScrollRequest = { block: BlockRef; fraction: number; token: number }
 
 export type LocateRequest = { blocks: BlockRef[]; token: number };
 
+export type FindRequest = { text: string; matchCase?: boolean; step: 'first' | 'next' | 'previous'; select?: boolean; token: number };
+
 export type EditorEvent =
     | { type: 'opened'; pages: number }
     | { type: 'openFailed'; message: string }
@@ -91,6 +93,7 @@ export type EditorEvent =
     | { type: 'viewport'; top: BlockRef | null; fraction: number; visibleHeight: number; page: number; pages: number; cause: 'user' | 'host'; token: number | null }
     | { type: 'blockNotFound'; block: BlockRef; token: number }
     | { type: 'located'; positions: (number | null)[]; height: number; token: number }
+    | { type: 'findResult'; count: number; index: number | null; token: number }
     | { type: 'locationMismatch'; ids: string[] }
     | { type: 'marksDropped'; count: number }
     | { type: 'redactionsPending'; marks: number }
@@ -139,6 +142,7 @@ mod tests {
             "export interface BlockRef { part: string; index: number; }",
             "export type ScrollRequest = { block: BlockRef; fraction: number; token: number };",
             "export type LocateRequest = { blocks: BlockRef[]; token: number };",
+            "export type FindRequest = { text: string; matchCase?: boolean; step: 'first' | 'next' | 'previous'; select?: boolean; token: number };",
             "export type EditorEvent = | { type: 'opened'; pages: number } | { type: 'openFailed'; message: string } \
              | { type: 'pageChanged'; page: number } \
              | { type: 'selection'; text: string; copyText: string; page: number | null; x: number; y: number } \
@@ -151,6 +155,7 @@ mod tests {
              | { type: 'viewport'; top: BlockRef | null; fraction: number; visibleHeight: number; page: number; pages: number; cause: 'user' | 'host'; token: number | null } \
              | { type: 'blockNotFound'; block: BlockRef; token: number } \
              | { type: 'located'; positions: (number | null)[]; height: number; token: number } \
+             | { type: 'findResult'; count: number; index: number | null; token: number } \
              | { type: 'locationMismatch'; ids: string[] } \
              | { type: 'marksDropped'; count: number } \
              | { type: 'redactionsPending'; marks: number } | { type: 'editRefused'; code: EditRefusalCode };",
@@ -207,6 +212,7 @@ mod tests {
                 "locate",
                 "#[wasm_bindgen(js_name = locate)] pub fn locate(&self, #[wasm_bindgen(unchecked_param_type = \"LocateRequest\")] request: JsValue)",
             ),
+            ("find", "#[wasm_bindgen(js_name = find)] pub fn find(&self, #[wasm_bindgen(unchecked_param_type = \"FindRequest\")] request: JsValue)"),
             ("requestSave", "#[wasm_bindgen(js_name = requestSave)] pub fn request_save(&self) {"),
             ("applyRedactions", "#[wasm_bindgen(js_name = applyRedactions)] pub fn apply_redactions(&self) {"),
         ] {

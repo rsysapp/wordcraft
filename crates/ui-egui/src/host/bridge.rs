@@ -6,7 +6,7 @@ use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 use serde::Serialize;
 
-use super::wire::{BlockRef, JumpTarget, LocateRequest, MarkSpec, ModeRequest, OpenOptions, ScrollRequest, ThemeSpec, ZoomRequest};
+use super::wire::{BlockRef, FindRequest, JumpTarget, LocateRequest, MarkSpec, ModeRequest, OpenOptions, ScrollRequest, ThemeSpec, ZoomRequest};
 
 /// What a host page asks of the editor.
 #[derive(Clone, Debug, PartialEq)]
@@ -34,6 +34,9 @@ pub enum HostCommand {
     /// Where blocks start along the stacked pages; answered by `Located` carrying the request's
     /// token once the document is laid out. Embed API 0.3.
     Locate(LocateRequest),
+    /// Search the open document and step through the matches; answered by `FindResult` carrying the
+    /// request's token. Embed API 0.3.
+    Find(FindRequest),
 }
 
 /// What the editor tells the host page; serialises to the embed API's `EditorEvent`.
@@ -113,6 +116,15 @@ pub enum HostEvent {
         pages: u32,
         cause: Cause,
         token: Option<u32>,
+    },
+    /// The answer to `find` (embed API 0.3): how many matches the text has and which one the find
+    /// is on (`None` when there are none), 0-based in document order. A find that selects its match
+    /// scrolls it into the middle of the view, and that scroll is reported by a `Viewport` with
+    /// `cause: Host` and this `token`; a count-only find (`select: false`) moves nothing.
+    FindResult {
+        count: u32,
+        index: Option<u32>,
+        token: u32,
     },
     /// `scrollToBlock` named a block the open document does not have (or has no layout for).
     BlockNotFound {
@@ -364,6 +376,8 @@ mod tests {
                 HostEvent::Located { positions: vec![Some(12.5), None, Some(800.0)], height: 1584.0, token: 5 },
                 json!({"type": "located", "positions": [12.5, null, 800.0], "height": 1584.0, "token": 5}),
             ),
+            (HostEvent::FindResult { count: 4, index: Some(1), token: 8 }, json!({"type": "findResult", "count": 4, "index": 1, "token": 8})),
+            (HostEvent::FindResult { count: 0, index: None, token: 9 }, json!({"type": "findResult", "count": 0, "index": null, "token": 9})),
             (HostEvent::LocationMismatch { ids: vec!["a".into(), "b".into()] }, json!({"type": "locationMismatch", "ids": ["a", "b"]})),
             (HostEvent::MarksDropped { count: 5 }, json!({"type": "marksDropped", "count": 5})),
             (HostEvent::SaveFailed { message: "m".into() }, json!({"type": "saveFailed", "message": "m"})),

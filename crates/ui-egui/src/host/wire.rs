@@ -275,6 +275,35 @@ pub fn parse_scroll_request(json: &str) -> Result<ScrollRequest, String> {
     Ok(request)
 }
 
+/// `find`'s request (embed API 0.3): search the open document for `text` and step through the matches.
+/// With `select` false the search only counts, so a host can ask the other side of a synchronised
+/// pair how many matches it has without moving it. The `findResult` it causes, and the `viewport`
+/// of the scroll a selecting find makes, carry the host's `token` back.
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FindRequest {
+    pub text: String,
+    #[serde(default)]
+    pub match_case: bool,
+    pub step: FindStepSpec,
+    #[serde(default = "yes")]
+    pub select: bool,
+    pub token: u32,
+}
+
+/// Which match a `find` goes to.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum FindStepSpec {
+    First,
+    Next,
+    Previous,
+}
+
+pub fn parse_find_request(json: &str) -> Result<FindRequest, String> {
+    serde_json::from_str(json).map_err(|error| format!("find: {error}"))
+}
+
 /// The most blocks one `locate` may ask about: a change strip places every change of a comparison,
 /// and a request beyond this is a mistake, not a long document.
 pub const MAX_LOCATE_BLOCKS: usize = 10_000;
@@ -462,6 +491,34 @@ mod tests {
             r#"{"fraction":0.5,"token":1}"#,
         ] {
             assert!(parse_scroll_request(bad).is_err(), "{bad}");
+        }
+    }
+
+    #[test]
+    fn find_requests_take_text_a_step_and_a_token_and_default_the_rest() {
+        assert_eq!(
+            parse_find_request(r#"{"text":"Clause","step":"first","token":1}"#),
+            Ok(FindRequest { text: "Clause".into(), match_case: false, step: FindStepSpec::First, select: true, token: 1 })
+        );
+        assert_eq!(
+            parse_find_request(r#"{"text":"","matchCase":true,"step":"previous","select":false,"token":0}"#),
+            Ok(FindRequest { text: String::new(), match_case: true, step: FindStepSpec::Previous, select: false, token: 0 })
+        );
+        assert_eq!(parse_find_request(r#"{"text":"a","step":"next","token":4294967295}"#).map(|request| request.step), Ok(FindStepSpec::Next));
+        for bad in [
+            r#"{"step":"first","token":1}"#,
+            r#"{"text":"a","token":1}"#,
+            r#"{"text":"a","step":"first"}"#,
+            r#"{"text":"a","step":"last","token":1}"#,
+            r#"{"text":"a","step":"First","token":1}"#,
+            r#"{"text":7,"step":"first","token":1}"#,
+            r#"{"text":"a","step":"first","token":-1}"#,
+            r#"{"text":"a","step":"first","token":1.5}"#,
+            r#"{"text":"a","step":"first","token":4294967296}"#,
+            r#"{"text":"a","matchCase":"yes","step":"first","token":1}"#,
+            r#"{"text":"a","select":null,"step":"first","token":1}"#,
+        ] {
+            assert!(parse_find_request(bad).is_err(), "{bad}");
         }
     }
 

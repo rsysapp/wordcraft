@@ -6,6 +6,7 @@ use serde_json::json;
 use wordcraft_doc::{Pos, StoryRef};
 use wordcraft_engine::Selection;
 
+use super::state::HostState;
 use crate::theme::{Tokens, regular};
 use crate::{WordApp, icons};
 
@@ -229,11 +230,70 @@ fn body_anchor(app: &WordApp) -> Pos {
 /// the highlight (the selected match). The selection is the editor's own, never reported to the host.
 pub fn run_find(app: &mut WordApp, query: &str, step: FindStep) {
     let before = app.session.sel.clone();
-    find(app, query, step);
+    let mut anchor = app.host.as_mut().and_then(|host| host.find_anchor.take());
+    let moved = find(app, &mut anchor, query, false, step);
+    if let Some(host) = app.host.as_mut() {
+        host.find_anchor = anchor;
+        if moved {
+            host.page_target = None;
+        }
+    }
     // Escape, or a step that found no match, leaves a person's selection as it was.
     if app.session.sel != before {
         note_programmatic_selection(app);
     }
+}
+
+/// The host's `find` that selects its match (`host` is out of the app while host commands run): the
+/// view bar's find with the host's case option, and a person's selection kept when nothing matches
+/// (the bar's typing parks the caret at the search's start first; a host asking about text that is
+/// not there has not asked for that).
+pub(crate) fn run_host_find(app: &mut WordApp, host: &mut HostState, query: &str, match_case: bool, step: FindStep) {
+    let before = app.session.sel.clone();
+    let caret_scroll = app.canvas.scroll_to_caret;
+    let moved = find(app, &mut host.find_anchor, query, match_case, step);
+    if moved {
+        host.page_target = None;
+    }
+    if !query.is_empty() && app.session.find.results.is_empty() {
+        app.session.sel = before.clone();
+        app.canvas.scroll_to_caret = caret_scroll;
+    }
+    if app.session.sel != before {
+        host.note_programmatic_selection(&app.session.sel);
+    }
+}
+
+/// The host's `find` with `select: false`: the search runs into `session.find`, and `current` is
+/// the match the same step would go to from the person's selection, but the selection, the scroll
+/// and the bar's text are left as they are. The engine's search runs on the session with the
+/// selection moved to the search's start only while it runs.
+pub(crate) fn count_matches(app: &mut WordApp, query: &str, match_case: bool, step: FindStep) {
+    if query.is_empty() {
+        app.session.find.results.clear();
+        app.session.find.current = 0;
+        return;
+    }
+    let saved = app.session.sel.clone();
+    // The engine searches the story the caret is in; anything but the body starts at its top.
+    let (start, end) = if saved.ordered().0.story == StoryRef::Body { saved.ordered() } else { (Pos::body(0, 0), Pos::body(0, 0)) };
+    app.session.sel = Selection::caret(start.clone());
+    let found = app.session.run("edit.find", &json!({"text": query, "matchCase": match_case, "wholeWord": false, "regex": false}));
+    app.session.sel = saved;
+    if found.is_err() {
+        app.session.find.results.clear();
+        app.session.find.current = 0;
+        return;
+    }
+    let results = &app.session.find.results;
+    // The engine's own choices (`edit.find`, `edit.findNext`, `edit.findPrevious`), made from the
+    // person's selection instead of the one it moved.
+    let current = match step {
+        FindStep::First => results.iter().position(|(from, _)| *from >= start).unwrap_or(0),
+        FindStep::Next => results.iter().position(|(from, _)| *from >= end).unwrap_or(0),
+        FindStep::Previous => results.iter().rposition(|(_, to)| *to <= start).unwrap_or(results.len().saturating_sub(1)),
+    };
+    app.session.find.current = current;
 }
 
 /// The selection is the editor's doing (find, the page buttons): see
@@ -244,7 +304,9 @@ fn note_programmatic_selection(app: &mut WordApp) {
     }
 }
 
-fn find(app: &mut WordApp, query: &str, step: FindStep) {
+/// Runs a find step; `true` when the view went to a match (the page a jump made current no longer is).
+/// `find_anchor` is where the search began, which typing refines from.
+fn find(app: &mut WordApp, find_anchor: &mut Option<Pos>, query: &str, match_case: bool, step: FindStep) -> bool {
     if query.is_empty() {
         let (start, end) = app.session.sel.ordered();
         let was_match = app.session.find.results.iter().any(|(a, b)| *a == start && *b == end);
@@ -253,46 +315,29 @@ fn find(app: &mut WordApp, query: &str, step: FindStep) {
         if was_match {
             app.session.sel = Selection::caret(start);
         }
-        if let Some(host) = app.host.as_mut() {
-            host.find_anchor = None;
-        }
-        return;
+        *find_anchor = None;
+        return false;
     }
     match step {
         FindStep::First => {
             // Each keystroke searches again from where the search began: the engine takes the first
             // match at or after the caret, and the last keystroke left the caret on its match, so
             // a longer query would otherwise skip to a later match.
-            let kept = app.host.as_ref().and_then(|host| host.find_anchor.clone());
-            let anchor = kept.unwrap_or_else(|| body_anchor(app));
-            if let Some(host) = app.host.as_mut() {
-                host.find_anchor = Some(anchor.clone());
-            }
+            let anchor = find_anchor.clone().unwrap_or_else(|| body_anchor(app));
+            *find_anchor = Some(anchor.clone());
             app.session.sel = Selection::caret(anchor);
             // The options are set every time: a host's earlier regex search must not make typed text a pattern.
-            let found = app.run("edit.find", json!({"text": query, "matchCase": false, "wholeWord": false, "regex": false}));
-            if found.is_ok() {
-                forget_page_target(app);
-            }
+            app.run("edit.find", json!({"text": query, "matchCase": match_case, "wholeWord": false, "regex": false})).is_ok()
         }
         FindStep::Next | FindStep::Previous => {
             let command = if step == FindStep::Next { "edit.findNext" } else { "edit.findPrevious" };
-            if app.run(command, json!({})).is_ok() {
-                // The view went to the match, wherever the last jump was.
-                forget_page_target(app);
-                // Typing on refines the search from the match just stepped to.
-                let anchor = body_anchor(app);
-                if let Some(host) = app.host.as_mut() {
-                    host.find_anchor = Some(anchor);
-                }
+            if app.run(command, json!({})).is_err() {
+                return false;
             }
+            // Typing on refines the search from the match just stepped to.
+            *find_anchor = Some(body_anchor(app));
+            true
         }
-    }
-}
-
-fn forget_page_target(app: &mut WordApp) {
-    if let Some(host) = app.host.as_mut() {
-        host.page_target = None;
     }
 }
 

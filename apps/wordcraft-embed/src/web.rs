@@ -153,6 +153,19 @@ impl EmbeddedEditor {
         Ok(())
     }
 
+    /// Searches the open document for `text` and steps through the matches (`first`, `next`,
+    /// `previous`, wrapping). Answered by one `findResult` with the request's `token`; a find that
+    /// selects (the default) puts its match in the middle of the view, and the `viewport` that
+    /// follows carries the token. `select: false` only counts and moves nothing.
+    #[wasm_bindgen(js_name = find)]
+    pub fn find(&self, #[wasm_bindgen(unchecked_param_type = "FindRequest")] request: JsValue) -> Result<(), JsValue> {
+        // Before `json_of`, as in `setZoom`: NaN and Infinity would read as null there.
+        check_counts(&request, &["token"], "find")?;
+        let request = wire::parse_find_request(&json_of(&request)?).map_err(|e| type_error(&e))?;
+        self.send(HostCommand::Find(request));
+        Ok(())
+    }
+
     /// Serialises the document; answered by `saveRequested` or `saveFailed`.
     #[wasm_bindgen(js_name = requestSave)]
     pub fn request_save(&self) {

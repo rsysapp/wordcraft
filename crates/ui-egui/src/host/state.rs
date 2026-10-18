@@ -9,7 +9,10 @@ use wordcraft_engine::Selection;
 use super::bridge::{Cause, HostBridge, HostCommand, HostEvent};
 use super::marks::Marks;
 use super::text_match::{TextIndex, visible_fragment_text};
-use super::wire::{Display, JumpTarget, OpenOptions, ScrollRequest, ThemeSpec, ZoomRequest, ZoomValue, occurrence_index, page_index};
+use super::view::FindStep;
+use super::wire::{
+    Display, FindRequest, FindStepSpec, JumpTarget, OpenOptions, ScrollRequest, ThemeSpec, ZoomRequest, ZoomValue, occurrence_index, page_index,
+};
 use crate::WordApp;
 
 /// Points left above a passage the host jumps to, so it does not sit on the view's edge. The PDF
@@ -269,7 +272,7 @@ pub(crate) fn before_frame(app: &mut WordApp, ctx: &egui::Context) {
                 | HostCommand::JumpTo(_)
                 | HostCommand::SetZoom(_)
                 | HostCommand::ScrollToBlock(_)
-        );
+        ) || matches!(&command, HostCommand::Find(request) if request.select);
         match command {
             HostCommand::Open { name, bytes, options } => {
                 super::edit::before_open(app, &mut host);
@@ -291,6 +294,7 @@ pub(crate) fn before_frame(app: &mut WordApp, ctx: &egui::Context) {
             HostCommand::ScrollToBlock(request) => scroll_to_block(app, &mut host, &request),
             // Answered after the frame, once a document is open and laid out; moves nothing.
             HostCommand::Locate(request) => host.viewport.pending_locates.push(request),
+            HostCommand::Find(request) => find(app, &mut host, &request),
         }
     }
     // A host call replaces a glide the person's input started; the move is the host's from here.
@@ -348,6 +352,50 @@ fn scroll_to_block(app: &mut WordApp, host: &mut HostState, request: &ScrollRequ
     app.canvas.scroll_to_doc = Some((page, y));
     host.aim(page, y);
     host.viewport.scroll_token = Some(request.token);
+}
+
+/// The host's search. A selecting find goes where the view bar's goes (and keeps a person's
+/// selection when nothing matches); then the match is put in the middle of the view as host state, so
+/// the `viewport` that follows is the host's (`cause: Host`) and carries the find's token, which is how
+/// a host tells its own find's scroll from the reviewer's. A count-only find (`select: false`) moves
+/// neither selection nor view. Answered at once with the count and the position.
+fn find(app: &mut WordApp, host: &mut HostState, request: &FindRequest) {
+    let step = match request.step {
+        FindStepSpec::First => FindStep::First,
+        FindStepSpec::Next => FindStep::Next,
+        FindStepSpec::Previous => FindStep::Previous,
+    };
+    // Stepping goes through the last search; a different text or case begins a new one.
+    let search = &app.session.find;
+    let step =
+        if step != FindStep::First && (search.query != request.text || search.match_case != request.match_case) { FindStep::First } else { step };
+    if request.select {
+        super::view::run_host_find(app, host, &request.text, request.match_case, step);
+        // The bar's field shows what is being searched for.
+        host.find_query.clone_from(&request.text);
+        if !app.session.find.results.is_empty() {
+            show_match(app, host, request.token);
+        }
+    } else {
+        super::view::count_matches(app, &request.text, request.match_case, step);
+    }
+    let count = u32::try_from(app.session.find.results.len()).unwrap_or(u32::MAX);
+    let index = (count > 0).then(|| u32::try_from(app.session.find.current).unwrap_or(u32::MAX));
+    host.bridge.emit(HostEvent::FindResult { count, index, token: request.token });
+}
+
+/// Put the selected match in the middle of the view; the `viewport` after the scroll lands carries
+/// `token`. A match the layout has not placed cannot be shown, and no token is waiting for it.
+fn show_match(app: &mut WordApp, host: &mut HostState, token: u32) {
+    let (start, _) = app.session.sel.ordered();
+    let layout = app.session.layout();
+    let hint = layout.page_of(&start).unwrap_or(0);
+    let Some(caret) = layout.caret_on(&start, hint) else { return };
+    let Some((page, y)) = super::viewport::centred(app, caret.page, caret.top) else { return };
+    app.session.page_hint = caret.page;
+    app.canvas.scroll_to_doc = Some((page, y));
+    host.aim(page, y);
+    host.viewport.scroll_token = Some(token);
 }
 
 /// Answer the `locate` requests waiting, in the order they came, once a document is open: the layout

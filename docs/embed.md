@@ -154,8 +154,8 @@ editor.destroy();
 `EmbeddedEditor`'s methods are `static mount(canvas, options)`, `open(bytes, fileName, options?)`,
 `jumpTo(target)`, `setMarks(marks)`, `setTheme(theme)`, `setListener(listener)`, `destroy()` and,
 from API 0.2, `setMode(request: ModeRequest)`, `requestSave()` and `applyRedactions()` and, from API
-0.3, `setZoom(request: ZoomRequest)`, `scrollToBlock(request: ScrollRequest)` and
-`locate(request: LocateRequest)`; `setMarks` takes `EditorMark[]` from API 0.3 (a 0.2 `Mark[]` still
+0.3, `setZoom(request: ZoomRequest)`, `scrollToBlock(request: ScrollRequest)`,
+`locate(request: LocateRequest)` and `find(request: FindRequest)`; `setMarks` takes `EditorMark[]` from API 0.3 (a 0.2 `Mark[]` still
 type-checks and behaves as before). The types,
 as `wordcraft_embed.d.ts` declares them (the package script fails if a declaration is missing):
 
@@ -223,6 +223,8 @@ export type ScrollRequest = { block: BlockRef; fraction: number; token: number }
 
 export type LocateRequest = { blocks: BlockRef[]; token: number };
 
+export type FindRequest = { text: string; matchCase?: boolean; step: 'first' | 'next' | 'previous'; select?: boolean; token: number };
+
 export type EditorEvent =
     | { type: 'opened'; pages: number }
     | { type: 'openFailed'; message: string }
@@ -241,6 +243,7 @@ export type EditorEvent =
     | { type: 'viewport'; top: BlockRef | null; fraction: number; visibleHeight: number; page: number; pages: number; cause: 'user' | 'host'; token: number | null }
     | { type: 'blockNotFound'; block: BlockRef; token: number }
     | { type: 'located'; positions: (number | null)[]; height: number; token: number }
+    | { type: 'findResult'; count: number; index: number | null; token: number }
     | { type: 'locationMismatch'; ids: string[] }
     | { type: 'marksDropped'; count: number }
     | { type: 'redactionsPending'; marks: number }
@@ -578,6 +581,39 @@ location): `{ block, fingerprint, from?, to? }`.
   rules as marks apply to `from`, `to`, `index` and `length`.
 - **View mode's command gate is unchanged.** The jump is made by the editor's host state; no command
   is run.
+
+### Find
+
+`find({ text, matchCase?, step, select?, token })` searches the open document for `text` and goes
+through the matches, for a host that draws its own find (see No view bar; with the editor's view bar
+the two share one search, and the bar's field shows the host's text). It works with and without the
+bar, in view mode and while the document is in edit mode, and changes nothing in the document.
+
+- **`step`.** `'first'` searches from where the search began (typing on refines the search, so each
+  keystroke sends `'first'` and the match does not skip ahead), or from the top of the body when none
+  began; `'next'` and `'previous'` go from the current match and wrap past the ends. A `next` or
+  `previous` whose `text` or `matchCase` differs from the last search begins a new one, as `'first'`.
+  The search is of the document's body, literal text (no patterns, not whole words), and ignores case unless `matchCase` is true.
+- **`findResult`.** One per `find`, in order, carrying the request's `token`:
+  `{ type: 'findResult', count, index, token }`. `count` is the matches the text has and `index` the
+  0-based one the find is on, in document order, `null` when `count` is 0. Empty `text` clears the
+  search and answers `count: 0`, `index: null`; so does text that is not in the document.
+- **Selecting (`select: true`, the default).** The match is selected, as the view bar's find selects
+  it, and put in the middle of the view as `jumpTo({ kind: 'location' })` centres a place. The
+  selection is the editor's own: no `selection` event, and one the host was told of is cleared. A
+  find that matches nothing leaves the person's selection and the view as they were.
+- **The scroll it causes is the host's.** The `viewport` that follows says `cause: 'host'` and
+  carries the find's `token` (one per selecting find that found a match, sent once the scroll has
+  landed, even when the view was already there), so a host that syncs two views can tell its leader's
+  own find from the reviewer scrolling. A newer `scrollToBlock` or `find` replaces a token still
+  waiting. Nothing else about the view changes (`pageChanged` follows the match's page as it does for
+  any jump).
+- **Counting (`select: false`).** The search runs and `findResult` answers, but nothing is selected,
+  nothing scrolls, no `viewport` is sent and the bar's text is left alone; for the other side of a
+  synchronised pair, which only needs to show "3 of 11". `index` is the match `step` would go to from
+  the person's selection (for `'first'`: the first at or after it).
+- **View mode's command gate is unchanged.** `find` is a host call, answered by the editor's host
+  state; Ctrl/⌘+F and the Find command without text still do what No view bar describes.
 
 ## Behaviour a host page relies on
 
