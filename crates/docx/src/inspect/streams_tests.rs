@@ -584,6 +584,30 @@ fn the_paired_save_check_still_counts_every_other_edit() {
 }
 
 #[test]
+fn the_paired_save_check_says_which_story_each_untracked_edit_is_in() {
+    // A comparison explains each fact by a change in the same story (Clauflow #40), so the counts
+    // come per story part as well as in all.
+    let noted = |body: &str, note: &str| {
+        let body = format!(r#"<w:p>{}<w:r><w:footnoteReference w:id="2"/></w:r></w:p>"#, text(body));
+        let footnotes = format!(r#"<w:footnotes {W}><w:footnote w:id="2"><w:p>{}</w:p></w:footnote></w:footnotes>"#, text(note));
+        Docx::new(&body)
+            .rel(("rId6", rt::FOOTNOTES, "footnotes.xml", false))
+            .part("word/footnotes.xml", &footnotes)
+            .typed("/word/footnotes.xml", FOOTNOTES_TYPE)
+            .zip()
+    };
+    let inspection = paired(&noted("Payable", "In Rupiah."), &noted("Payable now", "In Dollars."));
+    let parts: Vec<&str> = inspection.untracked_by_part.iter().map(|count| count.part.as_str()).collect();
+    assert_eq!(parts, ["word/document.xml", "word/footnotes.xml"], "{inspection:#?}");
+    let total: u32 = inspection.untracked_by_part.iter().map(|count| count.count).sum();
+    assert_eq!(total, inspection.untracked_changes);
+    // Only the note edited: nothing is said of the body.
+    let note_only = paired(&noted("Payable", "In Rupiah."), &noted("Payable", "In Dollars."));
+    assert_eq!(note_only.untracked_by_part.iter().map(|count| count.part.as_str()).collect::<Vec<_>>(), ["word/footnotes.xml"]);
+    assert!(note_only.resolved_by_part.is_empty());
+}
+
+#[test]
 fn the_save_check_itself_still_counts_them() {
     // Comparison mode is a mode: the editor's save check reads these as before.
     assert!(super::inspect(&sections_naming("word/header1.xml", 1440), &sections_naming("word/header7.xml", 1440)).unwrap().untracked_changes > 0);

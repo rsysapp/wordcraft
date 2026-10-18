@@ -160,6 +160,22 @@ pub struct Inspection {
     pub content_types: Vec<ContentTypeChange>,
     /// What happened to comments.
     pub comments: CommentChanges,
+    /// [`Self::untracked_changes`] found in each story part, in the order the stories are
+    /// compared; a story both packages hold under different names (a header paired by slot) is
+    /// named as the base names it. Facts found outside the stories (comments) count only in the
+    /// total. A host comparing two versions explains each by a change in the same story.
+    pub untracked_by_part: Vec<PartCount>,
+    /// Accepted and rejected tracked changes of the base found in each story part, likewise.
+    pub resolved_by_part: Vec<PartCount>,
+}
+
+/// A count of facts found in one part.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PartCount {
+    /// The part's name in the package.
+    pub part: String,
+    /// How many facts were found in it.
+    pub count: u32,
 }
 
 /// One author's new tracked changes.
@@ -727,6 +743,7 @@ fn compare(
     for name in &story_parts {
         let (Some(mut before), Some(mut after)) = (base.kept.stories.remove(name), edited.kept.stories.remove(name)) else { continue };
         let held = story::items_held(&before).saturating_add(story::items_held(&after));
+        let (untracked_before, resolved_before) = (tally.untracked, tally.accepted.len().saturating_add(tally.rejected.len()));
         let compared = (|| -> Result<bool, String> {
             assign_contexts(&mut before, tables, &mut |_, format| format, budget)?;
             assign_contexts(&mut after, tables, &mut |tables, format| projector.format(tables, format), budget)?;
@@ -741,6 +758,14 @@ fn compare(
         match compared {
             Ok(complete) => inspection.too_many_changes |= !complete,
             Err(error) => return Err(InspectError::Edited(format!("{name}: {error}"))),
+        }
+        let untracked = tally.untracked.saturating_sub(untracked_before);
+        let resolved = count(tally.accepted.len().saturating_add(tally.rejected.len()).saturating_sub(resolved_before));
+        for (found, list) in [(untracked, &mut inspection.untracked_by_part), (resolved, &mut inspection.resolved_by_part)] {
+            if found > 0 {
+                budget.hold(RECORD_BYTES.saturating_add(budget::units(name.len()))).map_err(InspectError::Edited)?;
+                list.push(PartCount { part: name.clone(), count: found });
+            }
         }
     }
     for (author, held) in holds {
