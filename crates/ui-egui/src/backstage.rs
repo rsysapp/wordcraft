@@ -6,19 +6,28 @@ use serde_json::json;
 use crate::theme::{APP_COLOR, Tokens, medium, regular, semibold};
 use crate::{WordApp, icons};
 
-const PAGES: [(&str, &str); 11] = [
-    ("home", "Home"),
-    ("new", "New"),
-    ("open", "Open"),
-    ("info", "Info"),
-    ("recover", "Recover"),
-    ("save", "Save"),
-    ("saveAs", "Save As"),
-    ("print", "Print"),
-    ("export", "Export"),
-    ("close", "Close"),
-    ("options", "Options"),
+/// The side menu: page id, label and icon (#1714).
+const PAGES: [(&str, &str, &str); 11] = [
+    ("home", "Home", "homeFolder"),
+    ("new", "New", "blankPage"),
+    ("open", "Open", "open"),
+    ("info", "Info", "info"),
+    ("recover", "Recover", "recover"),
+    ("save", "Save", "save"),
+    ("saveAs", "Save As", "saveAs"),
+    ("print", "Print", "print"),
+    ("export", "Export", "export"),
+    ("close", "Close", "close"),
+    ("options", "Options", "options"),
 ];
+
+/// The Backstage back chevron's centre on macOS (#1873): beside the traffic lights in a
+/// window (the title bar's content edge), at the plain control inset in full screen, where the
+/// lights aren't docked top-left and the reserved offset would leave dead space.
+fn back_chevron_c(band_min_x: f32, center_y: f32, fullscreen: bool, content_left: f32) -> egui::Pos2 {
+    let x = if fullscreen { 26.0 } else { content_left + 3.0 };
+    pos2(band_min_x + x, center_y)
+}
 
 pub fn show(app: &mut WordApp, ui: &mut Ui) {
     let t = Tokens::get(ui.ctx());
@@ -49,7 +58,7 @@ pub fn show(app: &mut WordApp, ui: &mut Ui) {
                     ui.ctx().send_viewport_cmd(egui::ViewportCommand::StartDrag);
                 }
                 // The chevron's stroke starts at the content edge.
-                let c = pos2(band.min.x + app.mac_titlebar.content_left + 3.0, band.center().y);
+                let c = back_chevron_c(band.min.x, band.center().y, app.session.view.full_screen, app.mac_titlebar.content_left);
                 let resp = ui.interact(Rect::from_center_size(c, vec2(22.0, band.height())), ui.id().with("backstage_back"), Sense::click());
                 icons::paint(ui.painter(), Rect::from_center_size(c, vec2(18.0, 18.0)), "chevronLeft", egui::Color32::WHITE, egui::Color32::WHITE);
                 resp
@@ -70,7 +79,7 @@ pub fn show(app: &mut WordApp, ui: &mut Ui) {
                 app.canvas.want_focus = true;
             }
             ui.add_space(if mac { 12.0 } else { 6.0 });
-            for (id, label) in PAGES {
+            for (id, label, icon) in PAGES {
                 // No document open (#1129): Info, Save, Save As, Print and Export are greyed out.
                 let on = has_document || works_without_document(id);
                 let (r, resp) = ui.add_enabled_ui(on, |ui| ui.allocate_exact_size(vec2(200.0, 38.0), Sense::click())).inner;
@@ -81,12 +90,14 @@ pub fn show(app: &mut WordApp, ui: &mut Ui) {
                 } else if on && resp.hovered() {
                     ui.painter().rect_filled(r, 0.0, egui::Color32::from_white_alpha(26));
                 }
+                let ink = if on { egui::Color32::WHITE } else { egui::Color32::from_white_alpha(110) };
+                icons::paint(ui.painter(), Rect::from_center_size(pos2(r.min.x + 31.0, r.center().y), vec2(18.0, 18.0)), icon, ink, ink);
                 ui.painter().text(
-                    pos2(r.min.x + 22.0, r.center().y),
+                    pos2(r.min.x + 52.0, r.center().y),
                     Align2::LEFT_CENTER,
                     tl!(label),
                     if active { semibold(14.0) } else { medium(14.0) },
-                    if on { egui::Color32::WHITE } else { egui::Color32::from_white_alpha(110) },
+                    ink,
                 );
                 if resp.clicked() {
                     match id {
@@ -192,6 +203,9 @@ fn recovery_page(app: &mut WordApp, ui: &mut Ui) {
             ui.label(&doc.name);
             ui.label(&doc.saved_at);
             ui.add_enabled_ui(!busy, |ui| {
+                // Buttons keep the theme's own text colour: the page-wide white override is
+                // for labels on the black background and would bleach button labels (#1895).
+                ui.visuals_mut().override_text_color = None;
                 ui.horizontal(|ui| {
                     if ui.button(tl!("Restore")).clicked() {
                         let _ = app.run("file.recover", json!({"restore": doc.id}));
@@ -206,6 +220,7 @@ fn recovery_page(app: &mut WordApp, ui: &mut Ui) {
     });
     ui.add_space(20.0);
     ui.horizontal(|ui| {
+        ui.visuals_mut().override_text_color = None;
         if ui.button(tl!("Continue without restoring")).clicked() {
             let _ = app.run("ui.backstage", json!({"value": false}));
             app.canvas.want_focus = true;
@@ -492,6 +507,44 @@ mod tests {
     use super::matching_templates;
     use crate::{Services, WordApp};
 
+    /// #1714: every side-menu item has its own icon, a drawn one (an unknown name would fall back
+    /// to a tile with its first letter, the only icon here that draws text).
+    #[test]
+    fn every_side_menu_item_has_a_drawn_icon() {
+        let ctx = egui::Context::default();
+        let mut names = std::collections::HashSet::new();
+        for (id, _, icon) in super::PAGES {
+            assert!(names.insert(icon), "{id}: {icon} is used twice");
+            let mut out = ctx.run_ui(egui::RawInput::default(), |ui| {
+                let r = egui::Rect::from_min_size(egui::pos2(20.0, 20.0), egui::vec2(18.0, 18.0));
+                crate::icons::paint(ui.painter(), r, icon, egui::Color32::WHITE, egui::Color32::WHITE);
+            });
+            // The frame's font textures aren't uploaded anywhere here (cleared before any assert,
+            // so a failure doesn't panic again while the frame is dropped).
+            out.textures_delta.clear();
+            fn has_text(s: &egui::Shape) -> bool {
+                match s {
+                    egui::Shape::Text(_) => true,
+                    egui::Shape::Vec(v) => v.iter().any(has_text),
+                    _ => false,
+                }
+            }
+            assert!(!out.shapes.is_empty(), "{id}: {icon} draws nothing");
+            assert!(!out.shapes.iter().any(|s| has_text(&s.shape)), "{id}: {icon} is not a drawn icon");
+        }
+    }
+
+    /// #1873: the macOS back chevron sits beside the traffic lights windowed, at the plain
+    /// control inset in full screen.
+    #[test]
+    fn back_chevron_keeps_clear_of_traffic_lights_only_windowed() {
+        let windowed = super::back_chevron_c(0.0, 14.0, false, 70.0);
+        assert_eq!((windowed.x, windowed.y), (73.0, 14.0));
+        let full = super::back_chevron_c(0.0, 14.0, true, 70.0);
+        assert_eq!((full.x, full.y), (26.0, 14.0));
+        assert!(full.x < windowed.x);
+    }
+
     #[cfg(not(target_arch = "wasm32"))]
     fn recovery_app() -> (WordApp, std::path::PathBuf) {
         let root = std::env::temp_dir().join(format!(
@@ -636,6 +689,37 @@ mod tests {
         assert_eq!(h.state().ui.backstage_page, "new", "the link opens New");
         assert!(h.query_by_label("Report").is_some(), "New shows every template");
         assert!(h.query_by_label("Recent").is_none(), "New has no Recent list");
+    }
+
+    /// Clicking the back arrow closes the File page and gives the keyboard back to the page,
+    /// without naming as focused a widget the frame didn't draw: with accessibility on (a screen
+    /// reader, or any UI Automation client on Windows) AccessKit ends the program over that, and
+    /// 0.8.0 vanished after Blank document, File, then the back arrow. The test harness always runs
+    /// AccessKit.
+    #[test]
+    fn back_arrow_returns_to_the_page_with_accessibility_on() {
+        let a = WordApp::new(wordcraft_engine::Session::new(wordcraft_doc::Document::new()), Services::default());
+        let mut h = egui_kittest::Harness::builder().with_size(egui::vec2(1440.0, 900.0)).build_ui_state(
+            |ui, app: &mut WordApp| {
+                let ctx = ui.ctx().clone();
+                app.logic(&ctx);
+                app.ui(ui);
+            },
+            a,
+        );
+        h.run_steps(4);
+        assert!(h.state().canvas.widget_id.is_some(), "the page has been drawn");
+        h.state_mut().run("ui.backstage", json!({"value": true})).unwrap();
+        h.run_steps(4);
+        // The arrow heads the File page's side bar; it has no label to find it by.
+        let arrow = egui::pos2(100.0, 32.0);
+        h.event(egui::Event::PointerMoved(arrow));
+        for pressed in [true, false] {
+            h.event(egui::Event::PointerButton { pos: arrow, button: egui::PointerButton::Primary, pressed, modifiers: egui::Modifiers::NONE });
+        }
+        h.run_steps(4);
+        assert!(!h.state().ui.backstage, "the arrow closes the File page");
+        assert!(h.state().canvas.focused, "and the page has the keyboard");
     }
 
     /// #260: File › Info's Title and Author fields dropped every keystroke (they edited a copy
@@ -814,17 +898,17 @@ mod tests {
         h.get_by_label("Close").click();
         h.run_steps(4);
         assert!(matches!(h.state().dialog, Some(crate::dialogs::Dialog::SaveChanges { .. })), "unsaved changes ask first");
-        assert!(!h.state().quit_requested);
+        assert!(h.state().has_document());
 
         h.state_mut().run("ui.saveChanges", json!({"answer": "cancel"})).unwrap();
         h.run_steps(4);
-        assert!(!h.state().quit_requested, "Cancel keeps the document open");
+        assert!(h.state().has_document(), "Cancel keeps the document open");
         assert!(h.state().ui.backstage && h.state().ui.backstage_page == "info", "Cancel leaves the Backstage as it was");
 
         h.get_by_label("Close").click();
         h.run_steps(4);
         h.state_mut().run("ui.saveChanges", json!({"answer": "dontSave"})).unwrap();
-        assert!(h.state().quit_requested, "Don't Save closes");
+        assert!(!h.state().has_document() && !h.state().quit_requested, "Don't Save closes the document, not the window (#1712)");
     }
 
     /// A document without unsaved changes closes without a prompt.
@@ -844,7 +928,7 @@ mod tests {
         h.get_by_label("Close").click();
         h.run_steps(1);
         assert!(h.state().dialog.is_none(), "no prompt");
-        assert!(h.state().quit_requested);
+        assert!(!h.state().has_document() && !h.state().quit_requested);
     }
 
     #[test]

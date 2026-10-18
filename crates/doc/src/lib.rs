@@ -26,6 +26,7 @@ pub mod eq;
 pub mod fields;
 pub mod freeform;
 pub mod graphic;
+pub mod legacy_form;
 pub mod line_dash;
 pub mod link;
 pub mod locale_number;

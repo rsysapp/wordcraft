@@ -5427,6 +5427,7 @@ name = "wordcraft-ui-egui"
 version = "0.8.0"
 dependencies = [
  "aho-corasick",
+ "cfb",
  "craft-ui",
  "egui",
  "egui_kittest",

@@ -8,9 +8,15 @@ use wordcraft_doc::StoryRef;
 use crate::theme::{Tokens, TypeRung, medium, paint_text, regular, semibold, text_width};
 use crate::{WordApp, icons};
 
+/// The Quick Access Toolbar's button for command `id`.
+pub(crate) fn qat_button_id(id: &str) -> egui::Id {
+    egui::Id::new(("qat_button", id))
+}
+
 fn qat_button(ui: &mut Ui, app: &mut WordApp, icon: &str, tip: &str, id: &str, enabled: bool) -> egui::Response {
     let t = Tokens::get(ui.ctx());
-    let (r, resp) = ui.allocate_exact_size(vec2(26.0, 24.0), Sense::click());
+    let (r, _) = ui.allocate_exact_size(vec2(26.0, 24.0), Sense::hover());
+    let resp = ui.interact(r, qat_button_id(id), Sense::click());
     if resp.hovered() && enabled {
         ui.painter().rect_filled(r, 4.0, t.hover);
     }
@@ -87,6 +93,11 @@ fn undo_list_row_id(i: usize) -> egui::Id {
     undo_list_button_id().with(("row", i))
 }
 
+/// The footer Cancel row's id (#1903).
+pub(crate) fn undo_list_cancel_id() -> egui::Id {
+    undo_list_button_id().with("cancel")
+}
+
 /// The Undo list's rows, newest first: each step named as the Undo button's tooltip names it.
 pub(crate) fn undo_list_rows(app: &WordApp) -> Vec<String> {
     app.session.undo_history().into_iter().map(|l| tl!(l).to_string()).collect()
@@ -148,8 +159,21 @@ fn undo_list(ui: &mut Ui, app: &mut WordApp) {
         }
     });
     ui.separator();
-    let footer = undo_list_footer(hovered.map_or(0, |h| h + 1));
-    ui.vertical_centered(|ui| ui.label(egui::RichText::new(footer).font(regular(12.0)).color(t.text)));
+    let n = hovered.map_or(0, |h| h + 1);
+    if n == 0 {
+        // Cancel is a real row: it closes the popup without undoing anything (#1903).
+        let (r, _) = ui.allocate_exact_size(vec2(ui.available_width(), ROW), Sense::hover());
+        let resp = ui.interact(r, undo_list_cancel_id(), Sense::click());
+        if resp.hovered() {
+            ui.painter().rect_filled(r, 0.0, t.selection);
+        }
+        ui.painter().text(pos2(r.min.x + 6.0, r.center().y), Align2::LEFT_CENTER, undo_list_footer(0), regular(12.0), t.text);
+        if resp.clicked() {
+            ui.close();
+        }
+    } else {
+        ui.vertical_centered(|ui| ui.label(egui::RichText::new(undo_list_footer(n)).font(regular(12.0)).color(t.text)));
+    }
     if let Some(i) = clicked {
         let _ = app.run("edit.undoTo", json!({"count": i + 1}));
         ui.close();
@@ -178,6 +202,12 @@ pub(crate) fn qat_menu(ui: &mut Ui, app: &mut WordApp) {
     ui.separator();
     if ui.button(tl!("More Commands…")).clicked() {
         crate::dialogs_ribbon::open(app, crate::dialogs_ribbon::Page::QuickAccess);
+        ui.close();
+    }
+    ui.separator();
+    // Last, as in Word (#1945); the ribbon's right-click menu brings the toolbar back.
+    if ui.button(tl!("Hide Quick Access Toolbar")).clicked() {
+        let _ = app.run("ui.quickAccessToolbar", json!({"value": false}));
         ui.close();
     }
 }
@@ -281,7 +311,10 @@ pub fn title_bar(app: &mut WordApp, ui: &mut Ui) {
                     }
                 }
                 ui.add_space(8.0);
-                quick_access(ui, app);
+                // Hidden (#1945): neither the buttons nor the … menu; the title centres as before.
+                if app.ui.quick_access_toolbar {
+                    quick_access(ui, app);
+                }
                 qat_end = ui.min_rect().max.x;
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     // Account / community.
@@ -451,13 +484,24 @@ pub fn status_bar(app: &mut WordApp, ui: &mut Ui) {
                 // The language at the caret; a click sets the proofing language (Review › Language).
                 let lang = crate::ribbon::caret_language(app);
                 let missing = crate::ribbon::caret_missing_dictionary(app);
-                let shown = if missing.is_some() { crate::i18n::fmt(tl!("{language} (no dictionary)"), &[("language", &lang)]) } else { lang.clone() };
-                let tip = match missing {
-                    Some(name) => crate::i18n::fmt(
+                let unreadable = crate::ribbon::caret_unreadable_dictionary(app);
+                let shown = if unreadable.is_some() {
+                    crate::i18n::fmt(tl!("{language} (dictionary unreadable)"), &[("language", &lang)])
+                } else if missing.is_some() {
+                    crate::i18n::fmt(tl!("{language} (no dictionary)"), &[("language", &lang)])
+                } else {
+                    lang.clone()
+                };
+                let tip = match (&unreadable, missing) {
+                    (Some((file, reason)), _) => crate::i18n::fmt(
+                        tl!("The spelling dictionary for {language} couldn't be read, so it isn't checked. File: {file}. Reason: {reason}"),
+                        &[("language", &lang), ("file", &file.to_string_lossy()), ("reason", reason)],
+                    ),
+                    (None, Some(name)) => crate::i18n::fmt(
                         tl!("No spelling dictionary for {language} is installed, so it isn't checked. WordCraft looks for the Hunspell dictionary {name} in the WORDCRAFT_DICTIONARIES folder and in the usual system locations."),
                         &[("language", &lang), ("name", name)],
                     ),
-                    None => tl!("Language").to_string(),
+                    (None, None) => tl!("Language").to_string(),
                 };
                 let resp = st(ui, &shown).on_hover_text(tip);
                 egui::Popup::menu(&resp).show(|ui| {
@@ -682,6 +726,29 @@ mod tests {
         }
     }
 
+    /// #1903: the footer's Cancel row closes the Undo list without undoing anything.
+    #[test]
+    fn undo_list_cancel_closes_without_undoing() {
+        let mut a = WordApp::new(wordcraft_engine::Session::new(wordcraft_doc::Document::new()), crate::Services::default());
+        a.run("text.insert", json!({"text": "Hello"})).unwrap();
+        let before: Vec<String> = a.session.undo_history().into_iter().map(str::to_string).collect();
+        assert!(!before.is_empty());
+
+        let (ctx, mut n) = (ctx(), 0);
+        frame(&ctx, &mut n, vec![], &mut a);
+        let arrow = ctx.read_response(undo_list_button_id()).unwrap();
+        let popup = egui::Popup::default_response_id(&arrow);
+        click(&ctx, &mut n, arrow.rect.center(), &mut a);
+        assert!(egui::Popup::is_id_open(&ctx, popup), "the arrow opens the Undo list");
+        frame(&ctx, &mut n, vec![], &mut a);
+        let cancel = ctx.read_response(undo_list_cancel_id()).expect("Cancel is drawn");
+        click(&ctx, &mut n, cancel.rect.center(), &mut a);
+        let after: Vec<String> = a.session.undo_history().into_iter().map(str::to_string).collect();
+        assert_eq!(after, before, "nothing undone");
+        frame(&ctx, &mut n, vec![], &mut a);
+        assert!(!egui::Popup::is_id_open(&ctx, popup), "Cancel closes the list");
+    }
+
     #[test]
     fn mac_title_bar_centres_and_clears_the_traffic_lights() {
         // The lights are centred in the bar, and content keeps the same gap after them.
@@ -703,5 +770,54 @@ mod tests {
         assert_eq!(bar.content_left, 89.0);
         // Never tighter than the standard layout.
         assert_eq!(MacTitleBar::around_lights(40.0, 10.0, 12.0), MacTitleBar::default());
+    }
+
+    /// #1945: Hide Quick Access Toolbar, the last item of the toolbar's menu, takes the toolbar's
+    /// buttons and its … button out of the title bar, which keeps its title; the command brings
+    /// them back.
+    #[test]
+    fn hide_quick_access_toolbar_takes_the_toolbar_out_of_the_title_bar() {
+        use egui_kittest::kittest::Queryable;
+        let a = WordApp::new(wordcraft_engine::Session::new(wordcraft_doc::Document::new()), crate::Services::default());
+        let mut h = egui_kittest::Harness::builder().with_size(egui::vec2(1440.0, 900.0)).build_ui_state(
+            |ui, app: &mut WordApp| {
+                let ctx = ui.ctx().clone();
+                app.logic(&ctx);
+                // The fonts `logic` installs take effect on the next frame, as `WordApp::ui` waits.
+                if app.fonts_frames < 2 {
+                    app.fonts_frames += 1;
+                    return;
+                }
+                title_bar(app, ui);
+            },
+            a,
+        );
+        h.run_steps(4);
+        let drawn = |h: &egui_kittest::Harness<'static, WordApp>, id: &str| h.ctx.read_response(qat_button_id(id)).is_some();
+        for id in ["file.save", "edit.undo", "edit.redo"] {
+            assert!(drawn(&h, id), "{id} is on the toolbar");
+        }
+        let at = h.ctx.read_response(qat_menu_button_id()).expect("the … button").rect.center();
+        h.event(egui::Event::PointerMoved(at));
+        for pressed in [true, false] {
+            h.event(egui::Event::PointerButton { pos: at, button: egui::PointerButton::Primary, pressed, modifiers: Default::default() });
+        }
+        h.run_steps(2);
+        h.get_by_label("Hide Quick Access Toolbar").click();
+        // `read_response` also reads the frame before last, so run two frames past the change.
+        h.run_steps(3);
+        assert!(!h.state().ui.quick_access_toolbar, "the menu's last item hides the toolbar");
+        assert!(h.query_by_label("Hide Quick Access Toolbar").is_none(), "and closes the menu");
+        for id in ["file.save", "edit.undo", "edit.redo"] {
+            assert!(!drawn(&h, id), "{id} is gone");
+        }
+        assert!(h.ctx.read_response(qat_menu_button_id()).is_none(), "so is the … button");
+        assert!(h.query_by_label_contains("Not saved").is_some(), "the title is still drawn");
+        h.state_mut().run("ui.quickAccessToolbar", json!({"value": true})).unwrap();
+        h.run_steps(2);
+        for id in ["file.save", "edit.undo", "edit.redo"] {
+            assert!(drawn(&h, id), "{id} is back");
+        }
+        assert!(h.ctx.read_response(qat_menu_button_id()).is_some());
     }
 }

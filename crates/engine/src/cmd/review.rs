@@ -12,8 +12,10 @@ use crate::{CmdError, CmdResult, CommandSpec, Selection, Session, p};
 pub fn specs() -> Vec<CommandSpec> {
     vec![
         CommandSpec::new("review.newComment", "New Comment", "Review › Comments", new_comment).key(super::mac_or("Mod+Alt+A / Mod+Alt+M", "Mod+Alt+M")).params(r#"{"text": string}"#),
-        CommandSpec::new("review.reply", "Reply", "Review › Comments", reply).params(r#"{"id": n, "text": string}"#),
-        CommandSpec::new("review.editComment", "Edit Comment", "Review › Comments", edit_comment).params(r#"{"id": n, "text": string}"#),
+        CommandSpec::new("review.reply", "Reply", "Review › Comments", reply).params(r#"{"id": n, "text": string}"#).when(comments_change),
+        CommandSpec::new("review.editComment", "Edit Comment", "Review › Comments", edit_comment)
+            .params(r#"{"id": n, "text": string}"#)
+            .when(comments_change),
         CommandSpec::new("review.deleteComment", "Delete", "Review › Comments", delete_comment).params(r#"{"id"?: n, "all"?: bool}"#),
         CommandSpec::new("review.resolveComment", "Resolve", "Review › Comments", |s, v| {
             let id = p::u64(v, "id").map(|x| x as u32).or_else(|| comment_at_caret(s)).ok_or_else(|| CmdError::Params("`id` required".into()))?;
@@ -164,6 +166,15 @@ fn reply(s: &mut Session, v: &Value) -> CmdResult {
 fn comment_id(s: &Session) -> Result<u32, CmdError> {
     let ids = &s.doc.comments;
     wordcraft_doc::free_id(ids.keys().next_back().copied(), ids.keys().copied(), 0).ok_or_else(|| CmdError::Failed("no free comment id".into()))
+}
+
+/// Comments can't be written or edited in a document protected as read only or for filling in
+/// forms (the comment fields are read-only there, #1348).
+fn comments_change(s: &Session) -> Option<&'static str> {
+    match s.doc.settings.protection.as_deref() {
+        Some("readOnly" | "forms") => Some("the document is protected"),
+        _ => None,
+    }
 }
 
 /// Replace a comment's (or reply's) text; each line becomes a paragraph.
@@ -863,7 +874,7 @@ fn word_count(s: &mut Session, v: &Value) -> CmdResult {
 fn para_issues(s: &Session, story: StoryRef, path: &wordcraft_doc::Path) -> Vec<(Pos, Pos, wordcraft_proof::Issue)> {
     let Some(p) = s.doc.para(story, path) else { return Vec::new() };
     let runs = wordcraft_layout::para::proof_runs(&s.doc, p, None);
-    wordcraft_layout::para::paragraph_issues(p, &runs, &s.prefs.spelling(), true)
+    wordcraft_layout::para::paragraph_issues(p, &runs, &s.prefs.spelling(), true, wordcraft_layout::para::is_list_item(&s.doc, p))
         .into_iter()
         .map(|i| (Pos { story, path: path.clone(), off: i.start }, Pos { story, path: path.clone(), off: i.end }, i))
         .collect()

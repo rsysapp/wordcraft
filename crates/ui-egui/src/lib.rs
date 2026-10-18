@@ -73,6 +73,7 @@ pub mod print_page;
 pub mod printing;
 pub mod read_aloud;
 pub mod ribbon;
+pub mod ribbon_fit;
 pub mod ruler_tabs;
 pub mod scroll;
 pub mod system_clipboard;
@@ -239,6 +240,10 @@ pub struct UiState {
     #[serde(skip)]
     pub print: print_page::PrintSettings,
     pub ribbon_collapsed: bool,
+    /// The Quick Access Toolbar shows in the title bar (#1945). Its menu's Hide Quick Access
+    /// Toolbar takes it away; Show Quick Access Toolbar (the ribbon's right-click menu, Customize
+    /// Ribbon › Quick Access Toolbar) brings it back. Kept between runs.
+    pub quick_access_toolbar: bool,
     pub recent: Vec<String>,
     /// Symbols inserted from the Symbol dialog, most recent first (#321).
     pub recent_symbols: Vec<dialogs_insert::RecentSymbol>,
@@ -358,6 +363,7 @@ impl Default for UiState {
             backstage_page: "home".into(),
             print: print_page::PrintSettings::default(),
             ribbon_collapsed: false,
+            quick_access_toolbar: true,
             recent: Vec::new(),
             recent_symbols: Vec::new(),
             recent_colors: Vec::new(),
@@ -626,6 +632,8 @@ pub struct WordApp {
     /// the session's document, no document is open: the window shows no page and only the File
     /// tab, Help and settings work. See [`WordApp::has_document`].
     no_document: Option<u64>,
+    /// Comment and reply text typed but not yet written to the document (#1348).
+    pub(crate) comment_drafts: panes::CommentDrafts,
 }
 
 /// The answer to "Do you want to save changes?" (`ui.saveChanges`).
@@ -726,6 +734,7 @@ impl WordApp {
             info_editing: None,
             recovery_seen: false,
             no_document: None,
+            comment_drafts: Default::default(),
         }
     }
 
@@ -872,6 +881,11 @@ impl WordApp {
         if let Some(r) = host::profile::view_gate(self, id, &params) {
             return r;
         }
+        // Comment text still being typed is written first, so a save or export has it and a
+        // close, New or Open counts it as a change (#1348). A draft the document refuses is not
+        // part of it: saving and exporting go on without it (the refusal stays on the status
+        // line), and replacing the document asks Save / Don't Save / Cancel about it.
+        let refused = if flushes_comment_drafts(id, &params) { panes::flush_comment_drafts(self).err() } else { None };
         if id == "file.recover" && params.as_object().is_none_or(|p| p.is_empty()) {
             self.ui.backstage = true;
             self.ui.backstage_page = "recover".into();
@@ -883,7 +897,7 @@ impl WordApp {
             self.dialog = dialogs::Dialog::open(name, self);
             return Ok(json!({"pending": name}));
         }
-        if (self.session.dirty || self.save_unconfirmed()) && discards_document(id, &params) {
+        if (self.session.dirty || self.save_unconfirmed() || refused.is_some()) && discards_document(id, &params) {
             let name = self.prompt_name();
             self.dialog = Some(dialogs::Dialog::SaveChanges {
                 name,
@@ -911,6 +925,10 @@ impl WordApp {
         }
         let applied = applied_font(id, &params);
         let r = self.execute_user(id, params);
+        // A save error already on the status line is the reason to see; the refusal shows otherwise.
+        if let (Some(e), true) = (refused, r.is_ok()) {
+            self.status(e);
+        }
         if let (Ok(_), Some(name)) = (&r, applied) {
             push_recent_font(&mut self.ui.recent_fonts, &name);
         }
@@ -954,6 +972,9 @@ impl WordApp {
         }
         if let Some(r) = self.ui_command(id, &params) {
             return r;
+        }
+        if id == "file.close" {
+            return self.close_document(&params);
         }
         if id == "file.autosave" {
             return self.set_autosave(&params);
@@ -1118,12 +1139,22 @@ impl WordApp {
         if document != self.session.document_id() {
             return Err("the document the prompt asked about has been replaced".into());
         }
+        // Don't Save is the user's say-so to discard the changes, which Close otherwise refuses.
+        let mut params = params;
+        if choice == SaveChoice::DontSave && then == "file.close" {
+            match params.as_object_mut() {
+                Some(p) => {
+                    p.insert("force".into(), json!(true));
+                }
+                None => params = json!({"force": true}),
+            }
+        }
         let go = match choice {
             SaveChoice::Cancel => false,
             SaveChoice::DontSave => true,
-            // A new document: ask where through Save As; the command runs once that has saved,
-            // which with the desktop's non-blocking dialog is on a later frame (#94).
-            SaveChoice::Save if self.session.path.is_none() && self.services.download.is_none() => {
+            // A new document or an import-only Word file: ask where through Save As. The command
+            // runs once that has saved, on a later frame with the non-blocking dialog (#94).
+            SaveChoice::Save if (self.session.path.is_none() || self.legacy_word_path()) && self.services.download.is_none() => {
                 return match self.save_as(file_dialogs::AfterSave::Continue { then, params, document }) {
                     file_dialogs::Asked::Done(r) => r,
                     file_dialogs::Asked::Pending => Ok(json!({"pending": "saveAs"})),
@@ -1149,9 +1180,23 @@ impl WordApp {
         self.execute_user(&then, params).map(|r| json!({"done": true, "result": r}))
     }
 
-    /// [`WordApp::execute`] for something the user did: a document that turns out to be
-    /// password-protected asks for the password (and opens with it) instead of failing (#55).
+    /// User commands can ask for a supported Save As target or an opening password (#55).
+    /// Scripts and agents use [`WordApp::execute`], which never opens these dialogs.
     pub(crate) fn execute_user(&mut self, id: &str, params: Value) -> Result<Value, String> {
+        // Legacy Word files are import-only (#2445). Only a user's implicit Save asks for
+        // a supported target; scripts and explicitly supplied paths keep their normal errors.
+        if id == "file.save"
+            && params.get("path").and_then(Value::as_str).is_none()
+            && self.has_document()
+            && self.legacy_word_path()
+            && self.services.download.is_none()
+        {
+            return match self.save_as(file_dialogs::AfterSave::Nothing) {
+                file_dialogs::Asked::Done(r) => r,
+                file_dialogs::Asked::Pending => Ok(json!({"pending": "saveAs"})),
+                file_dialogs::Asked::Busy => Ok(json!({"saved": false})),
+            };
+        }
         let retry = (id == "file.open").then(|| params.clone());
         let r = self.execute(id, params);
         if let (Err(e), Some(params)) = (&r, retry)
@@ -1294,12 +1339,43 @@ impl WordApp {
             self.status(tl!("Wait for the print job to finish submitting before closing."));
             return false;
         }
-        // No document open (#1129): nothing to save.
-        if self.quit_requested || !self.session.dirty || !self.has_document() {
+        if self.quit_requested {
             return true;
         }
-        let _ = self.run("file.close", json!({}));
+        // No document open (#1129): nothing to save.
+        if !self.has_document() {
+            return true;
+        }
+        // A comment draft the document refuses is an unsaved change: the prompt can drop it.
+        let refused = panes::flush_comment_drafts(self).is_err();
+        if !self.session.dirty && !self.save_unconfirmed() && !refused {
+            return true;
+        }
+        // `quit`: once the prompt is answered the window closes too, not just the document.
+        let _ = self.run("file.close", json!({"quit": true}));
         false
+    }
+
+    /// File › Close (Mod+W, Mod+F4) closes the document and keeps the window, as Word does
+    /// (#1712): it shows no page, as after Esc on the Start screen (#1129), and File › New or Open
+    /// goes on from there. `{"quit": true}`, from the window's close button, quits instead. With no
+    /// document open there is nothing to close. Unsaved changes are never discarded unasked: a
+    /// dirty document closes only with `{"force": true}` (Don't Save in the prompt passes it).
+    fn close_document(&mut self, params: &Value) -> Result<Value, String> {
+        if let Some(e) = control::close_refused(self, "file.close", params) {
+            return Err(e.into());
+        }
+        if params.get("quit").and_then(Value::as_bool) == Some(true) {
+            self.quit_requested = true;
+            return Ok(json!({"quit": true}));
+        }
+        if !self.has_document() {
+            return Ok(json!({"closed": false}));
+        }
+        self.execute("file.new", json!({}))?;
+        self.no_document = Some(self.session.document_id());
+        self.ui.backstage = false;
+        Ok(json!({"closed": true}))
     }
 
     fn after_command(&mut self, id: &str) {
@@ -1494,6 +1570,17 @@ impl WordApp {
             "ui.collapseRibbon" => {
                 self.ui.ribbon_collapsed = !self.ui.ribbon_collapsed;
                 json!({"collapsed": self.ui.ribbon_collapsed})
+            }
+            "ui.quickAccessToolbar" => {
+                // Hide Quick Access Toolbar (its menu) and Show Quick Access Toolbar (the ribbon's
+                // right-click menu, Customize Ribbon), #1945: `value` true shows the toolbar in
+                // the title bar, false hides it; no value toggles it.
+                match p.get("value") {
+                    None => self.ui.quick_access_toolbar = !self.ui.quick_access_toolbar,
+                    Some(Value::Bool(on)) => self.ui.quick_access_toolbar = *on,
+                    Some(_) => return Some(Err("`value` must be true or false".into())),
+                }
+                json!({"quickAccessToolbar": self.ui.quick_access_toolbar})
             }
             "ui.keytips" => {
                 if let Some(v) = p.get("value") {
@@ -1804,6 +1891,16 @@ impl WordApp {
         r
     }
 
+    /// These paths have readers but no writer, so an interactive save needs another format.
+    fn legacy_word_path(&self) -> bool {
+        self.session
+            .path
+            .as_ref()
+            .and_then(|p| p.extension())
+            .and_then(|e| e.to_str())
+            .is_some_and(|e| e.eq_ignore_ascii_case("doc") || e.eq_ignore_ascii_case("dot"))
+    }
+
     /// The name Save suggests: the open file's own Word format (so a .docm keeps its macros),
     /// otherwise .docx.
     fn default_save_name(&self) -> String {
@@ -2057,7 +2154,7 @@ impl WordApp {
     /// Tell the host whether the document has unsaved changes ([`Services::on_dirty`]).
     fn report_dirty(&self) {
         if let Some(f) = &self.services.on_dirty {
-            f(self.session.dirty);
+            f(self.session.dirty || panes::has_comment_drafts(self));
         }
     }
 
@@ -2132,6 +2229,15 @@ impl WordApp {
             raw.events.push(egui::Event::PointerMoved(*p));
         }
         let n = n.min(self.synthetic.len());
+        if self.synthetic.iter().take(n).any(|e| matches!(e, egui::Event::Key { .. } | egui::Event::Text(_))) {
+            // Control input belongs to this window's remembered widget even while another app
+            // is active. Give only this input frame egui focus, without requesting OS activation.
+            raw.focused = true;
+            if let (Some(ctx), Some((id, _))) = (&self.ctx, self.canvas.widget_id) {
+                // Canvas keys run before painting updates last frame's native focus flag.
+                self.canvas.focused = ctx.memory(|m| m.has_focus(id));
+            }
+        }
         raw.events.extend(self.synthetic.drain(..n));
     }
 
@@ -2285,7 +2391,13 @@ impl WordApp {
             // `focused` flag (which gates the keys) isn't recomputed until then either. Claim both
             // now, or the click swallows the first keystroke.
             self.canvas.focused = true;
-            if let Some(id) = self.canvas.widget_id {
+            // Only a page this pass drew. The File page's back arrow closes the File page in the
+            // pass that drew it instead of the page, and focus on a widget missing from the pass
+            // names a node AccessKit doesn't have: with accessibility on, AccessKit ends the program
+            // over that. `want_focus` hands the keyboard over next frame instead.
+            if let Some((id, pass)) = self.canvas.widget_id
+                && pass == ctx.cumulative_pass_nr()
+            {
                 ctx.memory_mut(|m| m.request_focus(id));
             }
             // The canvas reads keys before it takes focus back (#1107), so it counts as focused
@@ -2491,6 +2603,10 @@ fn input_dialog(id: &str, params: &Value) -> Option<&'static str> {
         "chart.editData" if !["data", "categories", "series"].into_iter().any(has) => Some("chartData"),
         // Table Properties without settings shows the dialog (with settings it applies them).
         "table.properties" if params.as_object().is_none_or(|m| m.is_empty()) => Some("tableProperties"),
+        // Cell Margins without settings shows the dialog; values continue through the same command.
+        "table.cellMargins" if params.as_object().is_none_or(|m| m.is_empty()) => Some("tableCellMargins"),
+        // Size without a size (Picture Format › Size's launcher) shows the Size dialog (#2573).
+        "picture.size" if params.as_object().is_none_or(|m| m.is_empty()) => Some("pictureSize"),
         // Formula without one asks for it, suggested from the numbers next to the cell (#1201).
         "table.formula" if !has("formula") => Some("tableFormula"),
         // Sort without settings asks for the column, order and header row (#1200).
@@ -2572,6 +2688,7 @@ pub(crate) fn works_without_document(id: &str) -> bool {
             | "ui.dialog"
             | "ui.closeDialog"
             | "ui.collapseRibbon"
+            | "ui.quickAccessToolbar"
             | "ui.keytips"
             | "ui.dark"
             | "ui.theme"
@@ -2588,11 +2705,30 @@ pub(crate) fn works_without_document(id: &str) -> bool {
     ) || id.starts_with("help.")
 }
 
+/// Commands that save, export, print, send or replace the document: comment text still being
+/// typed is written before them (#1348).
+fn flushes_comment_drafts(id: &str, params: &Value) -> bool {
+    matches!(
+        id,
+        "file.save"
+            | "file.saveAs"
+            | "file.saveTemplate"
+            | "file.open"
+            | "file.exportPdf"
+            | "file.exportPng"
+            | "file.print"
+            | "file.printPdf"
+            | "file.share"
+            | "ui.print"
+            | "ui.printSubmit"
+    ) || discards_document(id, params)
+}
+
 /// User commands that replace or close the document (`file.open` without a path only shows the
 /// file picker; the open that follows is checked). Envelopes, Labels and Finish & Merge make a
 /// new document in its place; a merge written to a file (`path`) and an envelope added to this
 /// document (`add`) leave it alone.
-fn discards_document(id: &str, params: &Value) -> bool {
+pub(crate) fn discards_document(id: &str, params: &Value) -> bool {
     match id {
         "file.new" | "file.close" | "mailings.labels" => true,
         "mailings.envelopes" => params.get("add").and_then(Value::as_bool) != Some(true),
@@ -2855,6 +2991,34 @@ mod tests {
         assert_eq!(a.run("ui.caretAnimation", json!({"value": true})).unwrap()["caretAnimation"], true);
     }
 
+    /// #1945: showing or hiding the Quick Access Toolbar is a UI command (no value toggles it),
+    /// kept between runs; settings saved before it existed show the toolbar; it works with no
+    /// document open, like the other interface settings.
+    #[test]
+    fn quick_access_toolbar_is_a_ui_command_and_survives_a_restart() {
+        let mut a = app();
+        assert!(a.ui.quick_access_toolbar, "shown by default");
+        assert_eq!(a.run("ui.quickAccessToolbar", json!({})).unwrap(), json!({"quickAccessToolbar": false}), "no value toggles it");
+        assert_eq!(a.run("ui.quickAccessToolbar", json!({})).unwrap(), json!({"quickAccessToolbar": true}));
+        assert_eq!(a.run("ui.quickAccessToolbar", json!({"value": false})).unwrap(), json!({"quickAccessToolbar": false}));
+        for junk in [json!({"value": "no"}), json!({"value": 0}), json!({"value": null}), json!({"value": [true]})] {
+            assert!(a.run("ui.quickAccessToolbar", junk).is_err());
+        }
+        assert!(!a.ui.quick_access_toolbar, "a rejected value keeps the setting");
+        let saved = serde_json::to_string(&a.prefs()).unwrap();
+        assert!(saved.contains(r#""quickAccessToolbar":false"#), "{saved}");
+        let mut b = app();
+        b.apply_prefs(serde_json::from_str(&saved).unwrap());
+        assert!(!b.ui.quick_access_toolbar, "hidden after a restart");
+        let old: UiState = serde_json::from_str(r#"{"tab":"Insert"}"#).unwrap();
+        assert!(old.quick_access_toolbar && old.tab == "Insert", "older settings show the toolbar");
+        assert_eq!(a.run("ui.quickAccessToolbar", json!({"value": true})).unwrap()["quickAccessToolbar"], true);
+        let mut c = app();
+        c.start_screen();
+        assert!(!c.has_document());
+        assert_eq!(c.run("ui.quickAccessToolbar", json!({"value": false})).unwrap()["quickAccessToolbar"], false, "works without a document");
+    }
+
     fn harness(a: WordApp) -> egui_kittest::Harness<'static, WordApp> {
         egui_kittest::Harness::builder().with_size(egui::vec2(1440.0, 900.0)).build_ui_state(
             |ui, app: &mut WordApp| {
@@ -2922,6 +3086,31 @@ mod tests {
         b.run("ui.startScreen", json!({"value": false})).unwrap();
         assert!(!b.start_screen(), "off: today's behaviour");
         assert!(!b.ui.backstage && b.has_document());
+    }
+
+    /// #1908: with no document open the Home ribbon's split buttons grey out like the plain
+    /// buttons beside them, and their drop-down arrow opens no menu.
+    #[test]
+    fn split_buttons_are_disabled_with_no_document() {
+        use egui::accesskit::Role;
+        use egui_kittest::kittest::{NodeT, Queryable};
+        let mut a = app();
+        a.start_screen();
+        a.run("ui.backstage", json!({"value": false})).unwrap();
+        assert!(!a.has_document());
+        let mut h = harness(a);
+        h.run_steps(4);
+        for tip in ["Underline", "Text Highlight Color", "Font Color", "Bullets", "Numbering", "Shading", "Borders"] {
+            let node = h.query_by_role_and_label(Role::Button, tip);
+            assert!(node.is_some_and(|n| n.accesskit_node().is_disabled()), "{tip} is greyed out with no document");
+        }
+        let r = h.get_by_role_and_label(Role::Button, "Underline").rect();
+        let arrow = egui::pos2(r.max.x + 6.5, r.center().y);
+        for pressed in [true, false] {
+            h.event(egui::Event::PointerButton { pos: arrow, button: egui::PointerButton::Primary, pressed, modifiers: Default::default() });
+        }
+        h.run_steps(3);
+        assert!(!egui::Popup::is_any_open(&h.ctx), "the disabled split button's arrow opens no menu");
     }
 
     /// #1129: the empty window's File tab goes back to the Backstage with only Home, New, Open
@@ -3036,6 +3225,33 @@ mod tests {
         let basis = g.clone();
         g.rtl = true;
         assert_eq!(g.changes(&basis), json!({"rtl": true}));
+    }
+
+    /// Table Layout › Cell Margins opens with the table defaults and does not replace imported
+    /// values until the user changes a value and confirms.
+    #[test]
+    fn cell_margins_button_preserves_existing_values_until_confirmed() {
+        let mut a = app();
+        a.run("insert.table", json!({"rows": 1, "cols": 1})).unwrap();
+        let (tp, _, _) = a.session.sel.focus.path.cell().unwrap();
+        let table = a.session.doc.table_mut(a.session.sel.focus.story, &tp).unwrap();
+        table.props.cell_margins = Some([3.0, 6.0, 9.0, 12.0]);
+        table.rows[0].cells[0].props.margins = Some([1.0, 2.0, 3.0, 4.0]);
+
+        a.run("table.cellMargins", json!({})).unwrap();
+        let Some(dialogs::Dialog::CellMargins { form, basis }) = a.dialog.clone() else { panic!("no dialog: {:?}", a.dialog) };
+        assert_eq!((form.top, form.left, form.bottom, form.right), (3.0 / 72.0, 6.0 / 72.0, 9.0 / 72.0, 12.0 / 72.0));
+        assert_eq!(form.changes(&basis), json!({}), "an untouched dialog does not reset margins");
+
+        let mut changed = (*form).clone();
+        changed.right = 18.0 / 72.0;
+        let params = changed.changes(&basis);
+        assert_eq!(params, json!({"top": 3.0, "left": 6.0, "bottom": 9.0, "right": 18.0}));
+        a.dialog = None;
+        a.run("table.cellMargins", params).unwrap();
+        let table = a.session.doc.table(a.session.sel.focus.story, &tp).unwrap();
+        assert_eq!(table.props.cell_margins, Some([3.0, 6.0, 9.0, 18.0]));
+        assert_eq!(table.rows[0].cells[0].props.margins, Some([1.0, 2.0, 3.0, 4.0]), "cell-specific margins remain intact");
     }
 
     /// Home › Font › Enclose Characters (#297): the button opens the dialog on the selected
@@ -4118,6 +4334,126 @@ mod tests {
         frame(&mut a, vec![btn(ribbon, false)]);
     }
 
+    fn control_frame(a: &mut WordApp, ctx: &egui::Context, focused: bool) {
+        let mut raw = egui::RawInput {
+            focused,
+            time: Some(ctx.input(|i| i.time) + 1.0 / 60.0),
+            screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1280.0, 800.0))),
+            ..Default::default()
+        };
+        a.raw_input_hook(&mut raw);
+        ctx.run_ui(raw, |ui| {
+            a.logic(ui.ctx());
+            a.ui(ui);
+        })
+        .drop_without_applying_deltas();
+    }
+
+    fn control_input(a: &mut WordApp, ctx: &egui::Context, method: &str, params: Value) {
+        let (req, _reply) = ControlRequest::new(method, params);
+        let control::Outcome::Done(v) = control::handle(a, ctx, &req) else { panic!("input is queued") };
+        assert_eq!(v["result"]["queued"], true);
+    }
+
+    /// #2420: an inactive native window still delivers control input to its focused widget.
+    #[test]
+    fn control_keyboard_reaches_the_background_document_once() {
+        for focused in [true, false] {
+            let ctx = egui::Context::default();
+            let mut a = app();
+            a.run("document.setText", json!({"text": "Seed"})).unwrap();
+            for _ in 0..4 {
+                control_frame(&mut a, &ctx, true);
+            }
+            assert!(a.canvas.focused);
+            for _ in 0..2 {
+                control_frame(&mut a, &ctx, focused);
+            }
+            a.run("select.all", json!({})).unwrap();
+            // Two queued requests are delivered in order across the key's release boundary.
+            control_input(&mut a, &ctx, "ui.key", json!({"key": "b", "cmd": true}));
+            control_input(&mut a, &ctx, "ui.text", json!({"text": "Written"}));
+            control_frame(&mut a, &ctx, focused);
+            assert_eq!(a.session.doc.para_at(&a.session.sel.focus).unwrap().props_of_char(0).bold, Some(true), "focused={focused}: Mod+B applied");
+            assert_eq!(body_text(&a), "Seed", "text waits behind the key's release");
+            control_frame(&mut a, &ctx, focused);
+            assert_eq!(body_text(&a), "Written", "focused={focused}: text applied");
+            assert!(a.synthetic.is_empty());
+            let rev = a.session.rev();
+            for _ in 0..3 {
+                control_frame(&mut a, &ctx, true);
+            }
+            assert_eq!(a.session.rev(), rev, "foregrounding never replays an input");
+            a.run("edit.undo", json!({})).unwrap();
+            assert_eq!(body_text(&a), "Seed", "one Undo reverses the one text input");
+        }
+    }
+
+    #[test]
+    fn control_keyboard_keeps_the_background_widget_target() {
+        let ctx = egui::Context::default();
+        let mut a = app();
+        a.run("document.setText", json!({"text": "Seed"})).unwrap();
+        for _ in 0..4 {
+            control_frame(&mut a, &ctx, true);
+        }
+        a.run("edit.advancedFind", json!({})).unwrap();
+        for _ in 0..2 {
+            control_frame(&mut a, &ctx, true);
+        }
+        assert!(ctx.memory(|m| m.has_focus(egui::Id::new("find_what"))));
+        for _ in 0..2 {
+            control_frame(&mut a, &ctx, false);
+        }
+        control_input(&mut a, &ctx, "ui.text", json!({"text": "Needle"}));
+        control_frame(&mut a, &ctx, false);
+        assert!(matches!(&a.dialog, Some(dialogs::Dialog::Find { query, .. }) if query == "Needle"));
+        control_input(&mut a, &ctx, "ui.key", json!({"key": "Backspace"}));
+        control_frame(&mut a, &ctx, false);
+        assert!(matches!(&a.dialog, Some(dialogs::Dialog::Find { query, .. }) if query == "Needl"));
+        assert_eq!(body_text(&a), "Seed", "the Find field, not the document, owns the input");
+        control_input(&mut a, &ctx, "ui.key", json!({"key": "Escape"}));
+        control_frame(&mut a, &ctx, false);
+        assert!(a.dialog.is_none());
+        a.run("file.close", json!({})).unwrap();
+        for focused in [true, true, false, false] {
+            control_frame(&mut a, &ctx, focused);
+        }
+        assert!(matches!(a.dialog, Some(dialogs::Dialog::SaveChanges { .. })));
+        control_input(&mut a, &ctx, "ui.key", json!({"key": "Escape"}));
+        control_frame(&mut a, &ctx, false);
+        assert!(a.dialog.is_none());
+        assert!(a.session.dirty && a.has_document() && !a.quit_requested);
+        assert_eq!(body_text(&a), "Seed", "Cancel preserves the unsaved document");
+    }
+
+    #[test]
+    fn control_keyboard_preserves_native_focus_and_document_protection() {
+        let ctx = egui::Context::default();
+        let mut a = app();
+        a.run("document.setText", json!({"text": "Seed"})).unwrap();
+        for _ in 0..4 {
+            control_frame(&mut a, &ctx, true);
+        }
+        a.run("select.all", json!({})).unwrap();
+        a.run("review.restrict", json!({"mode": "readOnly"})).unwrap();
+        let doc = a.session.doc.clone();
+        for _ in 0..2 {
+            control_frame(&mut a, &ctx, false);
+        }
+        control_input(&mut a, &ctx, "ui.key", json!({"key": "b", "cmd": true}));
+        control_input(&mut a, &ctx, "ui.text", json!({"text": "Refused"}));
+        for _ in 0..3 {
+            control_frame(&mut a, &ctx, false);
+        }
+        assert_eq!(a.session.doc, doc, "control input respects the same protection as real keys");
+        assert!(a.synthetic.is_empty());
+        let mut native = egui::RawInput { focused: false, ..Default::default() };
+        a.raw_input_hook(&mut native);
+        assert!(!native.focused, "a frame without control keys keeps the native focus state");
+        assert!(!a.canvas.focused);
+    }
+
     /// The control channel's `ui.wheel` scrolls the canvas like a mouse wheel over it.
     #[test]
     fn control_wheel_scrolls_the_canvas() {
@@ -4497,25 +4833,46 @@ mod tests {
         assert!(body_text(&a).contains(UNSAVED));
     }
 
-    /// Mod+W ran `file.close`, which quit at once.
+    /// Mod+W ran `file.close`, which quit at once; then it asked first, but still quit the whole
+    /// app. #1712: as in Word, it closes the document and the window stays, showing no page, until
+    /// File › New or Open.
     #[test]
-    fn close_asks_before_quitting() {
+    fn close_asks_then_closes_the_document_and_keeps_the_window() {
         let mut a = typed();
         a.run("file.close", json!({})).unwrap();
         assert_eq!(prompt(&a), Some("saveChanges"));
-        assert!(!a.quit_requested);
         a.run("ui.saveChanges", json!({"answer": "cancel"})).unwrap();
-        assert!(!a.quit_requested);
+        assert!(a.has_document() && body_text(&a).contains(UNSAVED), "Cancel keeps the document");
 
         a.run("file.close", json!({})).unwrap();
         a.run("ui.saveChanges", json!({"answer": "dontSave"})).unwrap();
-        assert!(a.quit_requested);
+        assert!(!a.quit_requested, "the window stays");
+        assert!(!a.has_document() && !a.session.dirty && !a.ui.backstage, "no document, no page");
+        assert!(a.close_requested(), "closing the empty window asks nothing");
+        a.run("file.close", json!({})).unwrap();
+        assert!(!a.quit_requested && !a.has_document(), "nothing left to close");
+        a.run("file.new", json!({})).unwrap();
+        assert!(a.has_document(), "File › New goes on from there");
 
         // A clean document closes straight away.
         let mut clean = app();
         clean.run("file.close", json!({})).unwrap();
         assert_eq!(prompt(&clean), None);
-        assert!(clean.quit_requested);
+        assert!(!clean.quit_requested && !clean.has_document());
+    }
+
+    /// A direct programmatic `file.close` (no prompt, no control channel) never discards unsaved
+    /// changes either: it is refused unless `force` says so, as over the control channel.
+    #[test]
+    fn a_direct_close_keeps_unsaved_changes_unless_forced() {
+        let mut a = typed();
+        for params in [json!({}), json!({"quit": true}), json!({"force": "yes"})] {
+            let e = a.execute("file.close", params.clone()).unwrap_err();
+            assert!(e.contains("unsaved") && e.contains("force"), "{params}: {e}");
+            assert!(a.has_document() && !a.quit_requested && body_text(&a).contains(UNSAVED), "{params}");
+        }
+        a.execute("file.close", json!({"force": true})).unwrap();
+        assert!(!a.has_document() && !a.quit_requested);
     }
 
     /// The window's close button quit at once; now it asks (the host cancels the close on false).
@@ -4648,7 +5005,7 @@ mod tests {
     #[test]
     fn enter_answers_with_the_focused_button() {
         use egui_kittest::kittest::Queryable;
-        for (focus, quits, saves) in [(Some("Cancel"), false, false), (Some("Don't Save"), true, false), (None, true, true)] {
+        for (focus, closes, saves) in [(Some("Cancel"), false, false), (Some("Don't Save"), true, false), (None, true, true)] {
             let dir = scratch(&format!("enter-{}", focus.map_or(0, str::len)));
             let path = docx_on_disk(&dir, "Draft");
             let before = std::fs::read(&path).unwrap();
@@ -4685,7 +5042,7 @@ mod tests {
             }
             let a = h.state();
             assert_eq!(prompt(a), None, "{focus:?}: answered");
-            assert_eq!(a.quit_requested, quits, "{focus:?}: quit");
+            assert_eq!(!a.has_document(), closes, "{focus:?}: closed");
             assert_eq!(std::fs::read(&path).unwrap() != before, saves, "{focus:?}: file written");
             let _ = std::fs::remove_dir_all(&dir);
         }
@@ -4696,7 +5053,7 @@ mod tests {
     #[test]
     fn arrow_keys_choose_the_save_prompt_answer() {
         use egui_kittest::kittest::Queryable;
-        for (arrows, focused, quits, saves) in [
+        for (arrows, focused, closes, saves) in [
             (vec![egui::Key::ArrowLeft], "Save", true, true),
             (vec![egui::Key::ArrowRight], "Don't Save", true, false),
             (vec![egui::Key::ArrowRight, egui::Key::ArrowRight, egui::Key::ArrowRight], "Cancel", false, false),
@@ -4738,7 +5095,7 @@ mod tests {
             }
             let a = h.state();
             assert_eq!(prompt(a), None, "{arrows:?}: answered");
-            assert_eq!(a.quit_requested, quits, "{arrows:?}: quit");
+            assert_eq!(!a.has_document(), closes, "{arrows:?}: closed");
             assert_eq!(std::fs::read(&path).unwrap() != before, saves, "{arrows:?}: file written");
             let _ = std::fs::remove_dir_all(&dir);
         }
@@ -4786,8 +5143,62 @@ mod tests {
             h.step();
         }
         assert_eq!(prompt(h.state()), None, "answered");
-        assert!(h.state().quit_requested, "Don't Save closes");
+        assert!(!h.state().has_document() && !h.state().quit_requested, "Don't Save closes the document, not the window (#1712)");
         assert_eq!(std::fs::read(&path).unwrap(), before, "nothing was saved");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// #1015: focusing Save is not enough: its dialog must expose the question and any failed
+    /// save's explanation, so assistive technology has context for the three choices.
+    #[test]
+    fn save_prompt_exposes_its_context_to_accessibility() {
+        use egui::accesskit::Role;
+        use egui_kittest::kittest::{By, NodeT, Queryable};
+        let dir = scratch("save-accessibility");
+        let path = docx_on_disk(&dir, "Draft");
+        let mut a = app();
+        a.run("file.open", json!({"path": path.to_string_lossy()})).unwrap();
+        a.run("text.insert", json!({"text": "Revised "})).unwrap();
+        a.canvas.want_focus = true;
+        let mut h = egui_kittest::Harness::builder().with_size(egui::vec2(1440.0, 900.0)).build_ui_state(
+            |ui, app: &mut WordApp| {
+                let ctx = ui.ctx().clone();
+                app.logic(&ctx);
+                app.ui(ui);
+            },
+            a,
+        );
+        h.run_steps(6);
+        assert!(h.state().canvas.focused);
+        h.state_mut().run("file.close", json!({})).unwrap();
+        h.run_steps(3);
+        let save = h.query_all_by_role(Role::Button).find(|n| n.accesskit_node().label().as_deref() == Some("Save") && n.is_focused()).unwrap();
+        let mut ancestor = save.parent();
+        let mut roles = Vec::new();
+        while let Some(node) = ancestor {
+            roles.push(node.accesskit_node().role());
+            ancestor = node.parent();
+        }
+        assert!(roles.contains(&Role::AlertDialog), "Save has no alert-dialog ancestor: {roles:?}");
+        let dialog = h.get(By::new().predicate(|n| n.role() == Role::AlertDialog));
+        let node = dialog.accesskit_node();
+        assert!(node.label().is_some_and(|s| s.contains("contract.docx") && s.contains("save changes")));
+        assert!(node.description().is_some_and(|s| s.contains("Your changes will be lost")));
+        for label in ["Save", "Don't Save", "Cancel"] {
+            assert!(dialog.query_by_role_and_label(Role::Button, label).is_some(), "missing {label}");
+        }
+        let reason = "Couldn't save contract.docx: disk full";
+        if let Some(dialogs::Dialog::SaveChanges { message, .. }) = &mut h.state_mut().dialog {
+            *message = reason.into();
+        }
+        h.run_steps(2);
+        let dialog = h.get(By::new().predicate(|n| n.role() == Role::AlertDialog));
+        assert!(dialog.accesskit_node().description().is_some_and(|s| s.contains(reason)));
+        h.key_press(egui::Key::Escape);
+        h.run_steps(3);
+        assert!(h.state().dialog.is_none());
+        assert!(h.state().canvas.focused && h.state().session.dirty);
+        assert!(body_text(h.state()).contains("Revised Draft"));
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -5839,7 +6250,7 @@ mod tests {
         a.services.pick_save = Some(Box::new(move |_| Some(picked.clone())));
         a.run("file.close", json!({})).unwrap();
         a.run("ui.saveChanges", json!({"answer": "save"})).unwrap();
-        assert!(a.quit_requested);
+        assert!(!a.has_document(), "closed once saved");
         let saved = wordcraft_engine::io::open_path(&path).unwrap();
         assert!(saved.plain_text(wordcraft_doc::StoryRef::Body).contains(UNSAVED));
         let _ = std::fs::remove_dir_all(&dir);
@@ -5874,17 +6285,18 @@ mod tests {
         assert_eq!(r["ok"], json!(false), "{r}");
         let e = r["error"].as_str().unwrap_or("");
         assert!(e.contains("unsaved") && e.contains("force"), "{e}");
-        assert!(!a.quit_requested);
+        assert!(a.has_document() && !a.quit_requested);
         assert!(body_text(&a).contains(UNSAVED));
 
         let r = control_execute(&mut a, json!({"command": "file.close", "params": {"force": true}}));
         assert_eq!(r["ok"], json!(true), "{r}");
-        assert!(a.quit_requested);
+        // Closed: the document, not the window (#1712).
+        assert!(!a.has_document() && !a.quit_requested);
 
         let mut clean = app();
         let r = control_execute(&mut clean, json!({"command": "file.close"}));
         assert_eq!(r["ok"], json!(true), "{r}");
-        assert!(clean.quit_requested);
+        assert!(!clean.has_document() && !clean.quit_requested);
     }
 
     /// Every way to name `file.close` over the control channel is guarded (#1268).
@@ -5906,13 +6318,13 @@ mod tests {
             let mut a = typed();
             let r = send(&mut a, method, params.clone());
             assert_eq!(r["ok"], json!(false), "{method} {params}: {r}");
-            assert!(!a.quit_requested, "{method} {params}");
+            assert!(a.has_document() && !a.quit_requested, "{method} {params}");
             assert!(body_text(&a).contains(UNSAVED));
         }
         let mut a = typed();
         let r = send(&mut a, "file.close", json!({"force": true}));
         assert_eq!(r["ok"], json!(true), "{r}");
-        assert!(a.quit_requested);
+        assert!(!a.has_document() && !a.quit_requested);
     }
 
     const MAILINGS: [&str; 3] = ["mailings.envelopes", "mailings.labels", "mailings.finish"];
@@ -6644,6 +7056,24 @@ mod tests {
         assert!(theme::Tokens::get(&ctx).dark);
     }
 
+    /// #537: where winit reports no OS theme (Linux), System follows the desktop portal's answer
+    /// and pins the window to it, so GNOME's client-side title bar matches the interface and
+    /// follows a theme switch made while the app runs.
+    #[test]
+    fn system_theme_pins_the_title_bar_to_the_desktop_answer() {
+        use egui::{SystemTheme, ViewportCommand};
+        let ctx = egui::Context::default();
+        let mut a = app();
+        a.run("ui.theme", json!({"value": "system"})).unwrap();
+        for dark in [false, true, false] {
+            a.desktop_dark = Some(dark);
+            let sent = theme_frame(&ctx, &mut a, None);
+            let want = if dark { SystemTheme::Dark } else { SystemTheme::Light };
+            assert!(sent.contains(&ViewportCommand::SetTheme(want)), "desktop dark {dark}: {sent:?}");
+            assert_eq!(theme::Tokens::get(&ctx).dark, dark);
+        }
+    }
+
     /// #312: Dark page darkens only the pages; the interface keeps following its own setting.
     #[test]
     fn dark_page_leaves_the_interface_theme_alone() {
@@ -6963,10 +7393,12 @@ mod tests {
         )
         .unwrap();
         a.run("mailings.editRecipients", json!({})).unwrap();
-        let Some(dialogs::Dialog::RecipientList { rows, filter, .. }) = &a.dialog else { panic!() };
+        let Some(dialogs::Dialog::RecipientList { rows, filter, fields, .. }) = &a.dialog else { panic!() };
         assert_eq!(rows.len(), 3, "every record, not only the filtered ones");
         assert!(filter.open);
-        let params = filter.params();
+        let params = filter.params(fields);
+        // A rule or sort key on a field renamed or removed in the table drops (#1287).
+        assert_eq!(filter.params(&["Name".to_string()]), json!({"rules": [], "sort": [{"field": "Name", "descending": true}]}));
         assert_eq!(params["rules"], json!([{"field": "City", "op": "equal", "value": "London", "join": "and"}]));
         assert_eq!(params["sort"], json!([{"field": "Name", "descending": true}]));
         // Applying the dialog's filter to a reloaded list gives the same records.
@@ -6975,6 +7407,151 @@ mod tests {
         let names: Vec<&str> = a.session.merge.rows.iter().map(|r| r[0].as_str()).collect();
         assert_eq!(names, ["Grace", "Ada"]);
         assert!(open_filters("recipients")[0].1.contains(&"xls"));
+    }
+
+    /// #1576: Find in list and "only records that will be merged" hide rows from the grid
+    /// without touching the list; the shown rows keep their real indices for edit and remove.
+    #[test]
+    fn recipient_list_search_and_merged_view() {
+        let fields: Vec<String> = vec!["Name".into(), "City".into()];
+        let rows: Vec<Vec<String>> = [["Ada", "London"], ["Alan", "Wilmslow"], ["Grace", "LONDON"], ["Émile", "Paris"]]
+            .iter()
+            .map(|r| r.iter().map(|c| c.to_string()).collect())
+            .collect();
+        let none = dialogs::visible_recipients(&rows, None, "", false);
+        assert_eq!(none, [0, 1, 2, 3], "no search, no filter: every row");
+        // Search: any cell, any case, including non-ASCII.
+        assert_eq!(dialogs::visible_recipients(&rows, None, "london", false), [0, 2]);
+        assert_eq!(dialogs::visible_recipients(&rows, None, "  AL ", false), [1], "trimmed, any case");
+        assert_eq!(dialogs::visible_recipients(&rows, None, "émi", false), [3]);
+        let greek = vec![vec!["ΟΣ".to_string()], vec!["ος".to_string()], vec!["Αλφα".to_string()]];
+        assert_eq!(dialogs::visible_recipients(&greek, None, "ος", false), [0, 1], "final sigma matches capital sigma");
+        assert_eq!(dialogs::visible_recipients(&rows, None, "ÉMI", false), [3]);
+        assert!(dialogs::visible_recipients(&rows, None, "zzz", false).is_empty());
+        // Filter only: City = London keeps Ada and Grace.
+        let mut filter = dialogs::RecipientFilter::default();
+        filter.rules.push(dialogs::FilterRow {
+            field: "City".into(),
+            op: wordcraft_engine::cmd::mailings::FilterOp::Equal,
+            value: "London".into(),
+            or: false,
+        });
+        let order = dialogs::merge_order(&fields, &rows, &filter).unwrap();
+        assert_eq!(order, [Some(1), None, Some(2), None]);
+        assert_eq!(dialogs::visible_recipients(&rows, Some(&order), "", false), [0, 1, 2, 3], "unchecked: excluded rows still shown");
+        assert_eq!(dialogs::visible_recipients(&rows, Some(&order), "", true), [0, 2]);
+        // Both: search within the merged records.
+        assert_eq!(dialogs::visible_recipients(&rows, Some(&order), "grace", true), [2]);
+        assert!(dialogs::visible_recipients(&rows, Some(&order), "alan", true).is_empty());
+        // No filter: only_merged hides nothing.
+        assert_eq!(dialogs::visible_recipients(&rows, None, "", true), [0, 1, 2, 3]);
+        // Removing the first shown row removes the real record, not row 0.
+        let shown = dialogs::visible_recipients(&rows, None, "grace", false);
+        let mut edited = rows.clone();
+        edited.remove(shown[0]);
+        assert_eq!(edited.iter().map(|r| r[0].as_str()).collect::<Vec<_>>(), ["Ada", "Alan", "Émile"]);
+        // Hostile order (shorter than the list) never panics; missing entries count as excluded.
+        assert_eq!(dialogs::visible_recipients(&rows, Some(&[Some(1)]), "", true), [0]);
+        // The view settings don't reach the merge.
+        let mut viewed = filter.clone();
+        viewed.find = "grace".into();
+        viewed.only_merged = true;
+        assert_eq!(viewed.params(&fields), filter.params(&fields));
+    }
+
+    /// #1576 review: while a cell is edited the grid keeps its rows, so a record the edit stops
+    /// matching stays put instead of sliding another record under the cursor; and New Entry
+    /// shows every row, so the new, empty entry can't be hidden.
+    #[test]
+    fn recipient_grid_holds_its_rows_while_a_cell_is_edited() {
+        let mut held = None;
+        // Not editing: whatever matches now.
+        assert_eq!(dialogs::hold_rows(vec![0, 2], &mut held, false, 4), [0, 2]);
+        assert_eq!(held, None);
+        // Editing starts: the rows shown then are held…
+        assert_eq!(dialogs::hold_rows(vec![0, 2], &mut held, true, 4), [0, 2]);
+        // …even when the edit makes row 0 stop matching.
+        assert_eq!(dialogs::hold_rows(vec![2], &mut held, true, 4), [0, 2]);
+        // A held row past the end of a shrunk list is dropped, never indexed.
+        assert_eq!(dialogs::hold_rows(vec![], &mut held, true, 1), [0]);
+        // Editing ends: the view catches up.
+        assert_eq!(dialogs::hold_rows(vec![2], &mut held, false, 4), [2]);
+        assert_eq!(held, None);
+        assert_eq!(dialogs::hold_rows(vec![1], &mut held, true, 4), [1], "a new edit holds the new rows");
+
+        let mut filter = dialogs::RecipientFilter { find: "grace".into(), only_merged: true, held: Some(vec![1]), ..Default::default() };
+        filter.show_all();
+        assert!(filter.find.is_empty() && !filter.only_merged && filter.held.is_none());
+    }
+
+    /// #1576: the real Edit Recipient List grid in a harness (the dialog body, without the app
+    /// around it): Find, merged-only, an edit while the search hides rows, remove, New Entry.
+    #[test]
+    fn recipient_grid_edits_the_right_record_through_the_ui() {
+        use egui_kittest::kittest::Queryable;
+        type State = (WordApp, Vec<String>, Vec<Vec<String>>, String, dialogs::RecipientFilter);
+        let rows = [["Ada", "London"], ["Alan", "Wilmslow"], ["Grace", "London"], ["Émile", "Paris"]];
+        let mut filter = dialogs::RecipientFilter::default();
+        let rule =
+            dialogs::FilterRow { field: "City".into(), op: wordcraft_engine::cmd::mailings::FilterOp::Equal, value: "London".into(), or: false };
+        filter.rules.push(rule);
+        let state: State = (
+            app(),
+            vec!["Name".into(), "City".into()],
+            rows.iter().map(|r| r.iter().map(|c| c.to_string()).collect()).collect(),
+            String::new(),
+            filter,
+        );
+        let mut h = egui_kittest::Harness::builder().with_size(egui::vec2(900.0, 600.0)).build_ui_state(
+            |ui, s: &mut State| {
+                let (app, fields, rows, message, filter) = s;
+                dialogs::recipient_list(app, ui, fields, rows, message, filter);
+            },
+            state,
+        );
+        h.run_steps(4);
+        // Text boxes in order: Find, two field names, then the visible records' cells.
+        let cells = |h: &egui_kittest::Harness<'_, State>| h.query_all_by_role(egui::accesskit::Role::TextInput).count().saturating_sub(3) / 2;
+        let names = |h: &egui_kittest::Harness<'_, State>| h.state().2.iter().map(|r| r[0].clone()).collect::<Vec<_>>();
+        // Find in list: the first text box. Grace is the only match.
+        let find = h.query_all_by_role(egui::accesskit::Role::TextInput).next().unwrap();
+        find.click();
+        h.run_steps(2);
+        h.query_all_by_role(egui::accesskit::Role::TextInput).next().unwrap().type_text("grace");
+        h.run_steps(3);
+        assert_eq!(h.state().4.find, "grace");
+        assert!(cells(&h) == 1, "search hides the other rows");
+        // Merged-only on top of it: still Grace (London is kept).
+        h.get_by_label("Show only records that will be merged").click();
+        h.run_steps(3);
+        assert!(h.state().4.only_merged && cells(&h) == 1);
+        // Edit Grace's cell to something the search no longer matches: the row stays, and the
+        // edit lands on record 2, not on the first visible row's index.
+        h.query_all_by_role(egui::accesskit::Role::TextInput).nth(3).unwrap().click();
+        h.run_steps(2);
+        h.event(egui::Event::Key {
+            key: egui::Key::A,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: egui::Modifiers { command: true, ..Default::default() },
+        });
+        h.query_all_by_role(egui::accesskit::Role::TextInput).nth(3).unwrap().type_text("Zed");
+        h.run_steps(3);
+        assert_eq!(names(&h), ["Ada", "Alan", "Zed", "Émile"]);
+        assert_eq!(h.state().4.held, Some(vec![2]), "rows are held while the cell has the keyboard");
+        assert_eq!(cells(&h), 1);
+        // Remove the one shown record: the third "×" (two are field headers).
+        let xs: Vec<_> = h.get_all_by_label("×").collect();
+        xs[2].click();
+        h.run_steps(3);
+        assert_eq!(names(&h), ["Ada", "Alan", "Émile"]);
+        assert!(h.state().4.held.is_none());
+        // New Entry clears the view and appends an empty record.
+        h.get_by_label("New Entry").click();
+        h.run_steps(3);
+        assert_eq!(h.state().2, vec![vec!["Ada", "London"], vec!["Alan", "Wilmslow"], vec!["Émile", "Paris"], vec!["", ""]]);
+        assert!(h.state().4.find.is_empty() && !h.state().4.only_merged);
     }
 
     /// #240: Select Recipients needs data, so clicking it opens the recipient list instead of
