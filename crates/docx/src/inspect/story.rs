@@ -1497,7 +1497,8 @@ impl Walker<'_, '_> {
             "w:sdt" => self.sdt(el, Place::Block),
             "w:customXml" => self.container(el, Some("w:customXmlPr"), Place::Block, MarkKind::Plain),
             "w:sectPr" => {
-                let slot = self.slot("sectPr", Some(el), "w:sectPrChange", "w:sectPr", &|_| false)?;
+                let streams = self.extras.is_some();
+                let slot = self.slot("sectPr", Some(el), "w:sectPrChange", "w:sectPr", &|child| streams && is_header_or_footer_reference(child))?;
                 let format = self.format(slot.into_iter().collect(), false, false);
                 let mut hasher = Hasher::default();
                 hasher.field(b'Z', &[]);
@@ -1654,7 +1655,10 @@ impl Walker<'_, '_> {
         let mut slots = Vec::new();
         slots.extend(self.slot("pPr", properties, "w:pPrChange", "w:pPr", &|child| is(child, mark_properties) || is(child, section))?);
         slots.extend(self.slot("pPr.rPr", mark_properties, "w:rPrChange", "w:rPr", &is_wrap)?);
-        slots.extend(self.slot("pPr.sectPr", section, "w:sectPrChange", "w:sectPr", &|_| false)?);
+        // embed: streams mode: a section's header and footer references are compared by their
+        // slot, so which part holds a header is not formatting.
+        let streams = self.extras.is_some();
+        slots.extend(self.slot("pPr.sectPr", section, "w:sectPrChange", "w:sectPr", &|child| streams && is_header_or_footer_reference(child))?);
         // embed: streams mode: the section these properties end, as block-level ones would read.
         let section_format = match (self.extras.is_some(), slots.iter().find(|slot| slot.name == "pPr.sectPr")) {
             (true, Some(slot)) => Some(self.format(vec![Slot { name: "sectPr", ..slot.clone() }], false, false)),
@@ -1663,6 +1667,9 @@ impl Walker<'_, '_> {
         // A hidden mark hides the paragraph's end: its paragraph runs into the next.
         let mark_rev = slots.iter().find(|slot| slot.name == "pPr.rPr").and_then(|slot| slot.rev);
         let hiding = self.hiding(mark_properties, mark_rev.as_ref())?;
+        // embed: streams mode: the section break that follows carries the section's properties,
+        // so the paragraph mark's format leaves them out.
+        let slots = if streams { slots.into_iter().filter(|slot| slot.name != "pPr.sectPr").collect() } else { slots };
         let format = self.hidden_format(slots, hiding, false);
         let mut hasher = Hasher::default();
         hasher.field(b'P', &[]);
@@ -1879,4 +1886,9 @@ fn row_changes(row: &XEl) -> Result<Vec<(WrapKind, &XEl)>, String> {
             _ => None,
         })
         .collect())
+}
+
+/// embed: a section's `w:headerReference` or `w:footerReference`.
+fn is_header_or_footer_reference(child: &XEl) -> bool {
+    matches!(&*child.name, "w:headerReference" | "w:footerReference")
 }

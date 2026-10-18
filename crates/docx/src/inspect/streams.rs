@@ -56,13 +56,25 @@ pub struct Streams {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum StoryId {
     Body,
-    Header { part: String },
-    Footer { part: String },
-    Footnote { id: String },
-    Endnote { id: String },
+    Header {
+        part: String,
+    },
+    Footer {
+        part: String,
+    },
+    Footnote {
+        id: String,
+    },
+    Endnote {
+        id: String,
+    },
     /// A text box: the part it is in, the origin index of the paragraph that anchors it, and
     /// its order among that paragraph's text boxes.
-    TextBox { part: String, anchor: u32, ordinal: u32 },
+    TextBox {
+        part: String,
+        anchor: u32,
+        ordinal: u32,
+    },
 }
 
 pub struct Story {
@@ -131,33 +143,81 @@ pub struct Media {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum StreamItem {
-    Char { ch: char, format: FormatId, hidden: bool, revision: Option<Revision>, format_revision: Option<FormatRevision>, field: FieldRole },
+    Char {
+        ch: char,
+        format: FormatId,
+        hidden: bool,
+        revision: Option<Revision>,
+        format_revision: Option<FormatRevision>,
+        field: FieldRole,
+    },
     /// The end of a paragraph: its `w:p`'s pre-order index in its part (the model's
     /// `Origin.index`), its properties, and a tracked change of the mark itself.
-    ParagraphEnd { origin: u32, props: FormatId, revision: Option<Revision>, format_revision: Option<FormatRevision> },
-    TableStart { props: FormatId },
+    ParagraphEnd {
+        origin: u32,
+        props: FormatId,
+        revision: Option<Revision>,
+        format_revision: Option<FormatRevision>,
+    },
+    TableStart {
+        props: FormatId,
+    },
     TableEnd,
-    RowStart { props: FormatId, revision: Option<Revision> },
+    RowStart {
+        props: FormatId,
+        revision: Option<Revision>,
+    },
     RowEnd,
-    CellStart { props: FormatId, revision: Option<Revision> },
+    CellStart {
+        props: FormatId,
+        revision: Option<Revision>,
+    },
     CellEnd,
     FieldBegin,
     FieldSeparate,
     FieldEnd,
-    SimpleFieldStart { instruction: String },
+    SimpleFieldStart {
+        instruction: String,
+    },
     SimpleFieldEnd,
-    HyperlinkStart { target: Option<String>, anchor: Option<String> },
+    HyperlinkStart {
+        target: Option<String>,
+        anchor: Option<String>,
+    },
     HyperlinkEnd,
-    Object { kind: ObjectKind, digest: String, media: Vec<Media>, alt: Option<String> },
-    NoteReference { kind: NoteKind, id: String },
-    CommentStart { id: String },
-    CommentEnd { id: String },
-    CommentReference { id: String },
-    SectionBreak { props: FormatId, headers: Vec<(HeaderSlot, String)>, footers: Vec<(HeaderSlot, String)> },
-    ContentControlStart { props: FormatId },
+    Object {
+        kind: ObjectKind,
+        digest: String,
+        media: Vec<Media>,
+        alt: Option<String>,
+    },
+    NoteReference {
+        kind: NoteKind,
+        id: String,
+    },
+    CommentStart {
+        id: String,
+    },
+    CommentEnd {
+        id: String,
+    },
+    CommentReference {
+        id: String,
+    },
+    SectionBreak {
+        props: FormatId,
+        headers: Vec<(HeaderSlot, String)>,
+        footers: Vec<(HeaderSlot, String)>,
+    },
+    ContentControlStart {
+        props: FormatId,
+    },
     ContentControlEnd,
     /// Anything else, by element name and the digest of its canonical form.
-    Opaque { element: String, digest: String },
+    Opaque {
+        element: String,
+        digest: String,
+    },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -212,8 +272,10 @@ pub fn read_pair(left: &[u8], right: &[u8], limits: &StreamLimits) -> Result<Str
     let mut names = Names::default();
     let mut tables = Tables::new();
     let (mut left_record, mut right_record) = (SideRecord::default(), SideRecord::default());
-    let left_side = Side::read_with(left, &limits.read, &mut names, &mut tables, &mut budget, &mut false, Some(&mut left_record)).map_err(InspectError::Base)?;
-    let right_side = Side::read_with(right, &limits.read, &mut names, &mut tables, &mut budget, &mut false, Some(&mut right_record)).map_err(InspectError::Edited)?;
+    let left_side =
+        Side::read_with(left, &limits.read, &mut names, &mut tables, &mut budget, &mut false, Some(&mut left_record)).map_err(InspectError::Base)?;
+    let right_side = Side::read_with(right, &limits.read, &mut names, &mut tables, &mut budget, &mut false, Some(&mut right_record))
+        .map_err(InspectError::Edited)?;
     // Ids that ran out would make different pieces read as one.
     if tables.overflowed() {
         return Err(InspectError::Edited("more distinct content than an inspection reads".into()));
@@ -457,7 +519,10 @@ impl Decoder<'_> {
                 };
                 let revision = self.revision(item.wraps, Level::Text, budget)?;
                 let ch = char::from_u32(item.piece).unwrap_or(char::REPLACEMENT_CHARACTER);
-                out.push(StreamItem::Char { ch, format: FormatId(item.format), hidden: format.hidden, revision, format_revision: format.run, field }, budget)?;
+                out.push(
+                    StreamItem::Char { ch, format: FormatId(item.format), hidden: format.hidden, revision, format_revision: format.run, field },
+                    budget,
+                )?;
                 continue;
             }
             let Some(mark) = self.tables.mark_info(item.piece) else { continue };
@@ -604,7 +669,9 @@ fn item_strings(item: &StreamItem) -> u64 {
         | StreamItem::CommentStart { id: text }
         | StreamItem::CommentEnd { id: text }
         | StreamItem::CommentReference { id: text } => budget::units(text.len()),
-        StreamItem::HyperlinkStart { target, anchor } => budget::units(target.as_ref().map_or(0, String::len).saturating_add(anchor.as_ref().map_or(0, String::len))),
+        StreamItem::HyperlinkStart { target, anchor } => {
+            budget::units(target.as_ref().map_or(0, String::len).saturating_add(anchor.as_ref().map_or(0, String::len)))
+        }
         StreamItem::SectionBreak { headers, footers, .. } => {
             headers.iter().chain(footers).fold(0u64, |held, (_, part)| held.saturating_add(budget::units(part.len()).saturating_add(32)))
         }

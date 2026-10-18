@@ -73,7 +73,8 @@ impl Docx {
             types.push_str(&format!(r#"<Override PartName="{part}" ContentType="{kind}"/>"#));
         }
         types.push_str("</Types>");
-        let document = format!(r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?><w:document {W}><w:body>{}</w:body></w:document>"#, self.body);
+        let document =
+            format!(r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?><w:document {W}><w:body>{}</w:body></w:document>"#, self.body);
         let mut entries = vec![
             ("[Content_Types].xml".to_string(), types.into_bytes()),
             ("_rels/.rels".to_string(), ROOT_RELS.as_bytes().to_vec()),
@@ -146,11 +147,25 @@ fn read_one(bytes: &[u8]) -> Streams {
 }
 
 fn chars(story: &Story) -> String {
-    story.items.iter().filter_map(|item| match item { StreamItem::Char { ch, .. } => Some(*ch), _ => None }).collect()
+    story
+        .items
+        .iter()
+        .filter_map(|item| match item {
+            StreamItem::Char { ch, .. } => Some(*ch),
+            _ => None,
+        })
+        .collect()
 }
 
 fn origins(story: &Story) -> Vec<u32> {
-    story.items.iter().filter_map(|item| match item { StreamItem::ParagraphEnd { origin, .. } => Some(*origin), _ => None }).collect()
+    story
+        .items
+        .iter()
+        .filter_map(|item| match item {
+            StreamItem::ParagraphEnd { origin, .. } => Some(*origin),
+            _ => None,
+        })
+        .collect()
 }
 
 #[test]
@@ -215,14 +230,23 @@ fn origin_matches_the_model_reader() {
 fn tracked_insertions_and_deletions_carry_author_and_date() {
     let body = para(&format!("{}{}{}", text("Due in "), del(ANA, "thirty"), ins(ANA, "sixty")));
     let streams = read_one(&package(&body));
-    let revisions: Vec<Option<RevisionKind>> =
-        streams.stories[0].items.iter().filter_map(|item| match item { StreamItem::Char { revision, .. } => Some(revision.as_ref().map(|r| r.kind)), _ => None }).collect();
+    let revisions: Vec<Option<RevisionKind>> = streams.stories[0]
+        .items
+        .iter()
+        .filter_map(|item| match item {
+            StreamItem::Char { revision, .. } => Some(revision.as_ref().map(|r| r.kind)),
+            _ => None,
+        })
+        .collect();
     assert_eq!(revisions.iter().filter(|kind| **kind == Some(RevisionKind::Deleted)).count(), 6);
     assert_eq!(revisions.iter().filter(|kind| **kind == Some(RevisionKind::Inserted)).count(), 5);
     let revision = streams.stories[0]
         .items
         .iter()
-        .find_map(|item| match item { StreamItem::Char { revision: Some(revision), .. } => Some(revision), _ => None })
+        .find_map(|item| match item {
+            StreamItem::Char { revision: Some(revision), .. } => Some(revision),
+            _ => None,
+        })
         .unwrap();
     assert_eq!(revision.author, "Ana Contoh");
     assert_eq!(revision.date.as_deref(), Some("2026-10-01T09:00:00Z"));
@@ -236,11 +260,61 @@ fn equal_properties_share_a_format_id_across_the_pair() {
     let right = package(&format!("{}{}", para(&format!("{bold}{}", text(" plain"))), para(italic)));
     let pair = read_pair(&left, &right, &default_limits(left.len(), right.len())).unwrap();
     let formats = |streams: &Streams| -> Vec<FormatId> {
-        streams.stories[0].items.iter().filter_map(|item| match item { StreamItem::Char { format, .. } => Some(*format), _ => None }).collect()
+        streams.stories[0]
+            .items
+            .iter()
+            .filter_map(|item| match item {
+                StreamItem::Char { format, .. } => Some(*format),
+                _ => None,
+            })
+            .collect()
     };
     let (left, right) = (formats(&pair.left), formats(&pair.right));
     assert_eq!(left[0], right[0]);
     assert_ne!(left[0], *right.last().unwrap(), "bold and italic differ");
+}
+
+/// A paragraph ending a section with a default header, and the body's own section with one,
+/// both naming `part`; `margin` is the page's top margin.
+fn sections_naming(part: &str, margin: u32) -> Vec<u8> {
+    let section = |id: &str| format!(r#"<w:sectPr><w:headerReference w:type="default" r:id="{id}"/><w:pgMar w:top="{margin}"/></w:sectPr>"#);
+    let body = format!(r#"<w:p><w:pPr>{}</w:pPr>{}</w:p><w:p>{}</w:p>{}"#, section("rId5"), text("One"), text("Two"), section("rId5"));
+    let header = format!(r#"<w:hdr {W}><w:p>{}</w:p></w:hdr>"#, text("Header text"));
+    let target = part.trim_start_matches("word/");
+    Docx::new(&body).rel(("rId5", rt::HEADER, target, false)).part(part, &header).typed(&format!("/{part}"), HEADER_TYPE).zip()
+}
+
+#[test]
+fn a_renamed_header_part_leaves_paragraph_and_section_formats_equal() {
+    // The header is compared by its section and slot; which part holds it is not formatting.
+    let formats = |streams: &Streams| -> Vec<FormatId> {
+        streams.stories[0]
+            .items
+            .iter()
+            .filter_map(|item| match item {
+                StreamItem::ParagraphEnd { props, .. } | StreamItem::SectionBreak { props, .. } => Some(*props),
+                _ => None,
+            })
+            .collect()
+    };
+    let (left, right) = (sections_naming("word/header1.xml", 1440), sections_naming("word/header7.xml", 1440));
+    let pair = read_pair(&left, &right, &default_limits(left.len(), right.len())).unwrap();
+    assert_eq!(formats(&pair.left), formats(&pair.right));
+    let other = sections_naming("word/header1.xml", 720);
+    let pair = read_pair(&left, &other, &default_limits(left.len(), other.len())).unwrap();
+    let (left_formats, right_formats) = (formats(&pair.left), formats(&pair.right));
+    assert_ne!(left_formats, right_formats, "a page setup change still shows");
+    let paragraph_ends = |streams: &Streams| -> Vec<FormatId> {
+        streams.stories[0]
+            .items
+            .iter()
+            .filter_map(|item| match item {
+                StreamItem::ParagraphEnd { props, .. } => Some(*props),
+                _ => None,
+            })
+            .collect()
+    };
+    assert_eq!(paragraph_ends(&pair.left), paragraph_ends(&pair.right), "the section break carries page setup, not the paragraph mark");
 }
 
 #[test]
@@ -248,7 +322,11 @@ fn hyperlink_targets_are_readable() {
     let link = r#"<w:hyperlink r:id="rId7"><w:r><w:t>terms</w:t></w:r></w:hyperlink><w:hyperlink w:anchor="clause4"><w:r><w:t>clause 4</w:t></w:r></w:hyperlink>"#;
     let bytes = Docx::new(&para(link)).rel(("rId7", rt::HYPERLINK, "https://contoh.test/terms", true)).zip();
     let items = read_one(&bytes).stories.remove(0).items;
-    assert!(items.iter().any(|item| matches!(item, StreamItem::HyperlinkStart { target: Some(target), anchor: None } if target == "https://contoh.test/terms")));
+    assert!(
+        items
+            .iter()
+            .any(|item| matches!(item, StreamItem::HyperlinkStart { target: Some(target), anchor: None } if target == "https://contoh.test/terms"))
+    );
     assert!(items.iter().any(|item| matches!(item, StreamItem::HyperlinkStart { target: None, anchor: Some(anchor) } if anchor == "clause4")));
     assert_eq!(items.iter().filter(|item| matches!(item, StreamItem::HyperlinkEnd)).count(), 2);
 }
@@ -261,7 +339,15 @@ fn simple_field_instructions_and_field_roles_are_readable() {
     assert!(items.iter().any(|item| matches!(item, StreamItem::SimpleFieldStart { instruction } if instruction.trim() == "PAGE")));
     assert!(items.iter().any(|item| matches!(item, StreamItem::SimpleFieldEnd)));
     assert_eq!(items.iter().filter(|item| matches!(item, StreamItem::FieldBegin | StreamItem::FieldSeparate | StreamItem::FieldEnd)).count(), 3);
-    let of = |role: FieldRole| -> String { items.iter().filter_map(|item| match item { StreamItem::Char { ch, field, .. } if *field == role => Some(*ch), _ => None }).collect() };
+    let of = |role: FieldRole| -> String {
+        items
+            .iter()
+            .filter_map(|item| match item {
+                StreamItem::Char { ch, field, .. } if *field == role => Some(*ch),
+                _ => None,
+            })
+            .collect()
+    };
     assert!(of(FieldRole::Instruction).contains("DATE"));
     assert_eq!(of(FieldRole::Result), "1 October 20263");
     assert_eq!(of(FieldRole::None), "after");
@@ -275,13 +361,18 @@ fn notes_comments_and_sections_carry_their_ids() {
     assert!(body.items.iter().any(|item| matches!(item, StreamItem::CommentStart { id } if id == "0")));
     assert!(body.items.iter().any(|item| matches!(item, StreamItem::CommentEnd { id } if id == "0")));
     assert!(body.items.iter().any(|item| matches!(item, StreamItem::CommentReference { id } if id == "0")));
-    assert!(body.items.iter().any(|item| matches!(item, StreamItem::SectionBreak { headers, .. } if headers == &vec![(HeaderSlot::Default, "word/header1.xml".to_string())])));
+    assert!(body.items.iter().any(
+        |item| matches!(item, StreamItem::SectionBreak { headers, .. } if headers == &vec![(HeaderSlot::Default, "word/header1.xml".to_string())])
+    ));
     let note = streams.stories.iter().find(|story| story.id == StoryId::Footnote { id: "2".into() }).unwrap();
     assert_eq!(chars(note), "A note.");
     let header = streams.stories.iter().find(|story| story.id == StoryId::Header { part: "word/header1.xml".into() }).unwrap();
     assert_eq!(chars(header), "Header text");
     let comment = &streams.comments[0];
-    assert_eq!((comment.id.as_str(), comment.author.as_str(), comment.text.as_str(), comment.done), ("0", "Sari Contoh", "Please check clause 4.", false));
+    assert_eq!(
+        (comment.id.as_str(), comment.author.as_str(), comment.text.as_str(), comment.done),
+        ("0", "Sari Contoh", "Please check clause 4.", false)
+    );
     assert_eq!(comment.date.as_deref(), Some("2026-10-02T10:00:00Z"));
     // Body first, then the header, then the note.
     let order: Vec<&StoryId> = streams.stories.iter().map(|story| &story.id).collect();

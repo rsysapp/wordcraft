@@ -65,9 +65,9 @@ pub mod streams;
 mod xml;
 
 #[cfg(test)]
-mod tests;
-#[cfg(test)]
 mod streams_tests;
+#[cfg(test)]
+mod tests;
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -583,8 +583,18 @@ impl<'a> Side<'a> {
                     true => Some(stream_extras::Extras::new(&parsed.root, name, budget).map_err(|error| format!("{name}: {error}"))?),
                     false => None,
                 };
-                let items = story::walk_with(&parsed.root, &canon, tables, &mut revisions, &mut items_left, parsed.most_items, &hiding, budget, extras.as_mut())
-                    .map_err(|error| format!("{name}: {error}"));
+                let items = story::walk_with(
+                    &parsed.root,
+                    &canon,
+                    tables,
+                    &mut revisions,
+                    &mut items_left,
+                    parsed.most_items,
+                    &hiding,
+                    budget,
+                    extras.as_mut(),
+                )
+                .map_err(|error| format!("{name}: {error}"));
                 if let (Some(record), Some(extras)) = (record.as_deref_mut(), extras) {
                     record.stories.insert(name.clone(), extras);
                 }

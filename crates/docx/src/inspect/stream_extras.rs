@@ -56,28 +56,47 @@ pub(super) enum Extra {
     Close,
     /// A paragraph mark: its origin, and the section its properties end, if any (that section
     /// properties' format, alone, and its header and footer references).
-    Paragraph { origin: u32, section: Option<(u32, SectionRefs)> },
+    Paragraph {
+        origin: u32,
+        section: Option<(u32, SectionRefs)>,
+    },
     /// Section properties at block level (the body's last section).
     Section(SectionRefs),
-    Hyperlink { target: Option<String>, anchor: Option<String> },
+    Hyperlink {
+        target: Option<String>,
+        anchor: Option<String>,
+    },
     SimpleField(String),
     /// A content control's start, with its properties interned as a format.
     ContentControl(u32),
-    NoteStart { kind: NoteKind, id: String, separator: bool },
+    NoteStart {
+        kind: NoteKind,
+        id: String,
+        separator: bool,
+    },
     NoteEnd,
     NoteReference(NoteKind, String),
     Comment(CommentMark, String),
-    Object { kind: ObjectKind, media: Vec<String>, alt: Option<String> },
+    Object {
+        kind: ObjectKind,
+        media: Vec<String>,
+        alt: Option<String>,
+    },
 }
 
 impl Extra {
     /// What the fact holds beyond its entry.
     fn held(&self) -> u64 {
-        let strings = |list: &[(HeaderSlot, String)]| list.iter().fold(0u64, |held, (_, part)| held.saturating_add(units(part.len()).saturating_add(32)));
+        let strings =
+            |list: &[(HeaderSlot, String)]| list.iter().fold(0u64, |held, (_, part)| held.saturating_add(units(part.len()).saturating_add(32)));
         match self {
             Extra::Paragraph { section: Some((_, refs)), .. } | Extra::Section(refs) => strings(&refs.headers).saturating_add(strings(&refs.footers)),
-            Extra::Hyperlink { target, anchor } => units(target.as_ref().map_or(0, String::len)).saturating_add(units(anchor.as_ref().map_or(0, String::len))),
-            Extra::SimpleField(text) | Extra::NoteStart { id: text, .. } | Extra::NoteReference(_, text) | Extra::Comment(_, text) => units(text.len()),
+            Extra::Hyperlink { target, anchor } => {
+                units(target.as_ref().map_or(0, String::len)).saturating_add(units(anchor.as_ref().map_or(0, String::len)))
+            }
+            Extra::SimpleField(text) | Extra::NoteStart { id: text, .. } | Extra::NoteReference(_, text) | Extra::Comment(_, text) => {
+                units(text.len())
+            }
             Extra::Object { media, alt, .. } => {
                 media.iter().fold(units(alt.as_ref().map_or(0, String::len)), |held, part| held.saturating_add(units(part.len()).saturating_add(24)))
             }
@@ -207,11 +226,7 @@ pub(super) fn section_refs(section: &XEl, canon: &Canon<'_>, dir: &str) -> Secti
 /// The branch a reader takes first: an alternative-content element's first `mc:Choice` or
 /// `mc:Fallback`, the element itself otherwise.
 fn first_branch(el: &XEl) -> &XEl {
-    if &*el.name == "mc:AlternateContent" {
-        el.els().find(|branch| matches!(&*branch.name, "mc:Choice" | "mc:Fallback")).unwrap_or(el)
-    } else {
-        el
-    }
+    if &*el.name == "mc:AlternateContent" { el.els().find(|branch| matches!(&*branch.name, "mc:Choice" | "mc:Fallback")).unwrap_or(el) } else { el }
 }
 
 /// An object's kind, the parts its pictures show and its alternative text, from its first branch.

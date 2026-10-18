@@ -104,11 +104,20 @@ struct Walk<'a> {
 
 impl<'a> Walk<'a> {
     fn new(doc: &'a Document, part_names: &'a [String]) -> Walk<'a> {
-        Walk { doc, part_names, counters: Counters::default(), table_styles: HashMap::new(), chains: HashMap::new(), work_left: MAX_WORK, out: Vec::new() }
+        Walk {
+            doc,
+            part_names,
+            counters: Counters::default(),
+            table_styles: HashMap::new(),
+            chains: HashMap::new(),
+            work_left: MAX_WORK,
+            out: Vec::new(),
+        }
     }
 
     fn charge(&mut self, units: u64) -> Result<(), DocxError> {
-        self.work_left = self.work_left.checked_sub(units).ok_or_else(|| DocxError::Limit("paragraph facts: too many style and list lookups".into()))?;
+        self.work_left =
+            self.work_left.checked_sub(units).ok_or_else(|| DocxError::Limit("paragraph facts: too many style and list lookups".into()))?;
         Ok(())
     }
 
@@ -176,7 +185,12 @@ impl<'a> Walk<'a> {
             for cell in &row.cells {
                 let (mut para, mut chr, mut region_fill) = (ParaProps::default(), CharProps::default(), None);
                 if let Some(style) = &style {
-                    let region = PartSet::of_cell(&table.props.look, style.parts.band_size.unwrap_or(1), (row_index, table.rows.len()), (column, cell.span(), table.cols()));
+                    let region = PartSet::of_cell(
+                        &table.props.look,
+                        style.parts.band_size.unwrap_or(1),
+                        (row_index, table.rows.len()),
+                        (column, cell.span(), table.cols()),
+                    );
                     para = style.para.clone();
                     // Lowest precedence first (ECMA-376 §17.7.6).
                     for part in region.iter() {
@@ -397,12 +411,15 @@ mod tests {
         }
 
         fn build(body: &str, header: Option<&str>, extra_styles: &str, extra_nums: &str) -> Vec<u8> {
-            let header_type = r#"<Override PartName="/word/header1.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.header+xml"/>"#;
+            let header_type =
+                r#"<Override PartName="/word/header1.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.header+xml"/>"#;
             let types = format!(
                 r#"<?xml version="1.0" encoding="UTF-8"?><Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"><Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/><Default Extension="xml" ContentType="application/xml"/><Override PartName="/word/document.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.document.main+xml"/><Override PartName="/word/styles.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.styles+xml"/><Override PartName="/word/numbering.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.numbering+xml"/>{}</Types>"#,
                 if header.is_some() { header_type } else { "" }
             );
-            let root_rels = format!(r#"<?xml version="1.0" encoding="UTF-8"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="{REL}/officeDocument" Target="word/document.xml"/></Relationships>"#);
+            let root_rels = format!(
+                r#"<?xml version="1.0" encoding="UTF-8"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="{REL}/officeDocument" Target="word/document.xml"/></Relationships>"#
+            );
             let document_rels = format!(
                 r#"<?xml version="1.0" encoding="UTF-8"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="{REL}/styles" Target="styles.xml"/><Relationship Id="rId2" Type="{REL}/numbering" Target="numbering.xml"/>{}</Relationships>"#,
                 if header.is_some() { format!(r#"<Relationship Id="rId3" Type="{REL}/header" Target="header1.xml"/>"#) } else { String::new() }
@@ -431,7 +448,11 @@ mod tests {
         fn list_items(items: &[(u8, &str)]) -> String {
             items
                 .iter()
-                .map(|(level, text)| format!(r#"<w:p><w:pPr><w:numPr><w:ilvl w:val="{level}"/><w:numId w:val="1"/></w:numPr></w:pPr><w:r><w:t>{text}</w:t></w:r></w:p>"#))
+                .map(|(level, text)| {
+                    format!(
+                        r#"<w:p><w:pPr><w:numPr><w:ilvl w:val="{level}"/><w:numId w:val="1"/></w:numPr></w:pPr><w:r><w:t>{text}</w:t></w:r></w:p>"#
+                    )
+                })
                 .collect()
         }
 
@@ -444,12 +465,17 @@ mod tests {
         }
 
         pub fn styled(paragraphs: &[(&str, &str)]) -> Vec<u8> {
-            let body: String = paragraphs.iter().map(|(style, text)| format!(r#"<w:p><w:pPr><w:pStyle w:val="{style}"/></w:pPr><w:r><w:t>{text}</w:t></w:r></w:p>"#)).collect();
+            let body: String = paragraphs
+                .iter()
+                .map(|(style, text)| format!(r#"<w:p><w:pPr><w:pStyle w:val="{style}"/></w:pPr><w:r><w:t>{text}</w:t></w:r></w:p>"#))
+                .collect();
             zip(&body, None)
         }
 
         fn cell(text: &str, properties: &str, run_properties: &str) -> String {
-            format!(r#"<w:tc><w:tcPr>{properties}</w:tcPr><w:p><w:r><w:rPr>{run_properties}</w:rPr><w:t xml:space="preserve">{text}</w:t></w:r></w:p></w:tc>"#)
+            format!(
+                r#"<w:tc><w:tcPr>{properties}</w:tcPr><w:p><w:r><w:rPr>{run_properties}</w:rPr><w:t xml:space="preserve">{text}</w:t></w:r></w:p></w:tc>"#
+            )
         }
 
         /// A two-row table in a style that hides its header row and colours its text white.
@@ -468,34 +494,50 @@ mod tests {
         pub fn shaded_cells(cells: &[(&str, &str, &str)]) -> Vec<u8> {
             let cells: String = cells
                 .iter()
-                .map(|(fill, colour, text)| cell(text, &format!(r#"<w:shd w:val="clear" w:fill="{fill}"/>"#), &format!(r#"<w:color w:val="{colour}"/>"#)))
+                .map(|(fill, colour, text)| {
+                    cell(text, &format!(r#"<w:shd w:val="clear" w:fill="{fill}"/>"#), &format!(r#"<w:color w:val="{colour}"/>"#))
+                })
                 .collect();
             zip(&format!("<w:tbl><w:tblPr/><w:tblGrid><w:gridCol/><w:gridCol/></w:tblGrid><w:tr>{cells}</w:tr></w:tbl><w:p/>"), None)
         }
 
         /// A table in a black cell; the inner cell has no shading of its own.
         pub fn nested_in_black_cell(text: &str) -> Vec<u8> {
-            let inner = format!("<w:tbl><w:tblPr/><w:tblGrid><w:gridCol/></w:tblGrid><w:tr>{}</w:tr></w:tbl><w:p/>", cell(text, "", r#"<w:color w:val="000000"/>"#));
-            let outer = format!(r#"<w:tbl><w:tblPr/><w:tblGrid><w:gridCol/></w:tblGrid><w:tr><w:tc><w:tcPr><w:shd w:val="clear" w:fill="000000"/></w:tcPr>{inner}</w:tc></w:tr></w:tbl><w:p/>"#);
+            let inner = format!(
+                "<w:tbl><w:tblPr/><w:tblGrid><w:gridCol/></w:tblGrid><w:tr>{}</w:tr></w:tbl><w:p/>",
+                cell(text, "", r#"<w:color w:val="000000"/>"#)
+            );
+            let outer = format!(
+                r#"<w:tbl><w:tblPr/><w:tblGrid><w:gridCol/></w:tblGrid><w:tr><w:tc><w:tcPr><w:shd w:val="clear" w:fill="000000"/></w:tcPr>{inner}</w:tc></w:tr></w:tbl><w:p/>"#
+            );
             zip(&outer, None)
         }
 
         /// `styles` character styles, and `runs` runs each in one of them.
         pub fn many_styles(styles: usize, runs: usize) -> Vec<u8> {
-            let extra: String = (0..styles).map(|index| format!(r#"<w:style w:type="character" w:styleId="C{index}"><w:name w:val="c{index}"/></w:style>"#)).collect();
-            let body: String = (0..runs).map(|index| format!(r#"<w:r><w:rPr><w:rStyle w:val="C{}"/></w:rPr><w:t>x</w:t></w:r>"#, styles - 1 - index % styles)).collect();
+            let extra: String = (0..styles)
+                .map(|index| format!(r#"<w:style w:type="character" w:styleId="C{index}"><w:name w:val="c{index}"/></w:style>"#))
+                .collect();
+            let body: String = (0..runs)
+                .map(|index| format!(r#"<w:r><w:rPr><w:rStyle w:val="C{}"/></w:rPr><w:t>x</w:t></w:r>"#, styles - 1 - index % styles))
+                .collect();
             build(&format!("<w:p>{body}</w:p>"), None, &extra, "")
         }
 
         /// `lists` lists, and `items` paragraphs in the last of them.
         pub fn many_lists(lists: usize, items: usize) -> Vec<u8> {
             let nums: String = (2..lists + 2).map(|id| format!(r#"<w:num w:numId="{id}"><w:abstractNumId w:val="0"/></w:num>"#)).collect();
-            let body: String = (0..items).map(|_| format!(r#"<w:p><w:pPr><w:numPr><w:ilvl w:val="0"/><w:numId w:val="{}"/></w:numPr></w:pPr></w:p>"#, lists + 1)).collect();
+            let body: String = (0..items)
+                .map(|_| format!(r#"<w:p><w:pPr><w:numPr><w:ilvl w:val="0"/><w:numId w:val="{}"/></w:numPr></w:pPr></w:p>"#, lists + 1))
+                .collect();
             build(&body, None, "", &nums)
         }
 
         pub fn runs(runs: &[(&str, &str)]) -> Vec<u8> {
-            let body: String = runs.iter().map(|(text, properties)| format!(r#"<w:r><w:rPr>{properties}</w:rPr><w:t xml:space="preserve">{text}</w:t></w:r>"#)).collect();
+            let body: String = runs
+                .iter()
+                .map(|(text, properties)| format!(r#"<w:r><w:rPr>{properties}</w:rPr><w:t xml:space="preserve">{text}</w:t></w:r>"#))
+                .collect();
             zip(&format!("<w:p>{body}</w:p>"), None)
         }
     }

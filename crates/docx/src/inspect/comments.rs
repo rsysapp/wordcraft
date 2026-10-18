@@ -60,7 +60,14 @@ pub(super) fn read_with(comments: &XEl, extended: Option<&XEl>, canon: &Canon<'_
     read
 }
 
-fn read_held(comments: &XEl, extended: Option<&XEl>, canon: &Canon<'_>, budget: &mut Budget, map_held: &mut u64, detailed: bool) -> Result<Comments, String> {
+fn read_held(
+    comments: &XEl,
+    extended: Option<&XEl>,
+    canon: &Canon<'_>,
+    budget: &mut Budget,
+    map_held: &mut u64,
+    detailed: bool,
+) -> Result<Comments, String> {
     if &*comments.name != "w:comments" {
         return Err("a comments part without w:comments".into());
     }
