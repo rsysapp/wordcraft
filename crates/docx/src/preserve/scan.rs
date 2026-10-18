@@ -23,7 +23,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::ops::Range;
 use std::sync::Arc;
 
-use wordcraft_doc::para::OBJ;
+use wordcraft_doc::para::{OBJ, PTabAlign, PTabBase};
 use wordcraft_doc::table::{MAX_COLS, MAX_ROWS};
 
 use super::tree::{PEl, PKid};
@@ -1766,7 +1766,17 @@ impl Scanner<'_> {
                 }
             }
             "w:t" | "w:delText" => self.text(ctx, story, b, element, node, lock),
-            "w:tab" | "w:ptab" => self.single(story, b, element, node, lock, '\t'),
+            "w:tab" => self.single(story, b, element, node, lock, '\t'),
+            // As the reader: a positional tab with its required alignment and base is an object
+            // (copied whole, as `w:pgNum`); without them it is a plain tab.
+            "w:ptab"
+                if element.attr("w:alignment").and_then(PTabAlign::from_ooxml).is_some()
+                    && element.attr("w:relativeTo").and_then(PTabBase::from_ooxml).is_some() =>
+            {
+                let child = other(b);
+                emit(story, b, object(locked(node, lock, child)));
+            }
+            "w:ptab" => self.single(story, b, element, node, lock, '\t'),
             // A break inside a field's instruction is part of the code, not content (the reader's).
             "w:br" | "w:cr" if story.fields.iter().any(|field| !field.result) => {
                 other(b);
@@ -2991,12 +3001,13 @@ mod tests {
         );
         let scanned = scans_as_read(&bytes);
         let paragraph = body_paragraph(&scanned, 0);
-        // a; five one-character children; b, a space for the carriage return, c (control characters,
+        // a; the positional tab, an object as the reader reads it (locked); four one-character
+        // children; b, a space for the carriage return, c (control characters,
         // U+FFFC and the unknown reference dropped); CDATA and a w:t holding an element, copied
         // whole; the page number; the bidi text; the move; the ruby (base and ruby text, one object);
         // an equation; the two of one paragraph of equations, which share their node and so are
         // locked; the second w:pPr is content, not properties.
-        assert_eq!(kinds(paragraph), ["T", "SSSSS", "TTT", "LL", "LL", "L", "TTTT", "T", "TTTTT", "TTTTT", "L", "A", "LL"].concat());
+        assert_eq!(kinds(paragraph), ["T", "L", "SSSS", "TTT", "LL", "LL", "L", "TTTT", "T", "TTTTT", "TTTTT", "L", "A", "LL"].concat());
         let kinds: Vec<WrapperKind> = paragraph.wrappers.iter().map(|wrapper| wrapper.kind).collect();
         assert_eq!(kinds, vec![WrapperKind::Other, WrapperKind::Other, WrapperKind::Deleted, WrapperKind::Inserted]);
         let Node::Run(first) = &paragraph.nodes[0] else { panic!("a run") };
@@ -3006,7 +3017,7 @@ mod tests {
         assert!(matches!(first.children[9].kind, ChildKind::Other { .. }), "CDATA is copied whole");
         assert!(matches!(paragraph.nodes.last(), Some(Node::Other { name, .. }) if name == "w:pPr"));
         assert!(paragraph.ppr.is_some());
-        assert_eq!(paragraph.editable(), vec![0..9, 14..29]);
+        assert_eq!(paragraph.editable(), vec![0..1, 2..9, 14..29]);
     }
 
     /// 6C-18: nothing inside a field is edited where it stands: a field's result that spills over a
