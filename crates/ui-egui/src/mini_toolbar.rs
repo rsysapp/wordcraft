@@ -108,6 +108,11 @@ pub fn visible(app: &WordApp) -> bool {
     if app.session.view.read_mode {
         return false;
     }
+    // An embedded editor shows it only where its buttons run: view mode and edit mode without
+    // full editing refuse formatting, and a host's jump selects text there (Clauflow #41).
+    if !app.profile.allows_editing() && !app.session.edit_rules().is_some_and(|rules| rules.full) {
+        return false;
+    }
     // Never over a modal dialog or the Backstage.
     if app.dialog.is_some() || app.colors.is_some() || app.ui.backstage {
         return false;

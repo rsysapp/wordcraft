@@ -1240,3 +1240,34 @@ fn an_edit_sessions_save_keeps_names_and_dates_where_the_document_asks_to_remove
     assert!(document.contains(&format!(r#"w:date="{DATE}""#)), "{document}");
     assert!(!document.contains(r#"w:author="Author""#), "{document}");
 }
+
+/// Whether the mini toolbar was drawn in the last frame (`mini_toolbar::shown_id` is written only
+/// when it is).
+fn mini_toolbar_drawn(harness: &Harness<'static, WordApp>) -> bool {
+    harness.ctx.data(|data| data.get_temp::<[egui::Rect; 2]>(wordcraft_ui_egui::mini_toolbar::shown_id()).is_some())
+}
+
+/// The mini toolbar's buttons format, so it appears only where formatting runs: in full editing.
+/// A host's jump selects the passage it finds; in view mode or edit mode without `fullEditing`
+/// that selection drew a bar whose every button is refused (Clauflow #41).
+#[test]
+fn the_mini_toolbar_appears_only_where_formatting_runs() {
+    let (mut harness, bridge) = opened();
+    bridge.send(HostCommand::JumpTo(rent()));
+    harness.run_steps(4);
+    assert!(!harness.state().session.sel.is_collapsed(), "the jump selected the passage");
+    assert!(!wordcraft_ui_egui::mini_toolbar::visible(harness.state()) && !mini_toolbar_drawn(&harness), "view mode");
+
+    let (mut harness, bridge) = editing(true);
+    bridge.send(HostCommand::JumpTo(rent()));
+    harness.run_steps(4);
+    assert!(!harness.state().session.sel.is_collapsed());
+    assert!(!wordcraft_ui_egui::mini_toolbar::visible(harness.state()) && !mini_toolbar_drawn(&harness), "edit mode without fullEditing");
+
+    let (mut harness, bridge) = opened();
+    bridge.send(edit_request(&format!(r#"{EDIT_JSON},"fullEditing":true}}}}"#)));
+    harness.run_steps(3);
+    bridge.send(HostCommand::JumpTo(rent()));
+    harness.run_steps(4);
+    assert!(wordcraft_ui_egui::mini_toolbar::visible(harness.state()) && mini_toolbar_drawn(&harness), "full editing keeps it");
+}
