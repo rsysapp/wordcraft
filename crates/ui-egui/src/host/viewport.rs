@@ -11,7 +11,7 @@ use wordcraft_doc::{Block, Blocks, Document, MAX_TABLE_DEPTH, Path, Pos, StoryRe
 use wordcraft_docx::facts::Locator;
 use wordcraft_layout::DocLayout;
 
-use super::wire::BlockRef;
+use super::wire::{BlockRef, LocateRequest};
 use crate::WordApp;
 
 /// What the host page can know of the view; the unit `Viewport` events are made from.
@@ -62,6 +62,8 @@ pub(crate) struct ViewportState {
     /// The token of a `scrollToBlock` not yet answered; the `viewport` that follows the scroll
     /// carries it, and clears it.
     pub(crate) scroll_token: Option<u32>,
+    /// `locate` requests not answered yet: they wait for a document that is open and laid out.
+    pub(crate) pending_locates: Vec<LocateRequest>,
     /// The last reading the host was told; `None` until the first after an open.
     pub(crate) last: Option<ViewKey>,
     /// The person's own input reached the canvas this frame (`state::person_input`).
@@ -94,6 +96,13 @@ impl ViewportState {
             self.locator_version = content_version;
         }
         self.locator.as_ref()
+    }
+
+    /// The index of the top-level body block that `block` names, which is what `block_bounds` takes.
+    /// `None` when the document has no such part or paragraph.
+    fn top_level_block(&mut self, doc: &Document, content_version: u64, block: &BlockRef) -> Option<usize> {
+        let path = self.locator_for(doc, content_version)?.path(&block.part, block.index)?;
+        usize::try_from(Locator::block_of(&path).0.first().copied()?).ok()
     }
 }
 
@@ -252,9 +261,26 @@ pub(crate) fn target(app: &mut WordApp, viewport: &mut ViewportState, block: &Bl
     let content_version = app.session.content_version();
     let layout = app.session.layout();
     let doc = &app.session.doc;
-    let path = viewport.locator_for(doc, content_version)?.path(&block.part, block.index)?;
-    let top_level = Locator::block_of(&path).0.first().copied()?;
+    let top_level = viewport.top_level_block(doc, content_version, block)?;
     let starts = page_starts(&layout);
-    let (top, bottom) = block_bounds(doc, &layout, &starts, usize::try_from(top_level).ok()?)?;
+    let (top, bottom) = block_bounds(doc, &layout, &starts, top_level)?;
     on_page(&starts, top + fraction.clamp(0.0, 1.0) * (bottom - top))
+}
+
+/// The top of each of `blocks` on the stacked axis `read` and `target` use, in the request's order
+/// (`None` for a block the document lacks or has nothing laid out for), and the height of all the
+/// pages on that axis. The layout is taken once for the whole request.
+pub(crate) fn locate(app: &mut WordApp, viewport: &mut ViewportState, blocks: &[BlockRef]) -> (Vec<Option<f32>>, f32) {
+    let content_version = app.session.content_version();
+    let layout = app.session.layout();
+    let doc = &app.session.doc;
+    let starts = page_starts(&layout);
+    let positions = blocks
+        .iter()
+        .map(|block| {
+            let top_level = viewport.top_level_block(doc, content_version, block)?;
+            block_bounds(doc, &layout, &starts, top_level).map(|(top, _)| top)
+        })
+        .collect();
+    (positions, starts.last().copied().unwrap_or(0.0))
 }

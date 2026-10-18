@@ -278,6 +278,8 @@ pub(crate) fn before_frame(app: &mut WordApp, ctx: &egui::Context) {
             HostCommand::RequestSave => super::edit::save(app, &mut host),
             HostCommand::SetZoom(request) => set_zoom(app, &mut host, &request),
             HostCommand::ScrollToBlock(request) => scroll_to_block(app, &mut host, &request),
+            // Answered after the frame, once a document is open and laid out; moves nothing.
+            HostCommand::Locate(request) => host.viewport.pending_locates.push(request),
         }
     }
     // A host call replaces a glide the person's input started; the move is the host's from here.
@@ -335,6 +337,19 @@ fn scroll_to_block(app: &mut WordApp, host: &mut HostState, request: &ScrollRequ
     app.canvas.scroll_to_doc = Some((page, y));
     host.aim(page, y);
     host.viewport.scroll_token = Some(request.token);
+}
+
+/// Answer the `locate` requests waiting, in the order they came, once a document is open: the layout
+/// is made on demand, so an open document has one. Before that they wait, as a jump's host waits for
+/// `opened`.
+fn answer_locates(app: &mut WordApp, host: &mut HostState) {
+    if !host.opened || host.viewport.pending_locates.is_empty() {
+        return;
+    }
+    for request in std::mem::take(&mut host.viewport.pending_locates) {
+        let (positions, height) = super::viewport::locate(app, &mut host.viewport, &request.blocks);
+        host.bridge.emit(HostEvent::Located { positions, height, token: request.token });
+    }
 }
 
 /// How long after the person's input a move still counts as theirs when none has begun: a key's
@@ -445,6 +460,7 @@ pub(crate) fn after_frame(app: &mut WordApp, ctx: &egui::Context) {
     }
     report_zoom(app, &mut host);
     report_viewport(app, &mut host, ctx);
+    answer_locates(app, &mut host);
     // Selecting is part of editing: no selection events in edit mode (embed API 0.2).
     if host.edit.is_none() {
         settle_selection(app, &mut host, ctx);

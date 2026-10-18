@@ -61,6 +61,8 @@ export interface BlockRef {
 
 export type ScrollRequest = { block: BlockRef; fraction: number; token: number };
 
+export type LocateRequest = { blocks: BlockRef[]; token: number };
+
 export type EditorEvent =
     | { type: 'opened'; pages: number }
     | { type: 'openFailed'; message: string }
@@ -78,6 +80,7 @@ export type EditorEvent =
     | { type: 'zoomChanged'; percent: number; pageWidth: boolean; cause: 'user' | 'host'; token: number | null }
     | { type: 'viewport'; top: BlockRef | null; fraction: number; visibleHeight: number; page: number; pages: number; cause: 'user' | 'host'; token: number | null }
     | { type: 'blockNotFound'; block: BlockRef; token: number }
+    | { type: 'located'; positions: (number | null)[]; height: number; token: number }
     | { type: 'redactionsPending'; marks: number }
     | { type: 'editRefused'; code: EditRefusalCode };
 
@@ -121,6 +124,7 @@ mod tests {
             "export type ZoomRequest = { zoom: number | 'pageWidth'; token: number };",
             "export interface BlockRef { part: string; index: number; }",
             "export type ScrollRequest = { block: BlockRef; fraction: number; token: number };",
+            "export type LocateRequest = { blocks: BlockRef[]; token: number };",
             "export type EditorEvent = | { type: 'opened'; pages: number } | { type: 'openFailed'; message: string } \
              | { type: 'pageChanged'; page: number } \
              | { type: 'selection'; text: string; copyText: string; page: number | null; x: number; y: number } \
@@ -132,6 +136,7 @@ mod tests {
              | { type: 'zoomChanged'; percent: number; pageWidth: boolean; cause: 'user' | 'host'; token: number | null } \
              | { type: 'viewport'; top: BlockRef | null; fraction: number; visibleHeight: number; page: number; pages: number; cause: 'user' | 'host'; token: number | null } \
              | { type: 'blockNotFound'; block: BlockRef; token: number } \
+             | { type: 'located'; positions: (number | null)[]; height: number; token: number } \
              | { type: 'redactionsPending'; marks: number } | { type: 'editRefused'; code: EditRefusalCode };",
             "export type EditRefusalCode = | 'command_not_allowed' | 'decision_not_allowed' | 'paragraph_break_not_supported' \
              | 'character_not_allowed' | 'outside_editable_story' | 'invalid_edit_session' \
@@ -181,6 +186,10 @@ mod tests {
             (
                 "scrollToBlock",
                 "#[wasm_bindgen(js_name = scrollToBlock)] pub fn scroll_to_block(&self, #[wasm_bindgen(unchecked_param_type = \"ScrollRequest\")] request: JsValue)",
+            ),
+            (
+                "locate",
+                "#[wasm_bindgen(js_name = locate)] pub fn locate(&self, #[wasm_bindgen(unchecked_param_type = \"LocateRequest\")] request: JsValue)",
             ),
             ("requestSave", "#[wasm_bindgen(js_name = requestSave)] pub fn request_save(&self) {"),
             ("applyRedactions", "#[wasm_bindgen(js_name = applyRedactions)] pub fn apply_redactions(&self) {"),

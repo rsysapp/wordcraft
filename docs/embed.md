@@ -154,7 +154,8 @@ editor.destroy();
 `EmbeddedEditor`'s methods are `static mount(canvas, options)`, `open(bytes, fileName, options?)`,
 `jumpTo(target)`, `setMarks(marks)`, `setTheme(theme)`, `setListener(listener)`, `destroy()` and,
 from API 0.2, `setMode(request: ModeRequest)`, `requestSave()` and `applyRedactions()` and, from API
-0.3, `setZoom(request: ZoomRequest)` and `scrollToBlock(request: ScrollRequest)`. The types,
+0.3, `setZoom(request: ZoomRequest)`, `scrollToBlock(request: ScrollRequest)` and
+`locate(request: LocateRequest)`. The types,
 as `wordcraft_embed.d.ts` declares them (the package script fails if a declaration is missing):
 
 ```ts
@@ -209,6 +210,8 @@ export interface BlockRef {
 
 export type ScrollRequest = { block: BlockRef; fraction: number; token: number };
 
+export type LocateRequest = { blocks: BlockRef[]; token: number };
+
 export type EditorEvent =
     | { type: 'opened'; pages: number }
     | { type: 'openFailed'; message: string }
@@ -226,6 +229,7 @@ export type EditorEvent =
     | { type: 'zoomChanged'; percent: number; pageWidth: boolean; cause: 'user' | 'host'; token: number | null }
     | { type: 'viewport'; top: BlockRef | null; fraction: number; visibleHeight: number; page: number; pages: number; cause: 'user' | 'host'; token: number | null }
     | { type: 'blockNotFound'; block: BlockRef; token: number }
+    | { type: 'located'; positions: (number | null)[]; height: number; token: number }
     | { type: 'redactionsPending'; marks: number }
     | { type: 'editRefused'; code: EditRefusalCode };
 
@@ -467,6 +471,29 @@ queues nothing.
 - **View mode's command gate is unchanged.** The scroll is applied by the editor's host state; the
   commands view mode refuses stay refused.
 
+### Locate
+
+`locate({ blocks, token })` asks where blocks start, so a host can draw a strip of the document's
+changes beside the view. The answer is one `{ type: 'located', positions, height, token }`:
+
+- **`positions`** has one entry per requested block, in the request's order: the top of the block's
+  first line, in document points (layout points, 1/72 inch), along the pages stacked one above the
+  next. `null` where the document has no such block: no such part or index, or a block with nothing
+  laid out (wording the clean display removed). A block cut by a page break, or a table, is one block
+  and has one top. A table's every paragraph is placed at the table's top, as `scrollToBlock` treats
+  it.
+- **`height`** is the height of all the pages on the same axis, the end of the last page. The page
+  gap the canvas draws between pages is screen spacing that changes with the zoom and is **not** part
+  of the axis: positions do not move when the zoom does. It is the axis `viewport`'s `visibleHeight`
+  is measured on, so `visibleHeight / height` is the part of the document the view shows.
+- **`token`** is the request's, a whole number the host chooses.
+- **When.** A `locate` sent before a document is open and laid out is held and answered once it is,
+  after `opened`. Each request is answered once; positions are not updated as the document changes,
+  so ask again after an edit. Locating moves nothing, selects nothing and sends no `viewport`.
+- **Limits.** At most 10,000 blocks per request; more, a missing `blocks` or `token`, or a `token`
+  or `index` that is not a whole number of zero or more throws a `TypeError` and queues nothing.
+- **View mode's command gate is unchanged.** The positions are read by the editor's host state.
+
 ## Behaviour a host page relies on
 
 - Call the module's default export (`init`) before `EmbeddedEditor.mount`. `mount` applies the
@@ -531,6 +558,7 @@ queues nothing.
 ## Limits
 
 - `setMarks` keeps the first 2,000 marks (`MAX_MARKS`) and ignores the rest.
+- `locate` takes at most 10,000 blocks (`MAX_LOCATE_BLOCKS`); more throws a `TypeError`.
 - Passages are at most 256 KiB of UTF-8 as sent (`MAX_RAW_PASSAGE_BYTES`, checked before anything
   is folded) and 10,000 characters once folded (`MAX_NEEDLE_CHARS`): a longer mark is skipped, a
   longer text jump answers `jumpNotFound`.

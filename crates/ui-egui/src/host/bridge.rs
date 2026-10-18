@@ -6,7 +6,7 @@ use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 use serde::Serialize;
 
-use super::wire::{BlockRef, JumpTarget, MarkSpec, ModeRequest, OpenOptions, ScrollRequest, ThemeSpec, ZoomRequest};
+use super::wire::{BlockRef, JumpTarget, LocateRequest, MarkSpec, ModeRequest, OpenOptions, ScrollRequest, ThemeSpec, ZoomRequest};
 
 /// What a host page asks of the editor.
 #[derive(Clone, Debug, PartialEq)]
@@ -31,6 +31,9 @@ pub enum HostCommand {
     /// Put a fraction of a block at the top of the view; answered by `Viewport` carrying the
     /// request's token, or `BlockNotFound`. Embed API 0.3.
     ScrollToBlock(ScrollRequest),
+    /// Where blocks start along the stacked pages; answered by `Located` carrying the request's
+    /// token once the document is laid out. Embed API 0.3.
+    Locate(LocateRequest),
 }
 
 /// What the editor tells the host page; serialises to the embed API's `EditorEvent`.
@@ -114,6 +117,15 @@ pub enum HostEvent {
     /// `scrollToBlock` named a block the open document does not have (or has no layout for).
     BlockNotFound {
         block: BlockRef,
+        token: u32,
+    },
+    /// The answer to `locate` (embed API 0.3): the top of each requested block in layout points
+    /// along the pages stacked without gaps (`None` for a block the document lacks or has nothing
+    /// laid out for), in the request's order, and the height of all the pages, the same axis the
+    /// `viewport` event's `visible_height` is measured on.
+    Located {
+        positions: Vec<Option<f32>>,
+        height: f32,
         token: u32,
     },
     /// An action refused in edit mode, once per action, by its stable code (`edit_mode::Refusal`).
@@ -336,6 +348,10 @@ mod tests {
             (
                 HostEvent::BlockNotFound { block: BlockRef { part: "word/document.xml".into(), index: 999 }, token: 4 },
                 json!({"type": "blockNotFound", "block": {"part": "word/document.xml", "index": 999}, "token": 4}),
+            ),
+            (
+                HostEvent::Located { positions: vec![Some(12.5), None, Some(800.0)], height: 1584.0, token: 5 },
+                json!({"type": "located", "positions": [12.5, null, 800.0], "height": 1584.0, "token": 5}),
             ),
             (HostEvent::SaveFailed { message: "m".into() }, json!({"type": "saveFailed", "message": "m"})),
             (HostEvent::EditRefused { code: "command_not_allowed".into() }, json!({"type": "editRefused", "code": "command_not_allowed"})),

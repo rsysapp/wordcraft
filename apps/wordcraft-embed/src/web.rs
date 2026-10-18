@@ -137,6 +137,18 @@ impl EmbeddedEditor {
         Ok(())
     }
 
+    /// Asks where blocks start along the stacked pages, for a host's change strip. Answered by one
+    /// `located` event with the request's `token` once a document is open and laid out; at most
+    /// 10,000 blocks, more throws a `TypeError`. Moves nothing.
+    #[wasm_bindgen(js_name = locate)]
+    pub fn locate(&self, #[wasm_bindgen(unchecked_param_type = "LocateRequest")] request: JsValue) -> Result<(), JsValue> {
+        check_counts(&request, &["token"], "locate")?;
+        check_locate_blocks(&request)?;
+        let request = wire::parse_locate_request(&json_of(&request)?).map_err(|e| type_error(&e))?;
+        self.send(HostCommand::Locate(request));
+        Ok(())
+    }
+
     /// Serialises the document; answered by `saveRequested` or `saveFailed`.
     #[wasm_bindgen(js_name = requestSave)]
     pub fn request_save(&self) {
@@ -385,6 +397,30 @@ fn check_mark_pages(marks: &JsValue) -> Result<(), JsValue> {
     for index in 0..count {
         let mark = js_sys::Reflect::get_u32(marks, index).map_err(|_| type_error(&format!("setMarks: mark {index} could not be read")))?;
         check_counts(&mark, &["page"], "setMarks")?;
+    }
+    Ok(())
+}
+
+/// `check_counts` for each block's `index` of a `locate` request, and a refusal of a list past the
+/// limit before any of it is serialised. Reads go through `Reflect::get` for the reason
+/// `check_mark_pages` gives. A `blocks` without a usable `length` is left to the parser, which
+/// refuses anything but an array.
+fn check_locate_blocks(request: &JsValue) -> Result<(), JsValue> {
+    if !request.is_object() {
+        return Ok(());
+    }
+    let blocks = js_sys::Reflect::get(request, &JsValue::from_str("blocks")).map_err(|_| type_error("locate: blocks could not be read"))?;
+    if !blocks.is_object() {
+        return Ok(());
+    }
+    let length = js_sys::Reflect::get(&blocks, &JsValue::from_str("length")).map_err(|_| type_error("locate: length could not be read"))?;
+    let Some(length) = length.as_f64().filter(|length| length.is_finite() && *length >= 0.0) else { return Ok(()) };
+    if length > wire::MAX_LOCATE_BLOCKS as f64 {
+        return Err(type_error(&format!("locate: {length} blocks is more than the {} allowed", wire::MAX_LOCATE_BLOCKS)));
+    }
+    for index in 0..length as u32 {
+        let block = js_sys::Reflect::get_u32(&blocks, index).map_err(|_| type_error(&format!("locate: block {index} could not be read")))?;
+        check_counts(&block, &["index"], "locate")?;
     }
     Ok(())
 }

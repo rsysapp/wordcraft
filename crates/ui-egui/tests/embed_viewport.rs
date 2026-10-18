@@ -7,7 +7,7 @@ mod common;
 use common::*;
 use egui_kittest::Harness;
 use wordcraft_ui_egui::WordApp;
-use wordcraft_ui_egui::host::{BlockRef, Cause, HostCommand, HostEvent, JumpTarget, ScrollRequest, ZoomRequest, ZoomValue};
+use wordcraft_ui_egui::host::{BlockRef, Cause, HostCommand, HostEvent, JumpTarget, LocateRequest, ScrollRequest, ZoomRequest, ZoomValue};
 
 const BODY: &str = "word/document.xml";
 
@@ -257,4 +257,124 @@ fn a_block_cut_by_a_page_break_is_one_block_and_a_fraction_of_it_lands_on_its_se
         "the view is on the block's later page, not its first: page {page}, block starts on page {}",
         first_page + 1
     );
+}
+
+fn located(events: Vec<HostEvent>, token: u32) -> Option<(Vec<Option<f32>>, f32)> {
+    events.into_iter().find_map(|event| match event {
+        HostEvent::Located { positions, height, token: answered } if answered == token => Some((positions, height)),
+        _ => None,
+    })
+}
+
+#[test]
+fn located_positions_rise_through_the_document_and_unknown_blocks_are_null() {
+    let (mut h, bridge) = embed_app();
+    open_doc(&mut h, &bridge, &clauses(120));
+    bridge.take_events();
+    let blocks = [0, 60, 119, 999].map(block).to_vec();
+    bridge.send(HostCommand::Locate(LocateRequest { blocks, token: 5 }));
+    frames(&mut h, 2);
+    let (positions, height) = located(bridge.take_events(), 5).expect("located");
+    assert_eq!(positions.len(), 4);
+    assert!(positions[0].unwrap() < positions[1].unwrap() && positions[1].unwrap() < positions[2].unwrap(), "{positions:?}");
+    assert!(positions[2].unwrap() < height, "{positions:?} in {height}");
+    assert_eq!(positions[3], None);
+}
+
+#[test]
+fn located_positions_use_the_axis_the_viewport_measures() {
+    // The strip draws the view as visibleHeight of `height`; so a block scrolled to the top of the
+    // view must be at its located position along the same stacked pages.
+    let (mut h, bridge) = embed_app();
+    open_doc(&mut h, &bridge, &clauses(120));
+    let count = pages(&mut h) as f32;
+    bridge.send(HostCommand::Locate(LocateRequest { blocks: vec![block(0), block(119)], token: 1 }));
+    frames(&mut h, 2);
+    let (positions, height) = located(bridge.take_events(), 1).expect("located");
+    // 612 x 792 points a page in the test document.
+    assert!((height - count * 792.0).abs() < 1.0, "{height} for {count} pages");
+    assert!(positions[0].unwrap() < 100.0, "the first block is at the top of page one: {positions:?}");
+    assert!(positions[1].unwrap() > (count - 1.0) * 792.0, "the last block is on the last page: {positions:?}");
+}
+
+#[test]
+fn every_paragraph_of_a_table_is_located_at_the_tables_top() {
+    use std::sync::Arc;
+    use wordcraft_doc::props::CharProps;
+    use wordcraft_doc::{Block, Document, Paragraph, Table, para_block};
+    let line = |text: &str| Paragraph::with_text(text, CharProps::default());
+    let mut table = Table::new(2, 1, 300.0);
+    table.rows[0].cells[0].blocks = vec![para_block(line("Fee schedule"))];
+    table.rows[1].cells[0].blocks = vec![para_block(line("Late fee"))];
+    let mut body: Vec<_> = (0..60).map(|i| para_block(line(&format!("Clause {i}. The Supplier shall deliver the goods in Schedule {i}.")))).collect();
+    body.push(Arc::new(Block::Table(table)));
+    body.extend((60..120).map(|i| para_block(line(&format!("Clause {i}. The Supplier shall deliver the goods in Schedule {i}.")))));
+    let mut doc = Document::new();
+    doc.body = body;
+    let (mut h, bridge) = embed_app();
+    open_doc(&mut h, &bridge, &doc);
+    bridge.take_events();
+    // Body paragraph 60 opens the table, 61 is its second row: one top-level block, one place.
+    bridge.send(HostCommand::Locate(LocateRequest { blocks: vec![block(59), block(60), block(61), block(62)], token: 2 }));
+    frames(&mut h, 2);
+    let (positions, _) = located(bridge.take_events(), 2).expect("located");
+    let [before, first, second, after] = positions[..] else { panic!("{positions:?}") };
+    assert_eq!(first, second, "{positions:?}");
+    assert!(before.unwrap() < first.unwrap() && first.unwrap() < after.unwrap(), "{positions:?}");
+}
+
+#[test]
+fn a_locate_before_a_document_is_open_is_answered_once_it_is_laid_out() {
+    let (mut h, bridge) = embed_app();
+    bridge.send(HostCommand::Locate(LocateRequest { blocks: vec![block(3)], token: 8 }));
+    frames(&mut h, 3);
+    assert!(located(bridge.take_events(), 8).is_none(), "nothing is open yet: no answer, not a null one");
+    let events = open_doc(&mut h, &bridge, &clauses(30));
+    let opened = events.iter().position(|event| matches!(event, HostEvent::Opened { .. })).expect("opened");
+    let answered = events.iter().position(|event| matches!(event, HostEvent::Located { token: 8, .. })).expect("located after the open");
+    assert!(opened < answered, "{events:?}");
+    let (positions, _) = located(events, 8).unwrap();
+    assert!(positions[0].is_some());
+}
+
+#[test]
+fn a_locate_is_answered_once() {
+    let (mut h, bridge) = embed_app();
+    open_doc(&mut h, &bridge, &clauses(30));
+    bridge.take_events();
+    bridge.send(HostCommand::Locate(LocateRequest { blocks: vec![block(0)], token: 3 }));
+    frames(&mut h, 5);
+    let answers = bridge.take_events().into_iter().filter(|event| matches!(event, HostEvent::Located { .. })).count();
+    assert_eq!(answers, 1);
+}
+
+#[test]
+fn locating_moves_nothing_and_says_nothing_of_the_view() {
+    let (mut h, bridge) = embed_app();
+    open_doc(&mut h, &bridge, &clauses(120));
+    bridge.take_events();
+    bridge.send(HostCommand::Locate(LocateRequest { blocks: vec![block(100)], token: 4 }));
+    frames(&mut h, 4);
+    let events = bridge.take_events();
+    assert!(viewports(events).is_empty(), "locate does not scroll");
+}
+
+#[test]
+fn an_empty_locate_is_answered_with_the_height() {
+    let (mut h, bridge) = embed_app();
+    open_doc(&mut h, &bridge, &clauses(120));
+    bridge.take_events();
+    bridge.send(HostCommand::Locate(LocateRequest { blocks: Vec::new(), token: 6 }));
+    frames(&mut h, 2);
+    let (positions, height) = located(bridge.take_events(), 6).expect("located");
+    assert!(positions.is_empty() && height > 0.0);
+}
+
+#[test]
+fn locate_refuses_more_than_ten_thousand_blocks() {
+    let blocks: Vec<_> = (0..10_001).map(|index| serde_json::json!({"part": BODY, "index": index})).collect();
+    assert!(wordcraft_ui_egui::host::wire::parse_locate_request(&serde_json::json!({"blocks": blocks, "token": 1}).to_string()).is_err());
+    let blocks: Vec<_> = (0..10_000).map(|index| serde_json::json!({"part": BODY, "index": index})).collect();
+    let request = wordcraft_ui_egui::host::wire::parse_locate_request(&serde_json::json!({"blocks": blocks, "token": 1}).to_string()).unwrap();
+    assert_eq!(request.blocks.len(), 10_000);
 }

@@ -139,6 +139,7 @@ for want in \
   'setMode(request: ModeRequest): void;' \
   'setZoom(request: ZoomRequest): void;' \
   'scrollToBlock(request: ScrollRequest): void;' \
+  'locate(request: LocateRequest): void;' \
   'requestSave(): void;' \
   'applyRedactions(): void;' \
   'export interface MountOptions' \
@@ -148,6 +149,8 @@ for want in \
   'export type ZoomRequest' \
   'export interface BlockRef' \
   'export type ScrollRequest' \
+  'export type LocateRequest' \
+  "{ type: 'located'; positions: (number | null)[]; height: number; token: number }" \
   "{ type: 'viewport'; top: BlockRef | null; fraction: number; visibleHeight: number; page: number; pages: number; cause: 'user' | 'host'; token: number | null }" \
   "{ type: 'blockNotFound'; block: BlockRef; token: number }" \
   'export interface Theme' \

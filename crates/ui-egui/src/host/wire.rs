@@ -234,6 +234,27 @@ pub fn parse_scroll_request(json: &str) -> Result<ScrollRequest, String> {
     Ok(request)
 }
 
+/// The most blocks one `locate` may ask about: a change strip places every change of a comparison,
+/// and a request beyond this is a mistake, not a long document.
+pub const MAX_LOCATE_BLOCKS: usize = 10_000;
+
+/// `locate`'s request (embed API 0.3): where each of `blocks` starts, answered by `located` with the
+/// host's `token`.
+#[derive(Clone, Debug, PartialEq, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LocateRequest {
+    pub blocks: Vec<BlockRef>,
+    pub token: u32,
+}
+
+pub fn parse_locate_request(json: &str) -> Result<LocateRequest, String> {
+    let request: LocateRequest = serde_json::from_str(json).map_err(|error| format!("locate: {error}"))?;
+    if request.blocks.len() > MAX_LOCATE_BLOCKS {
+        return Err(format!("locate: {} blocks is more than the {MAX_LOCATE_BLOCKS} allowed", request.blocks.len()));
+    }
+    Ok(request)
+}
+
 pub fn parse_open_options(json: &str) -> Result<OpenOptions, String> {
     serde_json::from_str(json).map_err(|error| format!("open: {error}"))
 }
