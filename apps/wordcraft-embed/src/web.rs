@@ -181,6 +181,8 @@ async fn start(canvas: JsValue, options: JsValue) -> Result<EmbeddedEditor, JsVa
     let options = wire::parse_mount_options(&json_of(&options)?).map_err(|e| type_error(&e))?;
     // Routes the editor's own warnings to the console; a second mount keeps the first logger.
     eframe::WebLogger::init(log::LevelFilter::Warn).ok();
+    // Read before the theme moves out of `options`.
+    let view_bar = options.view_bar;
     // A fresh bridge per mount: a destroyed editor's bridge stays detached.
     let bridge = HostBridge::new();
     // Queued before the runner starts, so the first frame's `logic` applies it before anything is
@@ -199,7 +201,9 @@ async fn start(canvas: JsValue, options: JsValue) -> Result<EmbeddedEditor, JsVa
                 // Commands wake the app from now on; the theme queued above waits for its frame.
                 app_bridge.set_context(cc.egui_ctx.clone());
                 host::prepare_context(&cc.egui_ctx);
-                let app = WordApp::new(Session::new(Document::new()), Services::default()).with_host(app_bridge.clone(), EmbedProfile::View);
+                let app = WordApp::new(Session::new(Document::new()), Services::default())
+                    .with_host(app_bridge.clone(), EmbedProfile::View)
+                    .with_view_bar(view_bar);
                 Ok(Box::new(EmbedShell { app, bridge: app_bridge, listener: app_listener, first_frame: resolve_first_frame }))
             }),
         )

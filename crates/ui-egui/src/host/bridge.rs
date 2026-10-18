@@ -77,6 +77,8 @@ pub enum HostEvent {
         x: f32,
         y: f32,
     },
+    /// Ctrl/⌘+F (or Find) with no view bar: the host opens its own find. Embed API 0.3.
+    FindRequested,
     /// An action refused in edit mode, once per action, by its stable code (`edit_mode::Refusal`).
     EditRefused {
         code: String,
@@ -250,6 +252,7 @@ mod tests {
             (HostEvent::DirtyChanged { dirty: true }, json!({"type": "dirtyChanged", "dirty": true})),
             // The bytes travel outside JSON (the embed crate sets them on the event object).
             (HostEvent::SaveRequested { file_name: "a.docx".into(), bytes: vec![1, 2] }, json!({"type": "saveRequested", "fileName": "a.docx"})),
+            (HostEvent::FindRequested, json!({"type": "findRequested"})),
             (HostEvent::SaveFailed { message: "m".into() }, json!({"type": "saveFailed", "message": "m"})),
             (HostEvent::EditRefused { code: "command_not_allowed".into() }, json!({"type": "editRefused", "code": "command_not_allowed"})),
             (

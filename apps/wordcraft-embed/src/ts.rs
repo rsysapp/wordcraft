@@ -9,6 +9,7 @@ pub const TS_DECLARATIONS: &str = r#"
 export interface MountOptions {
     mode: 'view';
     theme: Theme;
+    viewBar?: boolean;
 }
 
 export interface Theme {
@@ -64,6 +65,7 @@ export type EditorEvent =
     | { type: 'saveRequested'; bytes: Uint8Array; fileName: string }
     | { type: 'saveFailed'; message: string }
     | { type: 'commentRequested'; text: string; copyText: string; page: number | null; x: number; y: number }
+    | { type: 'findRequested' }
     | { type: 'redactionsPending'; marks: number }
     | { type: 'editRefused'; code: EditRefusalCode };
 
@@ -96,7 +98,7 @@ mod tests {
     fn declarations_match_the_embed_api() {
         let declared = squash(TS_DECLARATIONS);
         for decl in [
-            "export interface MountOptions { mode: 'view'; theme: Theme; }",
+            "export interface MountOptions { mode: 'view'; theme: Theme; viewBar?: boolean; }",
             "export interface Theme { dark: boolean; accent: string; accentContent: string; }",
             "export type JumpTarget = | { kind: 'page'; page: number } | { kind: 'text'; text: string; page: number | null; occurrence: number };",
             "export interface Mark { id: string; text: string; page: number | null; color: string; }",
@@ -111,7 +113,7 @@ mod tests {
              | { type: 'modeChanged'; mode: 'view' | 'edit' } | { type: 'dirtyChanged'; dirty: boolean } \
              | { type: 'saveRequested'; bytes: Uint8Array; fileName: string } | { type: 'saveFailed'; message: string } \
              | { type: 'commentRequested'; text: string; copyText: string; page: number | null; x: number; y: number } \
-             | { type: 'redactionsPending'; marks: number } | { type: 'editRefused'; code: EditRefusalCode };",
+             | { type: 'findRequested' } | { type: 'redactionsPending'; marks: number } | { type: 'editRefused'; code: EditRefusalCode };",
             "export type EditRefusalCode = | 'command_not_allowed' | 'decision_not_allowed' | 'paragraph_break_not_supported' \
              | 'character_not_allowed' | 'outside_editable_story' | 'invalid_edit_session' \
              | 'unknown_command' | 'invalid_parameters' | 'not_available' | 'document_protected' \

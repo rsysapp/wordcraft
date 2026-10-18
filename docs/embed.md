@@ -160,6 +160,7 @@ as `wordcraft_embed.d.ts` declares them (the package script fails if a declarati
 export interface MountOptions {
     mode: 'view';
     theme: Theme;
+    viewBar?: boolean;
 }
 
 export interface Theme {
@@ -211,6 +212,7 @@ export type EditorEvent =
     | { type: 'saveRequested'; bytes: Uint8Array; fileName: string }
     | { type: 'saveFailed'; message: string }
     | { type: 'commentRequested'; text: string; copyText: string; page: number | null; x: number; y: number }
+    | { type: 'findRequested' }
     | { type: 'redactionsPending'; marks: number }
     | { type: 'editRefused'; code: EditRefusalCode };
 
@@ -353,6 +355,20 @@ changes marked up as the file holds them.
   Fields it does not read are ignored.
 - **Fields are not refreshed.** DATE and TIME fields keep the values the file stores on this path
   (it does not refresh fields), in either display.
+
+### No view bar
+
+`mount(canvas, { mode: 'view', theme, viewBar: false })` mounts without the editor's own view bar
+(page, zoom and find controls), so the document starts at the top of the canvas and the host draws
+its own controls. Absent or `true` is API 0.2's bar. `viewBar` that is not a boolean rejects the
+`mount` promise with a `TypeError`.
+
+- **Ctrl/⌘+F asks the host.** Without a bar there is no find field to focus, and view mode opens no
+  find pane or dialog, so Ctrl/⌘+F (and the Find command without text) sends `{ type: 'findRequested' }`
+  and nothing else; the host opens its own find. Find with text, and `jumpTo`, work as before.
+- **Edit mode needs the bar.** The edit strip lives in the view bar. `setMode({ mode: 'edit', ... })`
+  on a bar-less editor is for hosts that do not edit in it; its edit controls are not drawn.
+- **View mode's command gate is unchanged.**
 
 ## Behaviour a host page relies on
 

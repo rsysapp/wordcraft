@@ -82,9 +82,18 @@ pub struct ThemeSpec {
 
 /// `EmbeddedEditor.mount`'s options.
 #[derive(Clone, Debug, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct MountOptions {
     pub mode: String,
     pub theme: ThemeSpec,
+    /// API 0.3: `false` mounts without the editor's own view bar (page, zoom and find controls), for
+    /// a host that draws its own. Absent means the bar, as API 0.2.
+    #[serde(default = "yes")]
+    pub view_bar: bool,
+}
+
+fn yes() -> bool {
+    true
 }
 
 impl ThemeSpec {
@@ -283,6 +292,12 @@ mod tests {
         let edit = parse_mount_options(r##"{"mode":"edit","theme":{"dark":false,"accent":"#0f766e","accentContent":"#ffffff"}}"##);
         assert!(edit.unwrap_err().contains("mounts in view mode"));
         assert!(parse_mount_options(r##"{"mode":"view","theme":{"dark":false,"accent":"teal","accentContent":"#ffffff"}}"##).is_err());
+        assert!(
+            parse_mount_options(r##"{"mode":"view","viewBar":"no","theme":{"dark":false,"accent":"#0f766e","accentContent":"#ffffff"}}"##).is_err()
+        );
+        let bare =
+            parse_mount_options(r##"{"mode":"view","viewBar":false,"theme":{"dark":false,"accent":"#0f766e","accentContent":"#ffffff"}}"##).unwrap();
+        assert!(!bare.view_bar);
         assert!(parse_theme(r##"{"dark":true,"accent":"#0f766e80","accentContent":"#ffffff"}"##).is_err(), "accent must be opaque");
         assert!(parse_theme(r##"{"dark":true,"accent":"#0f766e","accentContent":"#fff"}"##).is_err());
         assert!(parse_theme(r##"{"dark":true,"accent":"#0f766e","accentContent":"#000000"}"##).unwrap().dark);

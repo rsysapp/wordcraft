@@ -48,6 +48,9 @@ pub struct HostState {
     pub bridge: HostBridge,
     /// Set by Ctrl/⌘+F; the view bar focuses its find field on the next frame.
     pub(crate) focus_find: bool,
+    /// Whether the editor draws its own view bar (`MountOptions.viewBar`, API 0.3). Without it the
+    /// host draws page, zoom and find controls, and Ctrl/⌘+F is handed to the host.
+    pub(crate) view_bar: bool,
     pub(crate) find_query: String,
     /// Where the current find began: typing refines the search from here, not from the last match.
     pub(crate) find_anchor: Option<Pos>,
@@ -178,6 +181,7 @@ impl HostState {
         HostState {
             bridge,
             focus_find: false,
+            view_bar: true,
             find_query: String::new(),
             find_anchor: None,
             page_target: None,

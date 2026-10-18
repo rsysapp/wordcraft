@@ -11,7 +11,10 @@ use crate::{WordApp, icons};
 
 pub fn show(app: &mut WordApp, ui: &mut Ui) {
     let t = Tokens::get(ui.ctx());
-    bar(app, ui);
+    // The edit strip lives in the bar, so edit mode needs it (docs/embed.md, "No view bar").
+    if app.host.as_ref().is_none_or(|host| host.view_bar) {
+        bar(app, ui);
+    }
     egui::CentralPanel::default().frame(egui::Frame::NONE.fill(t.canvas)).show(ui, |ui| {
         crate::canvas::show(app, ui);
     });

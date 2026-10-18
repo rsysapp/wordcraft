@@ -140,6 +140,8 @@ for want in \
   'requestSave(): void;' \
   'applyRedactions(): void;' \
   'export interface MountOptions' \
+  'viewBar?: boolean;' \
+  "{ type: 'findRequested' }" \
   'export interface Theme' \
   'export type JumpTarget' \
   'export interface Mark' \

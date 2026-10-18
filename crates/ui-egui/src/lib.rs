@@ -742,6 +742,15 @@ impl WordApp {
         self
     }
 
+    /// embed: whether the editor draws its own view bar (`MountOptions.viewBar`). A no-op without a host.
+    #[doc(hidden)]
+    pub fn with_view_bar(mut self, view_bar: bool) -> Self {
+        if let Some(host) = self.host.as_mut() {
+            host.view_bar = view_bar;
+        }
+        self
+    }
+
     /// Start-up with no document to open (#766): show File › Home (Blank document, the templates
     /// and Recent), as Word starts, when the Start screen setting is on (the default). No document
     /// is open until the user picks Blank document or a template or opens a file (#1129): Esc or

@@ -174,6 +174,18 @@ pub fn embed_app() -> (Harness<'static, WordApp>, HostBridge) {
     view_app(Document::new(), 1.0)
 }
 
+/// As [`embed_app`], mounted with `MountOptions.viewBar` set to `view_bar`.
+pub fn embed_app_with_view_bar(view_bar: bool) -> (Harness<'static, WordApp>, HostBridge) {
+    let bridge = HostBridge::new();
+    let app = WordApp::new(Session::new(Document::new()), Services::default()).with_host(bridge.clone(), EmbedProfile::View).with_view_bar(view_bar);
+    let mut h = harness(app, 1.0);
+    bridge.set_context(h.ctx.clone());
+    wordcraft_ui_egui::host::prepare_context(&h.ctx);
+    frames(&mut h, 2);
+    bridge.take_events();
+    (h, bridge)
+}
+
 pub fn docx(doc: &Document) -> Vec<u8> {
     wordcraft_engine::io::save_bytes("fixture.docx", doc).expect("write docx")
 }
