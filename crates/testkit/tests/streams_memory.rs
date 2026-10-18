@@ -37,10 +37,7 @@ fn run(text: &str) -> String {
 fn cases() -> Vec<(&'static str, Vec<u8>)> {
     let author = "A".repeat(1_000);
     // Every character of a long insertion carries its revision, author and date.
-    let tracked = format!(
-        r#"<w:p><w:ins w:id="1" w:author="{author}" w:date="2026-10-01T09:00:00Z">{}</w:ins></w:p>"#,
-        run(&"x".repeat(200_000))
-    );
+    let tracked = format!(r#"<w:p><w:ins w:id="1" w:author="{author}" w:date="2026-10-01T09:00:00Z">{}</w:ins></w:p>"#, run(&"x".repeat(200_000)));
     // Many distinct opaque marks, each decoded with its element name and digest.
     let opaque: String = (0..20_000).map(|index| format!(r#"<w:p><w:bookmarkStart w:id="{index}" w:name="b{index}"/>{}</w:p>"#, run("a"))).collect();
     // Many text boxes, each its own story.
@@ -49,10 +46,8 @@ fn cases() -> Vec<(&'static str, Vec<u8>)> {
         .collect();
     // Many paragraphs: one decoded end each.
     let paragraphs: String = (0..100_000).map(|_| "<w:p/>".to_string()).collect();
-    let small_tracked = format!(
-        r#"<w:p><w:ins w:id="1" w:author="Ana Contoh" w:date="2026-10-01T09:00:00Z">{}</w:ins></w:p>"#,
-        run(&"x".repeat(100_000))
-    );
+    let small_tracked =
+        format!(r#"<w:p><w:ins w:id="1" w:author="Ana Contoh" w:date="2026-10-01T09:00:00Z">{}</w:ins></w:p>"#, run(&"x".repeat(100_000)));
     vec![
         ("tracked text", package(&tracked)),
         ("tracked, small", package(&small_tracked)),
@@ -72,7 +67,12 @@ fn reading_the_streams_never_holds_more_than_it_charged() {
         let held = peak().saturating_sub(baseline) as u64;
         // A refused read must have stopped before holding more than its limit.
         let charged = result.as_ref().map_or(limits.memory, |pair| pair.peak_memory);
-        eprintln!("{name:<16} held {:>7.1} MB  charged {:>7.1} MB  {}", held as f64 / 1e6, charged as f64 / 1e6, if result.is_ok() { "Ok" } else { "refused" });
+        eprintln!(
+            "{name:<16} held {:>7.1} MB  charged {:>7.1} MB  {}",
+            held as f64 / 1e6,
+            charged as f64 / 1e6,
+            if result.is_ok() { "Ok" } else { "refused" }
+        );
         if held > charged {
             over.push(name);
         }
