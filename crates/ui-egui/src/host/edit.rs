@@ -477,7 +477,7 @@ mod tests {
         crate::host::prepare_context(&harness.ctx);
         harness.run_steps(2);
         let bytes = wordcraft_engine::io::save_bytes("lease.docx", &Document::from_text("Rent is due monthly.")).expect("writes");
-        bridge.send(HostCommand::Open { name: "lease.docx".into(), bytes });
+        bridge.send(HostCommand::Open { name: "lease.docx".into(), bytes, options: Default::default() });
         harness.run_steps(3);
         let permissions = PermissionsSpec {
             accept_reject_changes: false,

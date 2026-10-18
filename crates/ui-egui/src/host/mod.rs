@@ -22,7 +22,7 @@ pub use bridge::{EditorMode, HostBridge, HostCommand, HostEvent, encode_for_host
 pub use profile::EmbedProfile;
 #[doc(hidden)]
 pub use state::HostState;
-pub use wire::{JumpTarget, MarkSpec, MountOptions, ThemeSpec};
+pub use wire::{Display, JumpTarget, MarkSpec, MountOptions, OpenOptions, ThemeSpec};
 
 /// Set up the context an embed build's app runs in; call it once the runner made the context.
 ///

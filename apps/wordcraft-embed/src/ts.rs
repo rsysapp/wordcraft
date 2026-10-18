@@ -47,6 +47,10 @@ export type ModeRequest =
     | { mode: 'view' }
     | { mode: 'edit'; author: EditorAuthor; revisionDate: string; permissions: EditorPermissions };
 
+export interface OpenOptions {
+    display?: 'asStored' | 'final';
+}
+
 export type EditorEvent =
     | { type: 'opened'; pages: number }
     | { type: 'openFailed'; message: string }
@@ -99,6 +103,7 @@ mod tests {
             "export interface EditorAuthor { id: string; name: string; }",
             "export interface EditorPermissions { acceptRejectChanges: boolean; organizePages: boolean; fillForms: boolean; redact: boolean; stamps: boolean; drawing: boolean; fullEditing?: boolean; }",
             "export type ModeRequest = | { mode: 'view' } | { mode: 'edit'; author: EditorAuthor; revisionDate: string; permissions: EditorPermissions };",
+            "export interface OpenOptions { display?: 'asStored' | 'final'; }",
             "export type EditorEvent = | { type: 'opened'; pages: number } | { type: 'openFailed'; message: string } \
              | { type: 'pageChanged'; page: number } \
              | { type: 'selection'; text: string; copyText: string; page: number | null; x: number; y: number } \
@@ -124,7 +129,8 @@ mod tests {
             (
                 "open",
                 "pub fn open( &self, #[wasm_bindgen(unchecked_param_type = \"Uint8Array\")] bytes: JsValue, \
-                 #[wasm_bindgen(js_name = \"fileName\", unchecked_param_type = \"string\")] file_name: JsValue, ) -> Result<(), JsValue>",
+                 #[wasm_bindgen(js_name = \"fileName\", unchecked_param_type = \"string\")] file_name: JsValue, \
+                 options: Option<OpenOptionsArgument>, ) -> Result<(), JsValue>",
             ),
             (
                 "jumpTo",

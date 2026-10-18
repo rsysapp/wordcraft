@@ -95,7 +95,7 @@ pub fn view_app(doc: Document, pixels_per_point: f32) -> (Harness<'static, WordA
     // Through the host, as the embed build only ever gets a document: the host is told of pages
     // only after `opened`.
     if doc != Document::new() {
-        bridge.send(HostCommand::Open { name: "agreement.docx".into(), bytes: docx(&doc) });
+        bridge.send(HostCommand::Open { name: "agreement.docx".into(), bytes: docx(&doc), options: Default::default() });
         frames(&mut h, 4);
     }
     // Start each test with an empty event queue.
@@ -180,7 +180,7 @@ pub fn docx(doc: &Document) -> Vec<u8> {
 
 /// Open `doc` the way a host page does; returns the events that followed.
 pub fn open_doc(h: &mut Harness<'_, WordApp>, bridge: &HostBridge, doc: &Document) -> Vec<HostEvent> {
-    bridge.send(HostCommand::Open { name: "agreement.docx".into(), bytes: docx(doc) });
+    bridge.send(HostCommand::Open { name: "agreement.docx".into(), bytes: docx(doc), options: Default::default() });
     frames(h, 4);
     bridge.take_events()
 }
@@ -210,4 +210,43 @@ pub fn drag_select(h: &mut Harness<'_, WordApp>, bridge: &HostBridge, from: &Pos
     h.event(release(b, egui::PointerButton::Primary));
     h.step();
     (during, bridge.take_events())
+}
+
+/// "Rent is due thirty sixty days.", written with "thirty" as a tracked deletion and "sixty" as a
+/// tracked insertion, by an author the host never sees. Built through the engine so the file holds
+/// real `w:del` and `w:ins` runs.
+pub fn tracked_lease_docx() -> Vec<u8> {
+    let mut session = Session::new(Document::from_text("Rent is due thirty days."));
+    session.author = "Ana Setia".into();
+    session.run("review.trackChanges", &serde_json::json!({ "value": true })).expect("track changes");
+    session.run("select.text", &serde_json::json!({ "text": "thirty" })).expect("select the old wording");
+    session.run("text.insert", &serde_json::json!({ "text": "sixty" })).expect("replace it");
+    assert!(session.doc.revisions.len() >= 2, "a tracked deletion and a tracked insertion: {:?}", session.doc.revisions);
+    wordcraft_engine::io::save_bytes("lease.docx", &session.doc).expect("write docx")
+}
+
+/// The text the layout places, line by line: what a reader sees on the pages. Wording left out of
+/// the layout (tracked deletions in the clean display) is not in it.
+pub fn laid_out_text(h: &mut Harness<'_, WordApp>) -> String {
+    use wordcraft_layout::Placed;
+    use wordcraft_layout::para::ClKind;
+
+    let app = h.state_mut();
+    let layout = app.session.layout();
+    let mut out = String::new();
+    for page in &layout.pages {
+        for item in &page.items {
+            let Placed::Lines { story, path, para, l0, l1, .. } = item else { continue };
+            let Some(paragraph) = app.session.doc.para(*story, path) else { continue };
+            for line in &para.lines[*l0..*l1] {
+                for cluster in &para.clusters[line.c0..line.c1] {
+                    if matches!(cluster.kind, ClKind::Text | ClKind::Space) {
+                        out.push_str(paragraph.text.get(cluster.start..cluster.end).unwrap_or(""));
+                    }
+                }
+                out.push('\n');
+            }
+        }
+    }
+    out
 }

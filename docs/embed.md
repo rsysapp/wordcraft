@@ -151,7 +151,7 @@ editor.setMode({ mode: 'view' });
 editor.destroy();
 ```
 
-`EmbeddedEditor`'s methods are `static mount(canvas, options)`, `open(bytes, fileName)`,
+`EmbeddedEditor`'s methods are `static mount(canvas, options)`, `open(bytes, fileName, options?)`,
 `jumpTo(target)`, `setMarks(marks)`, `setTheme(theme)`, `setListener(listener)`, `destroy()` and,
 from API 0.2, `setMode(request: ModeRequest)`, `requestSave()` and `applyRedactions()`. The types,
 as `wordcraft_embed.d.ts` declares them (the package script fails if a declaration is missing):
@@ -226,6 +226,10 @@ export type EditRefusalCode =
     | 'not_available'
     | 'document_protected'
     | 'command_failed';
+
+export interface OpenOptions {
+    display?: 'asStored' | 'final';
+}
 ```
 
 `MountOptions.mode` is always `'view'`: an editor mounts in view mode, needing no author, and
@@ -325,6 +329,30 @@ the strip then says "Header (shared with sections N–M)". Making a new header o
   moves focus out ("The host page's part"). Escape itself reaches the editor harmlessly (in a header
   or footer it leaves it). Edit mode claims the IME, so composed and on-screen typing arrive; view
   mode never does.
+
+## API 0.3
+
+Every 0.3 field is optional. A host that sends none of them sees exactly what API 0.2 showed.
+
+### Clean display
+
+`open(bytes, fileName, { display: 'final' })` shows the document as it reads once its tracked
+changes are accepted: deleted wording leaves the pages, inserted wording reads as ordinary text, and
+there are no balloons or comment margin. The file is never changed, and what `saveRequested` carries
+in edit mode is as before. `display: 'asStored'`, and no options at all, is API 0.2's display: tracked
+changes marked up as the file holds them.
+
+- **A display per open.** The display belongs to the `open` that asked for it. The next `open`
+  without `display: 'final'` shows its document as stored again, with the markup view settings the
+  clean display changed put back; the settings of a host that never asked for it are never touched.
+- **View mode's command gate is unchanged.** The editor sets the display itself; `review.markup`
+  and the other commands view mode refuses stay refused, so in view mode a person cannot switch the
+  markup back on.
+- **Options are checked.** `options` that is not an object, or a `display` other than `asStored`
+  and `final`, throws a `TypeError` and queues nothing, so nothing else about the open changes.
+  Fields it does not read are ignored.
+- **Fields are not refreshed.** DATE and TIME fields keep the values the file stores on this path
+  (it does not refresh fields), in either display.
 
 ## Behaviour a host page relies on
 

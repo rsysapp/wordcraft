@@ -9,7 +9,7 @@ use wordcraft_engine::Selection;
 use super::bridge::{HostBridge, HostCommand, HostEvent};
 use super::marks::Marks;
 use super::text_match::{TextIndex, visible_fragment_text};
-use super::wire::{JumpTarget, ThemeSpec, occurrence_index, page_index};
+use super::wire::{Display, JumpTarget, OpenOptions, ThemeSpec, occurrence_index, page_index};
 use crate::WordApp;
 
 /// Points left above a passage the host jumps to, so it does not sit on the view's edge. The PDF
@@ -107,6 +107,9 @@ pub struct HostState {
     pub(crate) last_save: Option<(u64, u64, bool)>,
     /// Rows of the view bar while editing: the edit strip goes on a second row when one is too narrow.
     pub(crate) bar_rows: u8,
+    /// The last open used `display: 'final'`: the markup view settings it changed are put back by the
+    /// next open that asks for the stored display.
+    pub(crate) clean_display: bool,
 }
 
 impl HostState {
@@ -201,6 +204,7 @@ impl HostState {
             frame: 0,
             last_save: None,
             bar_rows: 1,
+            clean_display: false,
         }
     }
 
@@ -231,9 +235,9 @@ pub(crate) fn before_frame(app: &mut WordApp, ctx: &egui::Context) {
     }
     for command in host.bridge.take_commands() {
         match command {
-            HostCommand::Open { name, bytes } => {
+            HostCommand::Open { name, bytes, options } => {
                 super::edit::before_open(app, &mut host);
-                open(app, &mut host, &name, &bytes);
+                open(app, &mut host, &name, &bytes, options);
             }
             // Refused like any open that fails: the open document stays, edit mode ends (embed API 0.2).
             HostCommand::OpenTooLarge { .. } => {
@@ -524,7 +528,7 @@ fn find_target(app: &mut WordApp, host: &mut HostState, target: &JumpTarget) -> 
 }
 
 /// A failed open keeps the document that was showing.
-fn open(app: &mut WordApp, host: &mut HostState, name: &str, bytes: &[u8]) {
+fn open(app: &mut WordApp, host: &mut HostState, name: &str, bytes: &[u8], options: OpenOptions) {
     match super::open::open_document(name, bytes) {
         Ok(doc) => {
             // The embed API's order for one open: selectionCleared, then jumpNotFound, then opened.
@@ -539,6 +543,7 @@ fn open(app: &mut WordApp, host: &mut HostState, name: &str, bytes: &[u8]) {
             host.file_open = true;
             host.file_name = name.to_string();
             app.session.set_document(doc);
+            apply_display(app, host, options.display);
             // A new document starts clean; `dirtyChanged` reports its edits from here.
             host.opened_version = app.session.content_version();
             host.session_date = None;
@@ -563,6 +568,33 @@ fn open(app: &mut WordApp, host: &mut HostState, name: &str, bytes: &[u8]) {
         }
         Err(message) => refuse_open(host, message),
     }
+}
+
+/// The display the host asked for (embed API 0.3). It is set here, as host state, and not through
+/// `review.markup`: view mode's command gate refuses that command and stays as it is.
+///
+/// `Final` accepts the tracked changes on screen only (the file is never touched): deleted wording
+/// leaves the layout, and balloons are off, which `Session::balloons_shown` derives from the markup
+/// being hidden. Comments are switched off in the markup preferences too, so no comment margin or
+/// highlight is painted. Opening another document as stored undoes only what `Final` changed, so a
+/// host that never sends options sees exactly what API 0.2 showed.
+fn apply_display(app: &mut WordApp, host: &mut HostState, display: Display) {
+    let markup = &mut app.session.prefs.markup;
+    match display {
+        Display::Final => {
+            app.session.view.show_markup = false;
+            markup.comments = false;
+            host.clean_display = true;
+        }
+        Display::AsStored if host.clean_display => {
+            app.session.view.show_markup = true;
+            markup.comments = true;
+            host.clean_display = false;
+        }
+        Display::AsStored => return,
+    }
+    // Deleted wording leaves (or returns to) the layout.
+    app.session.relayout();
 }
 
 /// An open that failed or was refused: the document that was showing stays on the canvas, but the
@@ -653,7 +685,7 @@ mod tests {
         h.run_steps(2);
         let text: Vec<String> = (1..=120).map(|i| format!("Clause {i}. The Supplier shall deliver the goods within thirty days.")).collect();
         let bytes = wordcraft_engine::io::save_bytes("a.docx", &Document::from_text(&text.join("\n"))).expect("writes");
-        bridge.send(HostCommand::Open { name: "a.docx".into(), bytes: bytes.clone() });
+        bridge.send(HostCommand::Open { name: "a.docx".into(), bytes: bytes.clone(), options: Default::default() });
         h.run_steps(4);
         bridge.take_events();
         bridge.send(HostCommand::JumpTo(JumpTarget::Page { page: 3 }));
@@ -661,7 +693,7 @@ mod tests {
         h.step();
         race.set(false);
         assert!(h.state().host.as_ref().is_some_and(|host| host.pending_jump.is_none()), "the jump landed");
-        bridge.send(HostCommand::Open { name: "a.docx".into(), bytes });
+        bridge.send(HostCommand::Open { name: "a.docx".into(), bytes, options: Default::default() });
         h.run_steps(4);
         let events = bridge.take_events();
         assert!(!events.iter().any(|event| matches!(event, HostEvent::JumpNotFound { .. })), "{events:?}");

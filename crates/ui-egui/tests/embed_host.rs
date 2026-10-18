@@ -38,7 +38,7 @@ fn no_page_changed_comes_before_the_first_opened() {
     let before = bridge.take_events();
     assert!(!before.iter().any(|e| matches!(e, HostEvent::PageChanged { .. })), "{before:?}");
     // A failed open is not an open either.
-    bridge.send(HostCommand::Open { name: "notes.txt".into(), bytes: b"text".to_vec() });
+    bridge.send(HostCommand::Open { name: "notes.txt".into(), bytes: b"text".to_vec(), options: Default::default() });
     frames(&mut h, 3);
     let failed = bridge.take_events();
     assert!(matches!(failed.as_slice(), [HostEvent::OpenFailed { .. }]), "{failed:?}");
@@ -94,7 +94,7 @@ fn files_that_cannot_be_shown_answer_open_failed_and_keep_the_open_document() {
         ("contract.pdf", b"%PDF-1.7".to_vec(), "Only Word documents"),
     ];
     for (name, bytes, says) in cases {
-        bridge.send(HostCommand::Open { name: name.into(), bytes });
+        bridge.send(HostCommand::Open { name: name.into(), bytes, options: Default::default() });
         frames(&mut h, 2);
         let events = bridge.take_events();
         assert!(matches!(events.as_slice(), [HostEvent::OpenFailed { message }] if message.contains(says)), "{name}: {events:?}");
@@ -113,15 +113,15 @@ fn an_open_over_the_cap_answers_too_large_in_order_without_copying_the_file() {
         copied += n;
         Ok::<_, ()>(Vec::new())
     };
-    bridge.send(HostCommand::Open { name: "empty.docx".into(), bytes: Vec::new() });
+    bridge.send(HostCommand::Open { name: "empty.docx".into(), bytes: Vec::new(), options: Default::default() });
     // Too large whatever the name or contents would have said.
     for (name, len) in [("big.docx", MAX_OPEN_BYTES + 1), ("big.pdf", usize::MAX)] {
-        let command = open_command(name.into(), len, &mut copy).expect("no copy to fail");
+        let command = open_command(name.into(), len, Default::default(), &mut copy).expect("no copy to fail");
         assert_eq!(command, HostCommand::OpenTooLarge { name: name.into(), len });
         bridge.send(command);
     }
-    bridge.send(open_command("detached.docx".into(), 0, &mut copy).expect("no copy to fail"));
-    bridge.send(HostCommand::Open { name: "notes.txt".into(), bytes: b"text".to_vec() });
+    bridge.send(open_command("detached.docx".into(), 0, Default::default(), &mut copy).expect("no copy to fail"));
+    bridge.send(HostCommand::Open { name: "notes.txt".into(), bytes: b"text".to_vec(), options: Default::default() });
     assert_eq!(copied, 0, "nothing of an oversized or empty file was copied");
     frames(&mut h, 2);
     let messages: Vec<String> = bridge
@@ -412,7 +412,7 @@ fn every_malformed_file_answers_open_failed_without_a_crash() {
     open_doc(&mut h, &bridge, &clauses(10));
     let shown = doc_json(&h);
     for (name, bytes, message) in malformed_files() {
-        bridge.send(HostCommand::Open { name: name.clone(), bytes });
+        bridge.send(HostCommand::Open { name: name.clone(), bytes, options: Default::default() });
         frames(&mut h, 2);
         assert_eq!(bridge.take_events(), vec![HostEvent::OpenFailed { message: message.into() }], "{name}");
         assert_eq!(doc_json(&h), shown, "{name} replaced the open document");
@@ -576,7 +576,7 @@ fn hostile_nesting_is_refused_as_too_complex_without_recursing() {
         .spawn(|| {
             let (mut h, bridge) = embed_app();
             open_doc(&mut h, &bridge, &clauses(3));
-            bridge.send(HostCommand::Open { name: "nested.docx".into(), bytes: document_nested(10_000) });
+            bridge.send(HostCommand::Open { name: "nested.docx".into(), bytes: document_nested(10_000), options: Default::default() });
             frames(&mut h, 3);
             (bridge.take_events(), h.state().session.doc.plain_text(wordcraft_doc::StoryRef::Body).starts_with("Clause 1."))
         })
@@ -770,7 +770,7 @@ fn commands_sent_before_the_first_frame_apply_in_order() {
     let bridge = HostBridge::new();
     let app = WordApp::new(Session::new(Document::new()), Services::default()).with_host(bridge.clone(), EmbedProfile::View);
     // Queued before the app ran a single frame, as a host may do right after mount.
-    bridge.send(HostCommand::Open { name: "agreement.docx".into(), bytes: docx(&clauses(120)) });
+    bridge.send(HostCommand::Open { name: "agreement.docx".into(), bytes: docx(&clauses(120)), options: Default::default() });
     bridge.send(HostCommand::JumpTo(text_target("Clause 90.", None, 0)));
     let mut h = harness(app, 1.0);
     frames(&mut h, 4);
@@ -842,7 +842,7 @@ fn a_jump_waiting_when_an_open_replaces_the_document_answers_jump_not_found() {
     for target in [JumpTarget::Page { page: 4 }, text_target("Clause 90.", None, 0)] {
         // The jump is found in the open document but has not landed when the next one replaces it.
         bridge.send(HostCommand::JumpTo(target.clone()));
-        bridge.send(HostCommand::Open { name: "next.docx".into(), bytes: second.clone() });
+        bridge.send(HostCommand::Open { name: "next.docx".into(), bytes: second.clone(), options: Default::default() });
         frames(&mut h, 4);
         let count = pages(&mut h) as u32;
         assert_eq!(
@@ -858,9 +858,9 @@ fn a_jump_waiting_when_an_open_replaces_the_document_answers_jump_not_found() {
     let bridge = HostBridge::new();
     let app = WordApp::new(Session::new(Document::new()), Services::default()).with_host(bridge.clone(), EmbedProfile::View);
     let early = text_target("Clause 90.", None, 0);
-    bridge.send(HostCommand::Open { name: "a.docx".into(), bytes: docx(&clauses(120)) });
+    bridge.send(HostCommand::Open { name: "a.docx".into(), bytes: docx(&clauses(120)), options: Default::default() });
     bridge.send(HostCommand::JumpTo(early.clone()));
-    bridge.send(HostCommand::Open { name: "b.docx".into(), bytes: second.clone() });
+    bridge.send(HostCommand::Open { name: "b.docx".into(), bytes: second.clone(), options: Default::default() });
     let mut h = harness(app, 1.0);
     frames(&mut h, 4);
     let events = bridge.take_events();
@@ -880,7 +880,7 @@ fn an_open_clears_the_reported_selection_before_answering_the_waiting_jump() {
     assert!(reported.iter().any(is_selection), "no selection was reported: {reported:?}");
     let target = JumpTarget::Page { page: 4 };
     bridge.send(HostCommand::JumpTo(target.clone()));
-    bridge.send(HostCommand::Open { name: "next.docx".into(), bytes: docx(&clauses(30)) });
+    bridge.send(HostCommand::Open { name: "next.docx".into(), bytes: docx(&clauses(30)), options: Default::default() });
     frames(&mut h, 4);
     let count = pages(&mut h) as u32;
     assert_eq!(
@@ -894,7 +894,7 @@ fn a_jump_waiting_when_an_open_fails_still_lands() {
     let (mut h, bridge) = embed_app();
     open_doc(&mut h, &bridge, &clauses(120));
     bridge.send(HostCommand::JumpTo(JumpTarget::Page { page: 4 }));
-    bridge.send(HostCommand::Open { name: "broken.docx".into(), bytes: b"PK\x03\x04 broken".to_vec() });
+    bridge.send(HostCommand::Open { name: "broken.docx".into(), bytes: b"PK\x03\x04 broken".to_vec(), options: Default::default() });
     frames(&mut h, 4);
     let events = bridge.take_events();
     assert!(matches!(events.as_slice(), [HostEvent::OpenFailed { .. }, HostEvent::PageChanged { page: 4 }]), "{events:?}");
@@ -1545,7 +1545,7 @@ fn every_selection_the_editor_makes_clears_a_reported_one_and_is_never_reported(
                 frames(&mut h, 2);
                 h.get_by(find_field()).type_text("goods listed");
             }
-            _ => bridge.send(HostCommand::Open { name: "next.docx".into(), bytes: docx(&clauses(120)) }),
+            _ => bridge.send(HostCommand::Open { name: "next.docx".into(), bytes: docx(&clauses(120)), options: Default::default() }),
         }
         frames(&mut h, 4);
         let events = bridge.take_events();

@@ -39,7 +39,7 @@ fn docx(text: &str) -> Vec<u8> {
 /// An embedded editor with a Word file opened through the bridge.
 fn opened() -> (Harness<'static, WordApp>, HostBridge) {
     let (mut harness, bridge) = common::view_app(Document::from_text(""), 1.0);
-    bridge.send(HostCommand::Open { name: "lease.docx".into(), bytes: docx("Rent is due monthly.") });
+    bridge.send(HostCommand::Open { name: "lease.docx".into(), bytes: docx("Rent is due monthly."), options: Default::default() });
     harness.run_steps(3);
     bridge.take_events();
     (harness, bridge)
@@ -94,7 +94,7 @@ fn opening_a_document_returns_to_view_mode_first_and_answers_a_waiting_jump_befo
     let (mut harness, bridge) = editing(true);
     // A jump found in the same frame is still waiting for its scroll when the open runs.
     bridge.send(HostCommand::JumpTo(rent()));
-    bridge.send(HostCommand::Open { name: "other.docx".into(), bytes: docx("Other.") });
+    bridge.send(HostCommand::Open { name: "other.docx".into(), bytes: docx("Other."), options: Default::default() });
     harness.run_steps(3);
     let events = bridge.take_events();
     assert_eq!(events.first(), Some(&HostEvent::ModeChanged { mode: EditorMode::View }), "{events:?}");
@@ -111,7 +111,7 @@ fn sends_an_open_s_events_in_the_contract_s_order_in_view_mode() {
     harness.run_steps(3);
     assert!(bridge.take_events().iter().any(|event| matches!(event, HostEvent::Selection { .. })));
     bridge.send(HostCommand::JumpTo(rent()));
-    bridge.send(HostCommand::Open { name: "other.docx".into(), bytes: docx("Other.") });
+    bridge.send(HostCommand::Open { name: "other.docx".into(), bytes: docx("Other."), options: Default::default() });
     harness.run_steps(3);
     let events = bridge.take_events();
     let at = |wanted: fn(&HostEvent) -> bool| events.iter().position(wanted);
@@ -141,7 +141,7 @@ fn a_too_large_open_leaves_edit_mode_and_leaves_nothing_to_edit() {
 #[test]
 fn a_failed_open_leaves_nothing_to_edit() {
     let (mut harness, bridge) = editing(false);
-    bridge.send(HostCommand::Open { name: "broken.docx".into(), bytes: b"not a package".to_vec() });
+    bridge.send(HostCommand::Open { name: "broken.docx".into(), bytes: b"not a package".to_vec(), options: Default::default() });
     harness.run_steps(2);
     let events = bridge.take_events();
     assert_eq!(events.first(), Some(&HostEvent::ModeChanged { mode: EditorMode::View }), "{events:?}");
@@ -251,7 +251,7 @@ fn refuses_another_date_while_the_document_has_unsaved_changes() {
     assert_eq!(events.first(), Some(&HostEvent::ModeChanged { mode: EditorMode::Edit }), "{events:?}");
     assert!(!events.contains(&HostEvent::DirtyChanged { dirty: false }), "{events:?}");
     // A new open is clean, so a new date is fine again.
-    bridge.send(HostCommand::Open { name: "lease.docx".into(), bytes: docx("Rent is due monthly.") });
+    bridge.send(HostCommand::Open { name: "lease.docx".into(), bytes: docx("Rent is due monthly."), options: Default::default() });
     bridge.send(edit_on("2026-10-11T08:00:00Z", false));
     harness.run_steps(3);
     let events = bridge.take_events();
@@ -486,7 +486,7 @@ fn a_save_through_the_host_passes_the_save_inspector() {
     let base = wordcraft_engine::io::save_bytes("lease.docx", &earlier.doc).unwrap();
 
     let (mut harness, bridge) = common::view_app(Document::from_text(""), 1.0);
-    bridge.send(HostCommand::Open { name: "lease.docx".into(), bytes: base.clone() });
+    bridge.send(HostCommand::Open { name: "lease.docx".into(), bytes: base.clone(), options: Default::default() });
     harness.run_steps(3);
     bridge.send(edit_on("2026-10-10T08:00:00.123Z", false));
     harness.run_steps(2);
@@ -590,7 +590,7 @@ fn a_caret_move_ends_the_notice() {
 fn the_notice_never_covers_the_caret_s_line() {
     let (mut harness, bridge) = common::view_app(Document::from_text(""), 1.0);
     let text = common::clauses(60);
-    bridge.send(HostCommand::Open { name: "lease.docx".into(), bytes: common::docx(&text) });
+    bridge.send(HostCommand::Open { name: "lease.docx".into(), bytes: common::docx(&text), options: Default::default() });
     harness.run_steps(4);
     bridge.send(edit(false));
     harness.run_steps(2);
@@ -632,7 +632,7 @@ fn with_header() -> Vec<u8> {
 #[test]
 fn enters_an_existing_header_and_leaves_it_with_escape() {
     let (mut harness, bridge) = common::view_app(Document::from_text(""), 1.0);
-    bridge.send(HostCommand::Open { name: "lease.docx".into(), bytes: with_header() });
+    bridge.send(HostCommand::Open { name: "lease.docx".into(), bytes: with_header(), options: Default::default() });
     harness.run_steps(3);
     bridge.send(edit(false));
     harness.run_steps(2);
@@ -666,7 +666,7 @@ fn answers_a_save_before_a_later_open_and_mode_change_in_the_same_frame() {
     harness.run_steps(2);
     bridge.take_events();
     bridge.send(HostCommand::RequestSave);
-    bridge.send(HostCommand::Open { name: "other.docx".into(), bytes: docx("Other.") });
+    bridge.send(HostCommand::Open { name: "other.docx".into(), bytes: docx("Other."), options: Default::default() });
     bridge.send(edit(false));
     harness.run_steps(2);
     let events = bridge.take_events();
@@ -854,7 +854,7 @@ fn long_text() -> Document {
 /// Opens `bytes` through the host and starts editing.
 fn editing_file(bytes: Vec<u8>) -> (Harness<'static, WordApp>, HostBridge) {
     let (mut harness, bridge) = common::view_app(Document::from_text(""), 1.0);
-    bridge.send(HostCommand::Open { name: "lease.docx".into(), bytes });
+    bridge.send(HostCommand::Open { name: "lease.docx".into(), bytes, options: Default::default() });
     harness.run_steps(3);
     bridge.send(edit(false));
     harness.run_steps(2);
@@ -994,7 +994,7 @@ fn with_download_service(downloads: std::rc::Rc<std::cell::Cell<usize>>) -> (Har
     bridge.set_context(harness.ctx.clone());
     wordcraft_ui_egui::host::prepare_context(&harness.ctx);
     harness.run_steps(2);
-    bridge.send(HostCommand::Open { name: "lease.docx".into(), bytes: docx("Rent is due monthly.") });
+    bridge.send(HostCommand::Open { name: "lease.docx".into(), bytes: docx("Rent is due monthly."), options: Default::default() });
     harness.run_steps(3);
     bridge.take_events();
     (harness, bridge)
@@ -1088,7 +1088,7 @@ fn keeps_the_document_dirty_after_a_save_until_it_is_opened_again() {
     assert!(bridge.take_events().is_empty());
 
     // The host keeps the save and opens it again: clean, in view mode, and edit mode starts clean.
-    bridge.send(HostCommand::Open { name: "lease.docx".into(), bytes: docx("Rent is due monthly.") });
+    bridge.send(HostCommand::Open { name: "lease.docx".into(), bytes: docx("Rent is due monthly."), options: Default::default() });
     harness.run_steps(3);
     bridge.take_events();
     bridge.send(edit(false));
@@ -1152,7 +1152,7 @@ fn sends_no_comment_request_for_a_selection_with_nothing_to_quote() {
 #[test]
 fn a_save_echoes_the_opened_name_verbatim_and_carries_word_bytes() {
     let (mut harness, bridge) = common::view_app(Document::from_text(""), 1.0);
-    bridge.send(HostCommand::Open { name: "LEASE.DOCX".into(), bytes: docx("Rent is due monthly.") });
+    bridge.send(HostCommand::Open { name: "LEASE.DOCX".into(), bytes: docx("Rent is due monthly."), options: Default::default() });
     harness.run_steps(3);
     bridge.send(edit(false));
     harness.run_steps(2);
@@ -1216,7 +1216,7 @@ fn an_edit_sessions_save_keeps_names_and_dates_where_the_document_asks_to_remove
     private.settings.remove_date_time = true;
     let bytes = wordcraft_engine::io::save_bytes("private.docx", &private).unwrap();
     let (mut harness, bridge) = common::view_app(Document::from_text(""), 1.0);
-    bridge.send(HostCommand::Open { name: "private.docx".into(), bytes });
+    bridge.send(HostCommand::Open { name: "private.docx".into(), bytes, options: Default::default() });
     harness.run_steps(3);
     assert!(harness.state().session.doc.settings.remove_personal_info, "the setting was read");
     bridge.send(edit(false));

@@ -6,13 +6,13 @@ use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 use serde::Serialize;
 
-use super::wire::{JumpTarget, MarkSpec, ModeRequest, ThemeSpec};
+use super::wire::{JumpTarget, MarkSpec, ModeRequest, OpenOptions, ThemeSpec};
 
 /// What a host page asks of the editor.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum HostCommand {
     /// Open a document, replacing the open one; answered by `Opened` or `OpenFailed`.
-    Open { name: String, bytes: Vec<u8> },
+    Open { name: String, bytes: Vec<u8>, options: OpenOptions },
     /// A file over `open::MAX_OPEN_BYTES`, of which nothing was copied (`open::open_command`).
     /// Answered by `OpenFailed` (`open::TOO_LARGE`), in order with the other opens.
     OpenTooLarge { name: String, len: usize },
@@ -206,7 +206,7 @@ mod tests {
     use crate::host::wire::JumpTarget;
 
     fn open(name: &str) -> HostCommand {
-        HostCommand::Open { name: name.into(), bytes: vec![1, 2] }
+        HostCommand::Open { name: name.into(), bytes: vec![1, 2], options: OpenOptions::default() }
     }
 
     /// A context whose repaint callback counts requests. The callback lives as long as the context,

@@ -19,6 +19,14 @@ use wordcraft_ui_egui::{Services, WordApp};
 #[wasm_bindgen(typescript_custom_section)]
 const TS_TYPES: &str = crate::ts::TS_DECLARATIONS;
 
+#[wasm_bindgen]
+extern "C" {
+    /// `open`'s optional third argument. A typed import, not `unchecked_param_type` on a `JsValue`:
+    /// only an `Option` of a named type makes wasm-bindgen write `options?: OpenOptions`.
+    #[wasm_bindgen(typescript_type = "OpenOptions")]
+    pub type OpenOptionsArgument;
+}
+
 /// The host's listener, shared by `EmbeddedEditor` and the app's event delivery.
 type Listener = Rc<RefCell<Option<js_sys::Function>>>;
 
@@ -47,9 +55,15 @@ impl EmbeddedEditor {
         &self,
         #[wasm_bindgen(unchecked_param_type = "Uint8Array")] bytes: JsValue,
         #[wasm_bindgen(js_name = "fileName", unchecked_param_type = "string")] file_name: JsValue,
+        options: Option<OpenOptionsArgument>,
     ) -> Result<(), JsValue> {
         let file_name = file_name.as_string().ok_or_else(|| type_error("open: fileName must be a string"))?;
         let bytes = bytes.dyn_into::<js_sys::Uint8Array>().map_err(|_| type_error("open: bytes must be a Uint8Array"))?;
+        // Options are optional (API 0.3): a host that sends none gets the display API 0.2 had.
+        let options = match options {
+            Some(options) => wire::parse_open_options(&json_of(options.as_ref())?).map_err(|e| type_error(&e))?,
+            None => wire::OpenOptions::default(),
+        };
         // Nothing is copied for an editor that will never read it.
         if self.destroyed.get() {
             return Ok(());
@@ -58,7 +72,7 @@ impl EmbeddedEditor {
         // empty one (also what a detached buffer reads as) is never touched; the rest is copied into
         // wasm memory once, then moved into the queue.
         let len = byte_length(&bytes)?;
-        self.send(open::open_command(file_name, len, |len| copy_bytes(&bytes, len))?);
+        self.send(open::open_command(file_name, len, options, |len| copy_bytes(&bytes, len))?);
         Ok(())
     }
 

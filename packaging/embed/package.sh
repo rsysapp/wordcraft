@@ -124,11 +124,13 @@ for path in "$CARGO_HOME_DIR" "$ROOT" "$HOME_DIR"; do
 done
 
 # The declarations the embed API promises (generated, so checked rather than trusted).
+# `open`'s line is checked up to its last name: wasm-bindgen writes an optional argument as
+# `options?: OpenOptions | null` (null reads as absent).
 for want in \
   'export default function __wbg_init' \
   'export class EmbeddedEditor' \
   'static mount(canvas: HTMLCanvasElement, options: MountOptions): Promise<EmbeddedEditor>;' \
-  'open(bytes: Uint8Array, fileName: string): void;' \
+  'open(bytes: Uint8Array, fileName: string, options?: OpenOptions' \
   'jumpTo(target: JumpTarget): void;' \
   'setMarks(marks: Mark[]): void;' \
   'setTheme(theme: Theme): void;' \
@@ -144,6 +146,7 @@ for want in \
   'export interface EditorAuthor' \
   'export interface EditorPermissions' \
   'export type ModeRequest' \
+  'export interface OpenOptions' \
   'export type EditorEvent' \
   'export type EditRefusalCode'; do
   grep -qF -- "$want" "$OUT/wordcraft_embed.d.ts" || { echo "error: wordcraft_embed.d.ts lacks: $want" >&2; exit 1; }

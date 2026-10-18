@@ -143,6 +143,28 @@ pub fn parse_theme(json: &str) -> Result<ThemeSpec, String> {
     Ok(theme)
 }
 
+/// How `open` shows the document (embed API 0.3). Fields a host adds later are ignored.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct OpenOptions {
+    #[serde(default)]
+    pub display: Display,
+}
+
+/// `asStored` is API 0.2's display: tracked changes marked up, as the file holds them. `final` is
+/// the clean display: tracked changes accepted, deleted wording out of the layout, no balloons.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum Display {
+    #[default]
+    AsStored,
+    Final,
+}
+
+pub fn parse_open_options(json: &str) -> Result<OpenOptions, String> {
+    serde_json::from_str(json).map_err(|error| format!("open: {error}"))
+}
+
 pub fn parse_jump_target(json: &str) -> Result<JumpTarget, String> {
     serde_json::from_str(json).map_err(|error| format!("jumpTo: {error}"))
 }
