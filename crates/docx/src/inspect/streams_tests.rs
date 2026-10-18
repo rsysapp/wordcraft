@@ -529,3 +529,65 @@ fn a_refusal_for_memory_says_so_in_the_words_exported() {
     assert!(message.contains(TOO_MUCH_MEMORY), "{message}");
     assert_ne!(TOO_MUCH_MEMORY, TOO_MUCH_WORK);
 }
+
+/// One footnote with this id, referenced from the body.
+fn footnote_numbered(id: &str) -> Vec<u8> {
+    let body = format!(r#"<w:p>{}<w:r><w:footnoteReference w:id="{id}"/></w:r></w:p>"#, text("Payable"));
+    let footnotes = format!(r#"<w:footnotes {W}><w:footnote w:id="{id}"><w:p>{}</w:p></w:footnote></w:footnotes>"#, text("In Rupiah."));
+    Docx::new(&body)
+        .rel(("rId6", rt::FOOTNOTES, "footnotes.xml", false))
+        .part("word/footnotes.xml", &footnotes)
+        .typed("/word/footnotes.xml", FOOTNOTES_TYPE)
+        .zip()
+}
+
+fn paired(left: &[u8], right: &[u8]) -> super::Inspection {
+    super::inspect_paired(left, right, &super::INSPECT_LIMITS, super::MAX_CHANGES).unwrap()
+}
+
+#[test]
+fn the_paired_save_check_leaves_out_what_the_comparison_pairs_by_slot_and_order() {
+    // A header held by another part, a note under another id, a new bookmark: the comparison pairs
+    // headers by slot and notes by reference order and leaves bookmarks out, so the save check it
+    // runs beside it counts none of them as an untracked edit.
+    let renamed = paired(&sections_naming("word/header1.xml", 1440), &sections_naming("word/header7.xml", 1440));
+    assert_eq!(renamed.untracked_changes, 0);
+    let renumbered = paired(&footnote_numbered("2"), &footnote_numbered("5"));
+    assert_eq!((renumbered.untracked_changes, renumbered.losses.len()), (0, 0), "{renumbered:#?}");
+    let marked =
+        r#"<w:bookmarkStart w:id="7" w:name="_GoBack"/><w:bookmarkEnd w:id="7"/><w:permStart w:id="3" w:edGrp="everyone"/><w:permEnd w:id="3"/>"#;
+    let bookmarked = paired(&package(&para(&text("Fee 5%"))), &package(&para(&format!("{marked}{}", text("Fee 5%")))));
+    assert_eq!((bookmarked.untracked_changes, bookmarked.losses.len()), (0, 0));
+}
+
+#[test]
+fn the_paired_save_check_still_counts_every_other_edit() {
+    assert_eq!(paired(&package(&para(&text("Fee 5%"))), &package(&para(&text("Fee 50%")))).untracked_changes, 1);
+    // A note's text, a section's margin and a header's slot are still compared.
+    let note_text = |text_of: &str| {
+        let body = format!(r#"<w:p>{}<w:r><w:footnoteReference w:id="2"/></w:r></w:p>"#, text("Payable"));
+        let footnotes = format!(r#"<w:footnotes {W}><w:footnote w:id="2"><w:p>{}</w:p></w:footnote></w:footnotes>"#, text(text_of));
+        Docx::new(&body)
+            .rel(("rId6", rt::FOOTNOTES, "footnotes.xml", false))
+            .part("word/footnotes.xml", &footnotes)
+            .typed("/word/footnotes.xml", FOOTNOTES_TYPE)
+            .zip()
+    };
+    assert!(paired(&note_text("In Rupiah."), &note_text("In Dollars.")).untracked_changes > 0);
+    assert!(paired(&sections_naming("word/header1.xml", 1440), &sections_naming("word/header1.xml", 720)).untracked_changes > 0);
+    let bookmark_with_text = format!(r#"<w:bookmarkStart w:id="7" w:name="x">{}</w:bookmarkStart>"#, text("x"));
+    assert!(
+        super::inspect_paired(&package(&para(&text("Fee"))), &package(&para(&bookmark_with_text)), &super::INSPECT_LIMITS, super::MAX_CHANGES)
+            .is_err()
+            || paired(&package(&para(&text("Fee"))), &package(&para(&bookmark_with_text))).untracked_changes > 0
+    );
+}
+
+#[test]
+fn the_save_check_itself_still_counts_them() {
+    // Comparison mode is a mode: the editor's save check reads these as before.
+    assert!(super::inspect(&sections_naming("word/header1.xml", 1440), &sections_naming("word/header7.xml", 1440)).unwrap().untracked_changes > 0);
+    assert!(super::inspect(&footnote_numbered("2"), &footnote_numbered("5")).unwrap().untracked_changes > 0);
+    let marked = r#"<w:bookmarkStart w:id="7" w:name="_GoBack"/><w:bookmarkEnd w:id="7"/>"#;
+    assert!(super::inspect(&package(&para(&text("Fee 5%"))), &package(&para(&format!("{marked}{}", text("Fee 5%"))))).unwrap().untracked_changes > 0);
+}

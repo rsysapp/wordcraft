@@ -2355,7 +2355,7 @@ fn walk_story(body: &str, tables: &mut story::Tables, budget: &mut budget::Budge
     let parsed = xml::parse(xml.as_bytes(), &mut names, &mut limits, budget).unwrap();
     let rels = opc::Rels::default();
     let (marks, _) = opc::bookmarks(&parsed.root, budget).unwrap();
-    let canon = opc::Canon { rels: &rels, bookmarks: Some(&marks) };
+    let canon = opc::Canon { rels: &rels, bookmarks: Some(&marks), paired: false };
     let mut revisions = story::Revisions::default();
     let mut left = MAX_STORY_ITEMS;
     story::walk(&parsed.root, &canon, tables, &mut revisions, &mut left, parsed.most_items, &story::StyleHiding::default(), budget).unwrap()

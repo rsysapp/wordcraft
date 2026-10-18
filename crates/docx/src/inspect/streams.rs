@@ -272,9 +272,9 @@ pub fn read_pair(left: &[u8], right: &[u8], limits: &StreamLimits) -> Result<Str
     let mut names = Names::default();
     let mut tables = Tables::new();
     let (mut left_record, mut right_record) = (SideRecord::default(), SideRecord::default());
-    let left_side =
-        Side::read_with(left, &limits.read, &mut names, &mut tables, &mut budget, &mut false, Some(&mut left_record)).map_err(InspectError::Base)?;
-    let right_side = Side::read_with(right, &limits.read, &mut names, &mut tables, &mut budget, &mut false, Some(&mut right_record))
+    let left_side = Side::read_with(left, &limits.read, &mut names, &mut tables, &mut budget, &mut false, Some(&mut left_record), false)
+        .map_err(InspectError::Base)?;
+    let right_side = Side::read_with(right, &limits.read, &mut names, &mut tables, &mut budget, &mut false, Some(&mut right_record), false)
         .map_err(InspectError::Edited)?;
     // Ids that ran out would make different pieces read as one.
     if tables.overflowed() {

@@ -267,7 +267,13 @@ pub(super) fn bookmarks(root: &XEl, budget: &mut Budget) -> Result<(Bookmarks, u
 pub(super) struct Canon<'a> {
     pub rels: &'a Rels,
     pub bookmarks: Option<&'a Bookmarks>,
+    /// embed: the save check run beside a version comparison ([`super::inspect_paired`]): note
+    /// ids are not compared, since the comparison pairs notes by reference order.
+    pub paired: bool,
 }
+
+/// embed: the elements whose `w:id` names a note.
+const NOTE_ID_ELEMENTS: [&str; 4] = ["w:footnoteReference", "w:endnoteReference", "w:footnote", "w:endnote"];
 
 /// An attribute's value as compared.
 /// Memory held by canonical hashing, one start tag at a time: its attributes in order, in a vector
@@ -300,6 +306,14 @@ impl Canon<'_> {
         Some(Value::Plain(value))
     }
 
+    /// embed: [`Canon::value`], without note ids when paired.
+    fn compared<'v>(&self, element: &str, key: &str, value: &'v str) -> Option<Value<'v>> {
+        if self.paired && key == "w:id" && NOTE_ID_ELEMENTS.contains(&element) {
+            return None;
+        }
+        Canon::value(element, key, value)
+    }
+
     fn write_value(&self, value: &Value<'_>, hasher: &mut Hasher) {
         match value {
             Value::Plain(text) => hasher.field(b'=', text.as_bytes()),
@@ -321,7 +335,7 @@ impl Canon<'_> {
 
     /// Whether any attribute of `el` is compared.
     pub(super) fn has_attributes(&self, el: &XEl) -> bool {
-        el.attrs.iter().any(|(key, value)| Canon::value(&el.name, key, value).is_some())
+        el.attrs.iter().any(|(key, value)| self.compared(&el.name, key, value).is_some())
     }
 
     /// The start tag: the name and the compared attributes, sorted.
@@ -332,7 +346,7 @@ impl Canon<'_> {
     /// The start tag of an element named `name` with these attributes.
     pub(super) fn start_tag_of<'e>(&self, name: &str, attrs: impl Iterator<Item = &'e (std::rc::Rc<str>, String)>, hasher: &mut Hasher) {
         let mut attributes: Vec<(&str, Value<'_>)> =
-            attrs.filter_map(|(key, value)| Canon::value(name, key, value).map(|value| (&**key, value))).collect();
+            attrs.filter_map(|(key, value)| self.compared(name, key, value).map(|value| (&**key, value))).collect();
         attributes.sort_by(|a, b| a.0.cmp(b.0));
         hasher.field(b'<', name.as_bytes());
         for (key, value) in &attributes {

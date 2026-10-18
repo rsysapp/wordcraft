@@ -321,6 +321,16 @@ pub fn inspect_within(base: &[u8], edited: &[u8], limits: &ReadLimits, max_chang
     inspect_budgeted(base, edited, limits, max_changes, &mut budget)
 }
 
+/// embed: the save check as Clauflow's version comparison runs it beside its own reading, to vouch
+/// that every difference it finds is one the comparison lists. What the comparison pairs by slot
+/// and order, or leaves out by design, is left out here too: which part holds a section's header
+/// or footer, the ids of notes (paired by reference order), and empty bookmark and editing
+/// permission marks. Everything else is compared as [`inspect_within`] compares it.
+pub fn inspect_paired(base: &[u8], edited: &[u8], limits: &ReadLimits, max_changes: usize) -> Result<Inspection, InspectError> {
+    let mut budget = Budget::new(MAX_WORK, memory_limit(base.len(), edited.len()));
+    inspect_budgeted_with(base, edited, limits, max_changes, &mut budget, true)
+}
+
 /// [`inspect`], also answering the most memory the inspection charged to its budget and the work it
 /// spent. For tests that check, with a counting allocator, that the inspection never holds more
 /// than it charged, and for measuring the bounds.
@@ -332,24 +342,36 @@ pub fn inspect_measured(base: &[u8], edited: &[u8]) -> (Result<Inspection, Inspe
 }
 
 fn inspect_budgeted(base: &[u8], edited: &[u8], limits: &ReadLimits, max_changes: usize, budget: &mut Budget) -> Result<Inspection, InspectError> {
+    inspect_budgeted_with(base, edited, limits, max_changes, budget, false)
+}
+
+/// embed: [`inspect_budgeted`], paired or not ([`inspect_paired`]).
+fn inspect_budgeted_with(
+    base: &[u8],
+    edited: &[u8],
+    limits: &ReadLimits,
+    max_changes: usize,
+    budget: &mut Budget,
+    paired: bool,
+) -> Result<Inspection, InspectError> {
     // Canonical hashing's working room, and the fixed room, held for the whole inspection.
     budget.hold(opc::HASHING_BYTES.saturating_add(FIXED_BYTES)).map_err(InspectError::Edited)?;
     let mut names = Names::default();
     let mut tables = Tables::new();
     let mut unsettled_styles = false;
-    let base = match Side::read(base, limits, &mut names, &mut tables, budget, &mut unsettled_styles) {
+    let base = match Side::read_with(base, limits, &mut names, &mut tables, budget, &mut unsettled_styles, None, paired) {
         Ok(base) => base,
         // A save keeps its base's styles: when the save's own cannot be settled either, the save
         // is what cannot be read for certain, and it is the save that is refused.
         Err(error) if unsettled_styles => {
-            return Err(match Side::read(edited, limits, &mut names, &mut tables, budget, &mut false) {
+            return Err(match Side::read_with(edited, limits, &mut names, &mut tables, budget, &mut false, None, paired) {
                 Err(edited_error) => InspectError::Edited(edited_error),
                 Ok(_) => InspectError::Base(error),
             });
         }
         Err(error) => return Err(InspectError::Base(error)),
     };
-    let edited = Side::read(edited, limits, &mut names, &mut tables, budget, &mut false).map_err(InspectError::Edited)?;
+    let edited = Side::read_with(edited, limits, &mut names, &mut tables, budget, &mut false, None, paired).map_err(InspectError::Edited)?;
     let inspection = compare(base, edited, &mut tables, max_changes, budget)?;
     // Ids that ran out would make different pieces read as one; no fact stands then.
     if tables.overflowed() {
@@ -481,7 +503,7 @@ impl<'a> Side<'a> {
         budget: &mut Budget,
         unsettled_styles: &mut bool,
     ) -> Result<Side<'a>, String> {
-        Side::read_with(bytes, limits, names, tables, budget, unsettled_styles, None)
+        Side::read_with(bytes, limits, names, tables, budget, unsettled_styles, None, false)
     }
 
     /// embed: [`Side::read`], recording streams mode's facts into `record` when given.
@@ -494,6 +516,7 @@ impl<'a> Side<'a> {
         budget: &mut Budget,
         unsettled_styles: &mut bool,
         mut record: Option<&mut streams::SideRecord>,
+        paired: bool,
     ) -> Result<Side<'a>, String> {
         let mut package = StrictPackage::open(bytes, limits, budget)?;
         let mut limits = Limits { elements_left: limits.max_elements, max_depth: limits.max_depth.min(crate::xml::MAX_DEPTH) };
@@ -578,7 +601,7 @@ impl<'a> Side<'a> {
                         return Err(format!("{name}: {error}"));
                     }
                 };
-                let canon = Canon { rels: part_rels, bookmarks: Some(&marks) };
+                let canon = Canon { rels: part_rels, bookmarks: Some(&marks), paired };
                 let mut extras = match record.is_some() {
                     true => Some(stream_extras::Extras::new(&parsed.root, name, budget).map_err(|error| format!("{name}: {error}"))?),
                     false => None,
@@ -605,7 +628,7 @@ impl<'a> Side<'a> {
             } else if opc::is_xml(name, content_type) {
                 let parsed = parse_part(&mut package, name, names, &mut limits, budget)?;
                 let root = &parsed.root;
-                let canon = Canon { rels: part_rels, bookmarks: None };
+                let canon = Canon { rels: part_rels, bookmarks: None, paired };
                 if *name == settings
                     && let Some(record) = record.as_deref_mut()
                 {
@@ -642,7 +665,7 @@ impl<'a> Side<'a> {
                     Some(extended) => Some(parse_part(&mut package, extended, names, &mut limits, budget)?),
                     None => None,
                 };
-                let canon = Canon { rels: rels.get(part.as_str()).unwrap_or(&empty), bookmarks: None };
+                let canon = Canon { rels: rels.get(part.as_str()).unwrap_or(&empty), bookmarks: None, paired };
                 let read = comments::read_with(&parsed.root, extended.as_ref().map(|extended| &extended.root), &canon, budget, record.is_some())
                     .map_err(|error| format!("{part}: {error}"));
                 budget.release(parsed.held.saturating_add(extended.map_or(0, |extended| extended.held)));

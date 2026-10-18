@@ -75,7 +75,7 @@ pub fn content_types(xml: &[u8], mark: &mut dyn FnMut()) -> Result<Measured, Str
 pub fn comments(xml: &[u8], mark: &mut dyn FnMut()) -> Result<Measured, String> {
     let (root, _names) = parsed(xml)?;
     let rels = Rels::default();
-    let canon = Canon { rels: &rels, bookmarks: None };
+    let canon = Canon { rels: &rels, bookmarks: None, paired: false };
     measure(&mut unlimited(), mark, |budget| {
         budget.hold(super::opc::HASHING_BYTES)?;
         Ok(Box::new(comments::read(&root, None, &canon, budget)?))
@@ -183,7 +183,7 @@ pub fn story(xml: &[u8], mark: &mut dyn FnMut()) -> Result<Measured, String> {
     let parsed = xml::parse(xml, &mut names, &mut limits(), &mut unlimited())?;
     let rels = Rels::default();
     let (bookmarks, _) = super::opc::bookmarks(&parsed.root, &mut unlimited())?;
-    let canon = Canon { rels: &rels, bookmarks: Some(&bookmarks) };
+    let canon = Canon { rels: &rels, bookmarks: Some(&bookmarks), paired: false };
     let hiding = StyleHiding::default();
     let mut tables = Tables::new();
     let mut budget = unlimited();
@@ -211,7 +211,7 @@ fn walked(xml: &[u8], tables: Option<Tables>) -> Result<Walked, String> {
     let parsed = xml::parse(xml, &mut names, &mut limits(), &mut budget)?;
     let rels = Rels::default();
     let (bookmarks, _) = super::opc::bookmarks(&parsed.root, &mut unlimited())?;
-    let canon = Canon { rels: &rels, bookmarks: Some(&bookmarks) };
+    let canon = Canon { rels: &rels, bookmarks: Some(&bookmarks), paired: false };
     let mut tables = tables.unwrap_or_else(Tables::new);
     let mut revisions = Revisions::default();
     let mut items_left = super::MAX_STORY_ITEMS;
@@ -361,7 +361,7 @@ pub fn tally(pairs: &[(Vec<u8>, Vec<u8>)], mark: &mut dyn FnMut()) -> Result<Mea
             let parsed = xml::parse(xml, &mut names, &mut limits(), budget)?;
             let rels = Rels::default();
             let (bookmarks, _) = super::opc::bookmarks(&parsed.root, &mut unlimited())?;
-            let canon = Canon { rels: &rels, bookmarks: Some(&bookmarks) };
+            let canon = Canon { rels: &rels, bookmarks: Some(&bookmarks), paired: false };
             let mut items_left = super::MAX_STORY_ITEMS;
             let items = story::walk(&parsed.root, &canon, tables, revisions, &mut items_left, parsed.most_items, &StyleHiding::default(), budget)?;
             budget.release(parsed.held);

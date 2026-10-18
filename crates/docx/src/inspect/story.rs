@@ -713,6 +713,9 @@ fn is(child: &XEl, other: Option<&XEl>) -> bool {
     other.is_some_and(|other| std::ptr::eq(child, other))
 }
 
+/// embed: marks the paired save check leaves out, as Clauflow's comparison does.
+const PAIRED_IGNORED: [&str; 4] = ["w:bookmarkStart", "w:bookmarkEnd", "w:permStart", "w:permEnd"];
+
 fn empty_marker(el: &XEl) -> bool {
     matches!(&*el.name, "w:proofErr" | "w:lastRenderedPageBreak") && el.kids.is_empty()
 }
@@ -1171,6 +1174,12 @@ impl Walker<'_, '_> {
     }
 
     /// embed: streams mode: record a fact about the item pushed last.
+    /// Marks no reader sees: proofing state and layout caches always; embed: and, in the paired
+    /// save check, empty bookmark and editing permission marks, which the comparison leaves out.
+    fn ignorable(&self, el: &XEl) -> bool {
+        empty_marker(el) || (self.canon.paired && el.kids.is_empty() && PAIRED_IGNORED.contains(&&*el.name))
+    }
+
     fn record(&mut self, extra: impl FnOnce(&Extras) -> Extra) -> Result<(), String> {
         let Some(extras) = self.extras.as_deref_mut() else { return Ok(()) };
         let index = self.items.len().saturating_sub(1);
@@ -1497,8 +1506,9 @@ impl Walker<'_, '_> {
             "w:sdt" => self.sdt(el, Place::Block),
             "w:customXml" => self.container(el, Some("w:customXmlPr"), Place::Block, MarkKind::Plain),
             "w:sectPr" => {
-                let streams = self.extras.is_some();
-                let slot = self.slot("sectPr", Some(el), "w:sectPrChange", "w:sectPr", &|child| streams && is_header_or_footer_reference(child))?;
+                // embed: and in the paired save check, which pairs headers by slot too.
+                let by_slot = self.extras.is_some() || self.canon.paired;
+                let slot = self.slot("sectPr", Some(el), "w:sectPrChange", "w:sectPr", &|child| by_slot && is_header_or_footer_reference(child))?;
                 let format = self.format(slot.into_iter().collect(), false, false);
                 let mut hasher = Hasher::default();
                 hasher.field(b'Z', &[]);
@@ -1511,7 +1521,7 @@ impl Walker<'_, '_> {
                 let canon = self.canon;
                 self.record(|extras| Extra::Section(stream_extras::section_refs(el, canon, &extras.dir)))
             }
-            _ if empty_marker(el) => Ok(()),
+            _ if self.ignorable(el) => Ok(()),
             _ => self.opaque(el, EMPTY),
         }
     }
@@ -1534,7 +1544,7 @@ impl Walker<'_, '_> {
             "w:smartTag" => self.container(el, Some("w:smartTagPr"), Place::Inline, MarkKind::Plain),
             "w:customXml" => self.container(el, Some("w:customXmlPr"), Place::Inline, MarkKind::Plain),
             "w:sdt" => self.sdt(el, Place::Inline),
-            _ if empty_marker(el) => Ok(()),
+            _ if self.ignorable(el) => Ok(()),
             _ => self.opaque(el, EMPTY),
         }
     }
@@ -1549,7 +1559,7 @@ impl Walker<'_, '_> {
             match node {
                 XNode::El(child) if &*child.name == "w:r" => self.run(child)?,
                 XNode::El(child) if WrapKind::of_run_level(&child.name).is_some() => self.wrap(child)?,
-                XNode::El(child) if empty_marker(child) => {}
+                XNode::El(child) if self.ignorable(child) => {}
                 // A range marker holding anything could carry content a reader shows untracked.
                 XNode::El(child) if RANGE_MARKERS.contains(&&*child.name) && child.kids.is_empty() => self.opaque(child, EMPTY)?,
                 XNode::El(child) => return Err(format!("{} inside a tracked change", child.name)),
@@ -1662,7 +1672,8 @@ impl Walker<'_, '_> {
         slots.extend(self.slot("pPr.rPr", mark_properties, "w:rPrChange", "w:rPr", &is_wrap)?);
         // embed: streams mode: a section's header and footer references are compared by their
         // slot, so which part holds a header is not formatting.
-        slots.extend(self.slot("pPr.sectPr", section, "w:sectPrChange", "w:sectPr", &|child| streams && is_header_or_footer_reference(child))?);
+        let by_slot = streams || self.canon.paired;
+        slots.extend(self.slot("pPr.sectPr", section, "w:sectPrChange", "w:sectPr", &|child| by_slot && is_header_or_footer_reference(child))?);
         // embed: streams mode: the section these properties end, as block-level ones would read.
         let section_format = match (self.extras.is_some(), slots.iter().find(|slot| slot.name == "pPr.sectPr")) {
             (true, Some(slot)) => Some(self.format(vec![Slot { name: "sectPr", ..slot.clone() }], false, false)),
@@ -1729,7 +1740,7 @@ impl Walker<'_, '_> {
                         }
                         // Anything else, including text in the wrong place for its kind (deleted
                         // text outside a deletion), is compared whole.
-                        _ if empty_marker(child) => {}
+                        _ if self.ignorable(child) => {}
                         _ => self.opaque(child, run_format)?,
                     }
                 }
