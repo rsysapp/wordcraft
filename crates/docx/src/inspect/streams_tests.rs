@@ -303,7 +303,23 @@ fn a_renamed_header_part_leaves_paragraph_and_section_formats_equal() {
     let other = sections_naming("word/header1.xml", 720);
     let pair = read_pair(&left, &other, &default_limits(left.len(), other.len())).unwrap();
     let (left_formats, right_formats) = (formats(&pair.left), formats(&pair.right));
-    assert_ne!(left_formats, right_formats, "a page setup change still shows");
+    let breaks = |streams: &Streams| -> Vec<FormatId> {
+        streams.stories[0]
+            .items
+            .iter()
+            .filter_map(|item| match item {
+                StreamItem::SectionBreak { props, .. } => Some(*props),
+                _ => None,
+            })
+            .collect()
+    };
+    let (left_breaks, right_breaks) = (breaks(&pair.left), breaks(&pair.right));
+    assert_eq!(left_breaks.len(), 2);
+    assert!(
+        left_breaks.iter().zip(&right_breaks).all(|(x, y)| x != y),
+        "a page setup change shows on both section breaks: {left_breaks:?} {right_breaks:?}"
+    );
+    assert_ne!(left_formats, right_formats);
     let paragraph_ends = |streams: &Streams| -> Vec<FormatId> {
         streams.stories[0]
             .items
