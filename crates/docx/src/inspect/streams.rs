@@ -270,6 +270,7 @@ fn decode(side: &Side<'_>, mut record: SideRecord, tables: &Tables, budget: &mut
                                 NoteKind::Footnote => StoryId::Footnote { id: id.clone() },
                                 NoteKind::Endnote => StoryId::Endnote { id: id.clone() },
                             };
+                            budget.hold(STORY_BYTES.saturating_add(budget::units(name.len().saturating_add(id_len(&id)))))?;
                             stories.push((rank, Story { id, part: name.clone(), items: decoded }));
                         }
                         index = end;
@@ -284,12 +285,15 @@ fn decode(side: &Side<'_>, mut record: SideRecord, tables: &Tables, budget: &mut
                     _ => StoryId::Footer { part: name.clone() },
                 };
                 let decoded = decoder.items(items, 0..items.len(), facts, digests, budget)?;
+                budget.hold(STORY_BYTES.saturating_add(budget::units(name.len().saturating_add(id_len(&id)))))?;
                 stories.push((rank, Story { id, part: name.clone(), items: decoded }));
             }
         }
         for text_box in &extras.text_boxes {
             let decoded = decoder.items(&text_box.items, 0..text_box.items.len(), &text_box.by_item, digests, budget)?;
             let id = StoryId::TextBox { part: name.clone(), anchor: text_box.anchor, ordinal: text_box.ordinal };
+            // The box's entry here and again in the list of all stories; its part named three times.
+            budget.hold(STORY_BYTES.saturating_mul(2).saturating_add(budget::units(name.len()).saturating_mul(3)))?;
             boxes.push((rank, name.clone(), Story { id, part: name.clone(), items: decoded }));
         }
     }
@@ -302,6 +306,8 @@ fn decode(side: &Side<'_>, mut record: SideRecord, tables: &Tables, budget: &mut
         };
         (rank_a, part_a, place(a)).cmp(&(rank_b, part_b, place(b)))
     });
+    // The list of all stories, beside the two it is made from while it is made.
+    budget.hold(budget::units(stories.len()).saturating_mul(STORY_BYTES))?;
     let mut all: Vec<Story> = stories.into_iter().map(|(_, story)| story).collect();
     all.extend(boxes.into_iter().map(|(_, _, story)| story));
 
@@ -322,6 +328,18 @@ fn decode(side: &Side<'_>, mut record: SideRecord, tables: &Tables, budget: &mut
     comments.sort_by(|a, b| (a.id.parse::<i64>().ok(), &a.id).cmp(&(b.id.parse::<i64>().ok(), &b.id)));
     let settings = record.settings.take().unwrap_or(Settings { track_revisions: false, protection: None, other_digest: String::new() });
     Ok(Streams { stories: all, comments, settings, parts, part_order: record.part_order })
+}
+
+/// Memory charged for each story's entry (in the list it is gathered in, with its rank).
+const STORY_BYTES: u64 = (std::mem::size_of::<(u8, String, Story)>() * 2) as u64;
+
+/// The bytes a story id names beyond its part.
+fn id_len(id: &StoryId) -> usize {
+    match id {
+        StoryId::Footnote { id } | StoryId::Endnote { id } => id.len(),
+        StoryId::Header { part } | StoryId::Footer { part } | StoryId::TextBox { part, .. } => part.len(),
+        StoryId::Body => 0,
+    }
 }
 
 /// Which wraps a revision is read from.
@@ -362,10 +380,11 @@ impl Decoder<'_> {
     }
 
     /// The innermost tracked change of `level` around an item.
-    fn revision(&mut self, wraps: u32, level: Level) -> Option<Revision> {
+    fn revision(&mut self, wraps: u32, level: Level, budget: &mut Budget) -> Result<Option<Revision>, String> {
         if let Some(found) = self.revisions.get(&(wraps, level)) {
-            return found.clone();
+            return Ok(found.clone());
         }
+        budget.work(4)?;
         let kind_of = |wrap: &Wrap| match (level, wrap.kind) {
             (Level::Text, WrapKind::Ins) | (Level::Row, WrapKind::RowIns) | (Level::Cell, WrapKind::CellIns) => Some(RevisionKind::Inserted),
             (Level::Text, WrapKind::Del) | (Level::Row, WrapKind::RowDel) | (Level::Cell, WrapKind::CellDel) => Some(RevisionKind::Deleted),
@@ -379,14 +398,16 @@ impl Decoder<'_> {
             .iter()
             .rev()
             .find_map(|wrap| kind_of(wrap).map(|kind| Revision { kind, author: self.text(wrap.author), date: self.date(wrap.date) }));
+        budget.hold(CACHE_BYTES.saturating_add(found.as_ref().map_or(0, revision_strings)))?;
         self.revisions.insert((wraps, level), found.clone());
-        found
+        Ok(found)
     }
 
-    fn format(&mut self, id: u32) -> FormatFacts {
+    fn format(&mut self, id: u32, budget: &mut Budget) -> Result<FormatFacts, String> {
         if let Some(facts) = self.formats.get(&id) {
-            return facts.clone();
+            return Ok(facts.clone());
         }
+        budget.work(4)?;
         let empty = Format::default();
         let format = self.tables.format_of(id).unwrap_or(&empty);
         let paragraph = format.slot("pPr").1.or(format.slot("pPr.rPr").1);
@@ -396,8 +417,10 @@ impl Decoder<'_> {
             run: self.format_revision(format.slot("rPr").1),
             paragraph: self.format_revision(paragraph),
         };
+        let strings = [&facts.run, &facts.paragraph].into_iter().flatten().fold(0u64, |held, rev| held.saturating_add(format_revision_strings(rev)));
+        budget.hold(CACHE_BYTES.saturating_add(strings))?;
         self.formats.insert(id, facts.clone());
-        facts
+        Ok(facts)
     }
 
     fn items(
@@ -408,7 +431,7 @@ impl Decoder<'_> {
         digests: &BTreeMap<u32, String>,
         budget: &mut Budget,
     ) -> Result<Vec<StreamItem>, String> {
-        let mut out = Vec::new();
+        let mut out = Decoded::default();
         // Open fields, innermost last: whether each is in its result yet.
         let mut fields: Vec<bool> = Vec::new();
         let digest = |piece: u32| digests.get(&piece).cloned().unwrap_or_default();
@@ -416,15 +439,15 @@ impl Decoder<'_> {
             let Some(item) = items.get(index) else { break };
             budget.work(3)?;
             if item.piece < MARK_BASE {
-                let format = self.format(item.format);
+                let format = self.format(item.format, budget)?;
                 let field = match (format.instr, fields.last()) {
                     (true, _) | (false, Some(false)) => FieldRole::Instruction,
                     (false, Some(true)) => FieldRole::Result,
                     (false, None) => FieldRole::None,
                 };
-                let revision = self.revision(item.wraps, Level::Text);
+                let revision = self.revision(item.wraps, Level::Text, budget)?;
                 let ch = char::from_u32(item.piece).unwrap_or(char::REPLACEMENT_CHARACTER);
-                out.push(StreamItem::Char { ch, format: FormatId(item.format), hidden: format.hidden, revision, format_revision: format.run, field });
+                out.push(StreamItem::Char { ch, format: FormatId(item.format), hidden: format.hidden, revision, format_revision: format.run, field }, budget)?;
                 continue;
             }
             let Some(mark) = self.tables.mark_info(item.piece) else { continue };
@@ -437,9 +460,9 @@ impl Decoder<'_> {
                         Some(Extra::Paragraph { origin, section }) => (*origin, section.as_ref()),
                         _ => (u32::MAX, None),
                     };
-                    let revision = self.revision(item.wraps, Level::Text);
-                    let format_revision = self.format(item.format).paragraph;
-                    out.push(StreamItem::ParagraphEnd { origin, props, revision, format_revision });
+                    let revision = self.revision(item.wraps, Level::Text, budget)?;
+                    let format_revision = self.format(item.format, budget)?.paragraph;
+                    out.push(StreamItem::ParagraphEnd { origin, props, revision, format_revision }, budget)?;
                     section.map(|(format, refs)| StreamItem::SectionBreak {
                         props: FormatId(*format),
                         headers: refs.headers.clone(),
@@ -493,8 +516,8 @@ impl Decoder<'_> {
                 }),
                 (_, Some(Extra::Open)) => Some(match &*mark.element {
                     "w:tbl" => StreamItem::TableStart { props },
-                    "w:tr" => StreamItem::RowStart { props, revision: self.revision(item.wraps, Level::Row) },
-                    "w:tc" => StreamItem::CellStart { props, revision: self.revision(item.wraps, Level::Cell) },
+                    "w:tr" => StreamItem::RowStart { props, revision: self.revision(item.wraps, Level::Row, budget)? },
+                    "w:tc" => StreamItem::CellStart { props, revision: self.revision(item.wraps, Level::Cell, budget)? },
                     element => StreamItem::Opaque { element: element.to_string(), digest: digest(item.piece) },
                 }),
                 // A container's end says nothing its start did not, except for those it closes.
@@ -509,25 +532,56 @@ impl Decoder<'_> {
                 _ => Some(StreamItem::Opaque { element: mark.element.to_string(), digest: digest(item.piece) }),
             };
             if let Some(decoded) = decoded {
-                out.push(decoded);
+                out.push(decoded, budget)?;
             }
         }
-        let held = out.iter().fold(budget::units(out.capacity()).saturating_mul(budget::units(std::mem::size_of::<StreamItem>())), |held, item| {
-            held.saturating_add(item_strings(item))
-        });
-        budget.hold(held)?;
-        Ok(out)
+        Ok(out.items)
     }
+}
+
+/// Decoded items, each growth of the vector and each item's strings charged before they are
+/// held: a large story is refused before it is decoded past the budget.
+#[derive(Default)]
+struct Decoded {
+    items: Vec<StreamItem>,
+}
+
+impl Decoded {
+    fn push(&mut self, item: StreamItem, budget: &mut Budget) -> Result<(), String> {
+        if self.items.len() == self.items.capacity() {
+            // The vector moves to its new room, both held while it moves.
+            let old = budget::units(self.items.capacity()).saturating_mul(ITEM_BYTES);
+            let more = self.items.capacity().max(64);
+            budget.hold(budget::units(self.items.capacity().saturating_add(more)).saturating_mul(ITEM_BYTES))?;
+            self.items.reserve_exact(more);
+            budget.release(old);
+        }
+        budget.hold(item_strings(&item))?;
+        self.items.push(item);
+        Ok(())
+    }
+}
+
+/// The memory of one decoded item, besides its strings.
+const ITEM_BYTES: u64 = std::mem::size_of::<StreamItem>() as u64;
+/// Memory charged for each cached revision and format, besides their strings.
+const CACHE_BYTES: u64 = budget::table_slot::<((u32, Level), Option<Revision>)>() + budget::table_slot::<(u32, FormatFacts)>();
+
+fn revision_strings(revision: &Revision) -> u64 {
+    budget::units(revision.author.len().saturating_add(revision.date.as_ref().map_or(0, String::len)))
+}
+
+fn format_revision_strings(revision: &FormatRevision) -> u64 {
+    budget::units(revision.author.len().saturating_add(revision.date.as_ref().map_or(0, String::len)))
 }
 
 /// The memory a decoded item's strings hold.
 fn item_strings(item: &StreamItem) -> u64 {
-    let revision = |revision: &Option<Revision>| {
-        revision.as_ref().map_or(0, |revision| budget::units(revision.author.len().saturating_add(revision.date.as_ref().map_or(0, String::len))))
-    };
+    let revision = |revision: &Option<Revision>| revision.as_ref().map_or(0, revision_strings);
     match item {
-        StreamItem::Char { revision: changed, format_revision, .. } | StreamItem::ParagraphEnd { revision: changed, format_revision, .. } => revision(changed)
-            .saturating_add(format_revision.as_ref().map_or(0, |rev| budget::units(rev.author.len().saturating_add(rev.date.as_ref().map_or(0, String::len))))),
+        StreamItem::Char { revision: changed, format_revision, .. } | StreamItem::ParagraphEnd { revision: changed, format_revision, .. } => {
+            revision(changed).saturating_add(format_revision.as_ref().map_or(0, format_revision_strings))
+        }
         StreamItem::RowStart { revision: changed, .. } | StreamItem::CellStart { revision: changed, .. } => revision(changed),
         StreamItem::Opaque { element, digest } => budget::units(element.len().saturating_add(digest.len())),
         StreamItem::Object { digest, media, alt, .. } => {

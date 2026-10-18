@@ -16,6 +16,8 @@ use super::xml::{XEl, XNode};
 const EXTRA_BYTES: u64 = tree_slot::<usize, Extra>();
 /// Memory charged for each mark's digest recorded: its entry and its 64 hex characters.
 const DIGEST_BYTES: u64 = tree_slot::<u32, String>() + 64;
+/// Memory charged for each text box's entry in the list of a part's text boxes.
+pub(super) const TEXT_BOX_BYTES: u64 = vector_slot::<TextBox>();
 /// Memory charged for each paragraph's origin.
 const ORIGIN_BYTES: u64 = vector_slot::<(usize, u32)>();
 

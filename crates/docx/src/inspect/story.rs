@@ -1212,6 +1212,7 @@ impl Walker<'_, '_> {
             }
             items.shrink_to_fit();
             self.budget.release(held.saturating_sub(items_held(&items)));
+            self.budget.hold(stream_extras::TEXT_BOX_BYTES)?;
             if let Some(extras) = self.extras.as_deref_mut() {
                 extras.text_boxes.push(TextBox { anchor, ordinal, items, by_item });
             }
