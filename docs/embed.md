@@ -7,7 +7,10 @@ find); API 0.2 (release `embed-v0.2.0`) adds **edit mode**, in which every chang
 change, and save, which hands the `.docx` bytes to the host ("Edit mode (API 0.2)"). Release
 `embed-v0.3.0` keeps the API and adds the `fullEditing` permission, and its save keeps the opened
 package: only the paragraphs the session changed are rewritten, every other part is the original's
-bytes, and a change that cannot be written that way is refused with its reason. Sources:
+bytes, and a change that cannot be written that way is refused with its reason. API 0.3 (release
+`embed-v0.4.0`) is the current API: it lets a host that draws its own controls and keeps two views
+level (a document comparison) drive the editor's display, zoom, scrolling, find and marks by location
+("API 0.3"); everything it adds is optional, and a 0.2 host runs unchanged. Sources:
 `apps/wordcraft-embed` (wasm-bindgen glue) and `crates/ui-egui/src/host/` (host bridge, view and
 edit mode, marks, selection, opening files).
 
@@ -148,6 +151,9 @@ editor.setMode({
 });
 editor.requestSave();
 editor.setMode({ mode: 'view' });
+// API 0.3: all optional (see "API 0.3").
+editor.setZoom({ zoom: 'pageWidth', token: 1 });
+editor.find({ text: 'Clause 5', step: 'first', token: 2 });
 editor.destroy();
 ```
 
@@ -156,8 +162,10 @@ editor.destroy();
 from API 0.2, `setMode(request: ModeRequest)`, `requestSave()` and `applyRedactions()` and, from API
 0.3, `setZoom(request: ZoomRequest)`, `scrollToBlock(request: ScrollRequest)`,
 `locate(request: LocateRequest)` and `find(request: FindRequest)`; `setMarks` takes `EditorMark[]` from API 0.3 (a 0.2 `Mark[]` still
-type-checks and behaves as before). The types,
-as `wordcraft_embed.d.ts` declares them (the package script fails if a declaration is missing):
+type-checks and behaves as before). A host handles the events it knows and **ignores event types it does
+not know**: an editor sends the 0.3 events (`zoomChanged`, `viewport` and the others in "API 0.3") whether or
+not the host asked for them, so a 0.2 host receives some it never expected, and a later API may add more.
+The types, as `wordcraft_embed.d.ts` declares them (the package script fails if a declaration is missing):
 
 ```ts
 export interface MountOptions {
@@ -367,15 +375,47 @@ the strip then says "Header (shared with sections N–M)". Making a new header o
 
 ## API 0.3
 
-Every 0.3 field is optional. A host that sends none of them sees exactly what API 0.2 showed.
+Every 0.3 field is optional. A host that sends none of them sees exactly what API 0.2 showed: the same
+display, the view bar, text marks, and a view mode whose command gate has not moved. Two things a 0.2
+host does see are events it never asked for (it should ignore event types it does not know, as above):
+`viewport` after every `opened` and when the view moves, `zoomChanged` when the person zooms, and
+`findRequested` only without a view bar (which a 0.2 host never mounts).
+
+| Item | JSON shape | 0.2 compatibility |
+|---|---|---|
+| `open` option `display` | `open(bytes, name, { display: 'asStored' \| 'final' })` | Absent, `null` options and `'asStored'` are 0.2's display |
+| `mount` option `viewBar` | `{ mode: 'view', theme, viewBar: false }` | Absent or `true` is 0.2's bar |
+| `setZoom` | `{ zoom: 10..500 \| 'pageWidth', token }` | New method; 0.2 had zoom only in the bar and by keys |
+| `zoomChanged` | `{ type: 'zoomChanged', percent, pageWidth, cause: 'user' \| 'host', token: number \| null }` | New event; ignorable |
+| `scrollToBlock` | `{ block: { part, index }, fraction, token }` | New method |
+| `viewport` | `{ type: 'viewport', top: BlockRef \| null, fraction, visibleHeight, page, pages, cause: 'user' \| 'host', token: number \| null }` | New event; ignorable (`pageChanged` is unchanged) |
+| `blockNotFound` | `{ type: 'blockNotFound', block, token }` | New event; sent only for a `scrollToBlock` |
+| `locate` | `{ blocks: BlockRef[], token }` | New method |
+| `located` | `{ type: 'located', positions: (number \| null)[], height, token }` | New event; sent only for a `locate` |
+| `setMarks` by location | `{ id, color, style?, at: { block, fingerprint: { length, hash }, from?, to? } }` | A `Mark[]` of text marks behaves as in 0.2 (`style` absent is `fill`) |
+| `locationMismatch` | `{ type: 'locationMismatch', ids: string[] }` | New event; sent only for location marks |
+| `marksDropped` | `{ type: 'marksDropped', count }` | New event; sent only when `setMarks` was given more than 2,000 marks |
+| `jumpTo` a location | `{ kind: 'location', at }` | New kind of target; `jumpNotFound` answers as for any jump |
+| `find` | `{ text, matchCase?, step: 'first' \| 'next' \| 'previous', select?, token }` | New method; the bar's find is as before |
+| `findResult` | `{ type: 'findResult', count, index: number \| null, token }` | New event; sent only for a `find` |
+| `findRequested` | `{ type: 'findRequested' }` | New event; sent only without a view bar |
+
+- **Tokens.** A `token` is a whole number from 0 to 4,294,967,295 that the host chooses and the answer
+  echoes; anything else is a `TypeError` (below).
+- **`null` and absent.** `null` for `open`'s `options` argument reads as no options (it is declared
+  `options?: OpenOptions | null`), and `null` for a mark's `page`, `from` or `to` reads as absent. Inside
+  an options object, the other optional fields (`display`, `viewBar`, `style`, `matchCase`, `select`) are
+  left out, not `null`: `null` there is a `TypeError`.
 
 ### Clean display
 
 `open(bytes, fileName, { display: 'final' })` shows the document as it reads once its tracked
 changes are accepted: deleted wording leaves the pages, inserted wording reads as ordinary text, and
-there are no balloons or comment margin. The file is never changed, and what `saveRequested` carries
-in edit mode is as before. `display: 'asStored'`, and no options at all, is API 0.2's display: tracked
-changes marked up as the file holds them.
+there are no balloons or comment margin. The file is never changed. `display: 'asStored'`, and no
+options at all, is API 0.2's display: tracked changes marked up as the file holds them.
+
+- **Not with edit mode.** The clean display combined with edit mode is not supported; a host that
+  edits opens the document as stored.
 
 - **A display per open.** The display belongs to the `open` that asked for it. The next `open`
   without `display: 'final'` shows its document as stored again, with the markup view settings the
@@ -392,13 +432,15 @@ changes marked up as the file holds them.
 ### No view bar
 
 `mount(canvas, { mode: 'view', theme, viewBar: false })` mounts without the editor's own view bar
-(page, zoom and find controls), so the document starts at the top of the canvas and the host draws
-its own controls. Absent or `true` is API 0.2's bar. `viewBar` that is not a boolean rejects the
+(page, zoom and find controls), so the document gets the bar's height back and the host draws its own
+controls (the 8 pt gap above the first page remains). Absent or `true` is API 0.2's bar. `viewBar` that is not a boolean rejects the
 `mount` promise with a `TypeError`.
 
 - **Ctrl/⌘+F asks the host.** Without a bar there is no find field to focus, and view mode opens no
   find pane or dialog, so Ctrl/⌘+F (and the Find command without text) sends `{ type: 'findRequested' }`
   and nothing else; the host opens its own find. Find with text, and `jumpTo`, work as before.
+  `findRequested` is also sent in edit mode when there is no bar, and never when there is one (the
+  bar's find field takes the focus).
 - **Edit mode needs the bar.** The edit strip lives in the view bar. `setMode({ mode: 'edit', ... })`
   on a bar-less editor is for hosts that do not edit in it; its edit controls are not drawn.
 - **View mode's command gate is unchanged.**
@@ -456,12 +498,13 @@ the view is in document terms, so two editors can be kept scrolled level without
 - **`cause: 'user'`** (and `token: null`) means the person's own input moved the view: a mouse
   wheel or trackpad scroll (and its easing), a drag on the scroll bar, a touch drag, a scroll key
   (Page Up/Down, Home/End, the arrows) while the document has the keyboard, or a press or drag in the
-  document (a caret that scrolls into view, a selection drag at the view's edge). A glide that
-  input starts keeps the cause for the frames it takes (for up to a second if it has not begun).
+  document (a selection drag at the view's edge). Only the person's own input counts: typing in edit
+  mode that scrolls the caret into view is `host`. A glide that input starts keeps the cause for the
+  frames it takes (for up to a second if it has not begun).
 - **`cause: 'host'` with `token: null`** is every other change: the first reading after an `open`,
   the layout settling after it, the host's `jumpTo` and `setZoom` and the reflow they cause, a
-  person's Ctrl/⌘+wheel zoom (told by `zoomChanged`), the edit strip taking room from the view, and a
-  resize of the canvas. A host that keeps two editors level makes the side the person moves the
+  person's Ctrl/⌘+wheel zoom (told by `zoomChanged`), typing that scrolls the caret into view, the edit
+  strip taking room from the view, and a resize of the canvas. A host that keeps two editors level makes the side the person moves the
   leader, so only `'user'` events should hand over the lead.
 - **`cause: 'host'` with a `token`** answers `scrollToBlock`; only that carries a token.
 
@@ -589,8 +632,9 @@ through the matches, for a host that draws its own find (see No view bar; with t
 the two share one search, and the bar's field shows the host's text). It works with and without the
 bar, in view mode and while the document is in edit mode, and changes nothing in the document.
 
-- **`step`.** `'first'` searches from where the search began (typing on refines the search, so each
-  keystroke sends `'first'` and the match does not skip ahead), or from the top of the body when none
+- **`step`.** `'first'` searches from the current position: the point the search began at, or, after a
+  `'next'` or `'previous'`, the current match, which it stays on (so typing on refines the search, each
+  keystroke sends `'first'` and the match does not skip ahead), or from the top of the body when no search
   began; `'next'` and `'previous'` go from the current match and wrap past the ends. A `next` or
   `previous` whose `text` or `matchCase` differs from the last search begins a new one, as `'first'`.
   The search is of the document's body, literal text (no patterns, not whole words), and ignores case unless `matchCase` is true.
