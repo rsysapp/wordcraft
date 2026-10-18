@@ -531,6 +531,7 @@ fn auto_tag(doc: &Document, src: &Source) -> String {
 }
 
 /// The author of a source for matching untagged entries: the editor when there is no author.
+#[cfg(not(target_arch = "wasm32"))]
 fn by_author(x: &Source) -> &str {
     if x.author.is_empty() { x.editor.as_str() } else { x.author.as_str() }
 }
@@ -589,7 +590,7 @@ fn import_sources(s: &mut Session, path: &str) -> Result<(), CmdError> {
     #[cfg(target_arch = "wasm32")]
     {
         let _ = (s, path);
-        return Err(CmdError::Failed("reading files by path isn't available on the web".into()));
+        Err(CmdError::Failed("reading files by path isn't available on the web".into()))
     }
     #[cfg(not(target_arch = "wasm32"))]
     {
