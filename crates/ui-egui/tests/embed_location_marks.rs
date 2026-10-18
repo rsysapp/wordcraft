@@ -302,3 +302,46 @@ fn a_location_mark_parses_with_its_defaults() {
     assert_eq!(marks[2].at.as_ref().unwrap().from, Some(u32::MAX), "a huge offset saturates and is later reported");
     assert!(parse_marks(r##"[{"id":"x","color":"#000000","text":"a","style":"glow"}]"##).is_err());
 }
+
+#[test]
+fn a_rangeless_bar_spans_its_table_even_when_the_first_cell_is_empty() {
+    use std::sync::Arc;
+    use wordcraft_doc::props::CharProps;
+    use wordcraft_doc::{Block, Document, Paragraph, Table, para_block};
+    let line = |text: &str| Paragraph::with_text(text, CharProps::default());
+    let mut table = Table::new(6, 1, 300.0);
+    for (row, slot) in table.rows.iter_mut().enumerate() {
+        let text = if row == 0 { String::new() } else { format!("Fee {row}. Payable within thirty days of the invoice.") };
+        slot.cells[0].blocks = vec![para_block(line(&text))];
+    }
+    let mut doc = Document::new();
+    doc.body = vec![para_block(line("Schedule of fees")), Arc::new(Block::Table(table)), para_block(line("End of the schedule."))];
+    let (mut h, bridge) = embed_app();
+    open_doc(&mut h, &bridge, &doc);
+    let first_cell_path = Path(vec![1, 0, 0, 0]);
+    let first_cell = paragraph_text_at(&h, &first_cell_path);
+    assert_eq!(first_cell, "", "the table's first paragraph has no text");
+    let origin = origin_at(&h, &first_cell_path);
+    bridge.send(HostCommand::SetMarks(vec![location_mark("table", origin, &first_cell, None, None, MarkStyle::Bar)]));
+    settle_marks(&mut h);
+    let rects = painted_marks(&h);
+    assert_eq!(rects.len(), 1);
+    let table_height = table_height_on_screen(&mut h, 1);
+    assert!(rects[0].height() >= table_height - 2.0, "the bar ({}) covers the table ({table_height}), not one line", rects[0].height());
+    assert!(mismatches(&bridge.take_events()).is_empty());
+}
+
+#[test]
+fn a_range_after_non_ascii_text_is_painted_on_its_words() {
+    let (mut h, bridge) = embed_app();
+    open_doc(&mut h, &bridge, &wordcraft_doc::Document::from_text("Caf\u{e9} \u{1F600} Rent due sixty days."));
+    let text = paragraph_text(&h, 0);
+    // "Caf\u{e9} " is 5 units and the emoji 2 (a surrogate pair), then a space: "Rent due" is units 8 to 16.
+    assert_eq!(text.encode_utf16().skip(8).take(8).collect::<Vec<u16>>(), "Rent due".encode_utf16().collect::<Vec<u16>>());
+    bridge.send(HostCommand::SetMarks(vec![location_mark("words", 0, &text, Some(8), Some(16), MarkStyle::Fill)]));
+    settle_marks(&mut h);
+    let rects = painted_marks(&h);
+    assert_eq!(rects.len(), 1);
+    assert_close_to_words(&mut h, &rects[0], 0, 8..16);
+    assert_eq!(selected_words_under(&mut h, 0, &rects[0]), "Rent due");
+}

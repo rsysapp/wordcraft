@@ -229,17 +229,18 @@ fn place_location(
     Some(match style {
         MarkStyle::Fill | MarkStyle::Outline if from == to => Vec::new(),
         MarkStyle::Fill | MarkStyle::Outline => words(&start, &end).into_iter().filter(|(_, rect)| rect.w > 0.0).collect(),
+        MarkStyle::Bar if whole => {
+            // No range: the whole top-level block (first, so that a paragraph without text, whose range
+            // is also empty, still gets it), which for a table is every row of it.
+            let (first, last) = block_span(doc, usize::try_from(*path.0.first()?).ok()?)?;
+            bars_beside(&words(&first, &last))
+        }
         MarkStyle::Bar if from == to => {
             // The place between two characters: the line it is on, in the margin beside the paragraph.
             let caret = layout.caret_on(&start, 0)?;
             let beside = words(&position(0), &position(paragraph.text.len()));
             let left = beside.iter().filter(|(page, _)| *page == caret.page).map(|(_, rect)| rect.x).reduce(f32::min).unwrap_or(caret.x);
             vec![(caret.page, bar_beside(left, caret.top, caret.top + caret.height))]
-        }
-        MarkStyle::Bar if whole => {
-            // No range: the whole top-level block, which for a table is every row of it.
-            let (first, last) = block_span(doc, usize::try_from(*path.0.first()?).ok()?)?;
-            bars_beside(&words(&first, &last))
         }
         MarkStyle::Bar => bars_beside(&words(&start, &end)),
     })
