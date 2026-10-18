@@ -25,6 +25,8 @@ mod xml;
 
 // embed: the edited-against-base comparison a host's server runs on every save.
 pub mod inspect;
+// embed: paragraph facts for Clauflow's version comparison.
+pub mod facts;
 
 pub use chart_spec::{chart_items, chart_xml};
 pub use crypt::{
