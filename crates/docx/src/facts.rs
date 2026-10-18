@@ -5,7 +5,8 @@
 
 use wordcraft_doc::numbering::Counters;
 use wordcraft_doc::props::{Rgb, TextColor};
-use wordcraft_doc::{Document, PartKind, StoryRef};
+use wordcraft_doc::styles::PartSet;
+use wordcraft_doc::{Block, CharProps, Document, ParaProps, PartKind, StoryRef};
 
 use crate::package::Package;
 use crate::{DocxError, ReadLimits};
@@ -77,6 +78,11 @@ fn story_facts(doc: &Document, part_names: &[String], story: StoryRef, out: &mut
         let Some(origin) = paragraph.origin else { continue };
         let Some(part) = usize::try_from(origin.part).ok().and_then(|index| part_names.get(index)) else { continue };
         let style = paragraph.props.style.as_deref();
+        let cell = in_cell(doc, story, &path.0);
+        let resolved = match &cell {
+            Some(cell) => doc.styles.resolve_para_in(&paragraph.props, Some(&cell.para)),
+            None => resolved,
+        };
         let mut concealed: Vec<(Conceal, String)> = Vec::new();
         // How the run before was concealed: neighbouring runs concealed the same way are one passage.
         let mut previous: Option<Conceal> = None;
@@ -88,8 +94,14 @@ fn story_facts(doc: &Document, part_names: &[String], story: StoryRef, out: &mut
             if text.is_empty() {
                 continue;
             }
-            let character = doc.styles.resolve_char(style, &run.props);
-            let behind = character.highlight.or(character.shading).or(resolved.shading).or(doc.settings.page_color).unwrap_or(Rgb(255, 255, 255));
+            let character = doc.styles.resolve_char_in(style, cell.as_ref().map(|cell| &cell.chr), &run.props);
+            let behind = character
+                .highlight
+                .or(character.shading)
+                .or(resolved.shading)
+                .or(cell.as_ref().and_then(|cell| cell.fill))
+                .or(doc.settings.page_color)
+                .unwrap_or(Rgb(255, 255, 255));
             let conceal = if character.hidden {
                 Some(Conceal::Hidden)
             } else if matches!(character.color, TextColor::Rgb(colour) if distance(colour, behind) <= COLOUR_DISTANCE) {
@@ -115,6 +127,50 @@ fn story_facts(doc: &Document, part_names: &[String], story: StoryRef, out: &mut
             concealed,
         });
     }
+}
+
+/// What the table cell a paragraph is in gives its text, as layout gives it: the innermost
+/// cell's table style formatting for its region (header row, bands, …), and what is painted
+/// behind the cell (its own shading, else its table style region's, else its table's, else the
+/// cell around its table).
+struct InCell {
+    para: ParaProps,
+    chr: CharProps,
+    fill: Option<Rgb>,
+}
+
+/// The cell holding the paragraph at `path` (`[block, row, cell, block, …]`), if any.
+fn in_cell(doc: &Document, story: StoryRef, path: &[u32]) -> Option<InCell> {
+    let mut blocks = doc.story(story)?;
+    let mut found: Option<InCell> = None;
+    let mut rest = path;
+    while let [block, row_index, cell_index, tail @ ..] = rest {
+        let index = |at: &u32| usize::try_from(*at).ok();
+        let Block::Table(table) = blocks.get(index(block)?)?.as_ref() else { return found };
+        let row = table.rows.get(index(row_index)?)?;
+        let cell_at = index(cell_index)?;
+        let cell = row.cells.get(cell_at)?;
+        // Grid columns are counted from the row's first cell, as layout counts them.
+        let column: usize = row.cells.iter().take(cell_at).map(|cell| cell.span()).sum();
+        let style = table.props.style.as_deref().and_then(|id| doc.styles.table_style(id));
+        let (mut para, mut chr, mut region_fill) = (ParaProps::default(), CharProps::default(), None);
+        if let Some(style) = &style {
+            let region = PartSet::of_cell(&table.props.look, style.parts.band_size.unwrap_or(1), (index(row_index)?, table.rows.len()), (column, cell.span(), table.cols()));
+            para = style.para.clone();
+            // Lowest precedence first (ECMA-376 §17.7.6).
+            for part in region.iter() {
+                let format = style.part(part);
+                chr.overlay(&format.chr);
+                para.align = format.align.or(para.align);
+                region_fill = format.fill.or(region_fill);
+            }
+        }
+        let outer = found.as_ref().and_then(|outer| outer.fill);
+        found = Some(InCell { para, chr, fill: cell.props.shading.or(region_fill).or(table.props.shading).or(outer) });
+        blocks = &cell.blocks;
+        rest = tail;
+    }
+    found
 }
 
 /// The largest difference between two colours' channels.
@@ -172,6 +228,31 @@ mod tests {
     }
 
     #[test]
+    fn concealment_by_a_table_style_is_listed() {
+        // The style hides the header row's text and colours the rest white.
+        let bytes = test_package::table_styled(&["Hidden header", "Hidden too"], &["White cell", "Also white"]);
+        let facts = paragraph_facts(&bytes, &LIMITS).unwrap();
+        let concealed: Vec<&(Conceal, String)> = facts.iter().flat_map(|fact| &fact.concealed).collect();
+        assert_eq!(
+            concealed,
+            vec![
+                &(Conceal::Hidden, "Hidden header".into()),
+                &(Conceal::Hidden, "Hidden too".into()),
+                &(Conceal::Colour, "White cell".into()),
+                &(Conceal::Colour, "Also white".into()),
+            ]
+        );
+    }
+
+    #[test]
+    fn text_coloured_like_its_cell_is_concealed_and_light_text_on_a_dark_cell_is_not() {
+        let bytes = test_package::shaded_cells(&[("000000", "000000", "Black on black"), ("000000", "FFFFFF", "White on black")]);
+        let facts = paragraph_facts(&bytes, &LIMITS).unwrap();
+        assert_eq!(facts[0].concealed, vec![(Conceal::Colour, "Black on black".into())]);
+        assert_eq!(facts[1].concealed, vec![]);
+    }
+
+    #[test]
     fn origins_and_parts_name_the_paragraphs() {
         let bytes = test_package::numbered(&[(0, "One"), (0, "Two")]);
         let facts = paragraph_facts(&bytes, &LIMITS).unwrap();
@@ -196,6 +277,10 @@ mod tests {
         const REL: &str = "http://schemas.openxmlformats.org/officeDocument/2006/relationships";
 
         fn zip(body: &str, header: Option<&str>) -> Vec<u8> {
+            zip_styled(body, header, "")
+        }
+
+        fn zip_styled(body: &str, header: Option<&str>, extra_styles: &str) -> Vec<u8> {
             let header_type = r#"<Override PartName="/word/header1.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.header+xml"/>"#;
             let types = format!(
                 r#"<?xml version="1.0" encoding="UTF-8"?><Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"><Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/><Default Extension="xml" ContentType="application/xml"/><Override PartName="/word/document.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.document.main+xml"/><Override PartName="/word/styles.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.styles+xml"/><Override PartName="/word/numbering.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.numbering+xml"/>{}</Types>"#,
@@ -208,7 +293,7 @@ mod tests {
             );
             let section = if header.is_some() { r#"<w:sectPr><w:headerReference w:type="default" r:id="rId3"/></w:sectPr>"# } else { "" };
             let styles = format!(
-                r#"<w:styles {W}><w:style w:type="paragraph" w:default="1" w:styleId="Normal"><w:name w:val="Normal"/><w:rPr><w:sz w:val="22"/></w:rPr></w:style><w:style w:type="paragraph" w:styleId="Heading1"><w:name w:val="heading 1"/><w:basedOn w:val="Normal"/><w:pPr><w:outlineLvl w:val="0"/></w:pPr></w:style></w:styles>"#
+                r#"<w:styles {W}><w:style w:type="paragraph" w:default="1" w:styleId="Normal"><w:name w:val="Normal"/><w:rPr><w:sz w:val="22"/></w:rPr></w:style><w:style w:type="paragraph" w:styleId="Heading1"><w:name w:val="heading 1"/><w:basedOn w:val="Normal"/><w:pPr><w:outlineLvl w:val="0"/></w:pPr></w:style>{extra_styles}</w:styles>"#
             );
             let numbering = format!(
                 r#"<w:numbering {W}><w:abstractNum w:abstractNumId="0"><w:lvl w:ilvl="0"><w:start w:val="1"/><w:numFmt w:val="decimal"/><w:lvlText w:val="%1."/></w:lvl><w:lvl w:ilvl="1"><w:start w:val="1"/><w:numFmt w:val="decimal"/><w:lvlText w:val="%1.%2"/></w:lvl></w:abstractNum><w:num w:numId="1"><w:abstractNumId w:val="0"/></w:num></w:numbering>"#
@@ -245,6 +330,31 @@ mod tests {
         pub fn styled(paragraphs: &[(&str, &str)]) -> Vec<u8> {
             let body: String = paragraphs.iter().map(|(style, text)| format!(r#"<w:p><w:pPr><w:pStyle w:val="{style}"/></w:pPr><w:r><w:t>{text}</w:t></w:r></w:p>"#)).collect();
             zip(&body, None)
+        }
+
+        fn cell(text: &str, properties: &str, run_properties: &str) -> String {
+            format!(r#"<w:tc><w:tcPr>{properties}</w:tcPr><w:p><w:r><w:rPr>{run_properties}</w:rPr><w:t xml:space="preserve">{text}</w:t></w:r></w:p></w:tc>"#)
+        }
+
+        /// A two-row table in a style that hides its header row and colours its text white.
+        pub fn table_styled(header: &[&str], body: &[&str]) -> Vec<u8> {
+            let style = r#"<w:style w:type="table" w:styleId="Sly"><w:name w:val="Sly"/><w:rPr><w:color w:val="FFFFFF"/></w:rPr><w:tblStylePr w:type="firstRow"><w:rPr><w:vanish/></w:rPr></w:tblStylePr></w:style>"#;
+            let row = |texts: &[&str]| format!("<w:tr>{}</w:tr>", texts.iter().map(|text| cell(text, "", "")).collect::<String>());
+            let table = format!(
+                r#"<w:tbl><w:tblPr><w:tblStyle w:val="Sly"/><w:tblLook w:firstRow="1" w:lastRow="0" w:firstColumn="0" w:lastColumn="0" w:noHBand="1" w:noVBand="1"/></w:tblPr><w:tblGrid><w:gridCol/><w:gridCol/></w:tblGrid>{}{}</w:tbl><w:p/>"#,
+                row(header),
+                row(body)
+            );
+            zip_styled(&table, None, style)
+        }
+
+        /// One row of cells, each `(fill, font colour, text)`.
+        pub fn shaded_cells(cells: &[(&str, &str, &str)]) -> Vec<u8> {
+            let cells: String = cells
+                .iter()
+                .map(|(fill, colour, text)| cell(text, &format!(r#"<w:shd w:val="clear" w:fill="{fill}"/>"#), &format!(r#"<w:color w:val="{colour}"/>"#)))
+                .collect();
+            zip(&format!("<w:tbl><w:tblPr/><w:tblGrid><w:gridCol/><w:gridCol/></w:tblGrid><w:tr>{cells}</w:tr></w:tbl><w:p/>"), None)
         }
 
         pub fn runs(runs: &[(&str, &str)]) -> Vec<u8> {
