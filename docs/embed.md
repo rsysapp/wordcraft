@@ -432,13 +432,18 @@ the view is in document terms, so two editors can be kept scrolled level without
   `cause: 'host'` with `token: null`, the baseline. After that one is sent after a frame in which
   `top`, `fraction` (to a thousandth), `page`, `pages` or `visibleHeight` (to a tenth) changed, at
   most one per frame; a view that did not change sends nothing. A resize or a layout settling is a
-  change too, and is not told apart from the person scrolling.
-- **`cause: 'user'`** (and `token: null`) is any change that does not answer a `scrollToBlock`: the
-  wheel, a trackpad, the scroll bar, a drag, a key, a zoom, a resize, the view bar's page controls,
-  and also what the host's other calls cause (`jumpTo`, `setZoom`, entering edit mode, which takes
-  room from the view). The editor does not tell those apart; a host that must tell its own calls
-  apart uses `scrollToBlock` and its token.
-- **`cause: 'host'` with a `token`** answers `scrollToBlock`.
+  change too (`cause: 'host'`, below).
+- **`cause: 'user'`** (and `token: null`) means the person's own input moved the view: a mouse
+  wheel or trackpad scroll (and its easing), a drag on the scroll bar, a touch drag, a scroll key
+  (Page Up/Down, Home/End, the arrows) while the document has the keyboard, or a press or drag in the
+  document (a caret that scrolls into view, a selection drag at the view's edge). A glide that
+  input starts keeps the cause for the frames it takes (for up to a second if it has not begun).
+- **`cause: 'host'` with `token: null`** is every other change: the first reading after an `open`,
+  the layout settling after it, the host's `jumpTo` and `setZoom` and the reflow they cause, a
+  person's Ctrl/⌘+wheel zoom (told by `zoomChanged`), the edit strip taking room from the view, and a
+  resize of the canvas. A host that keeps two editors level makes the side the person moves the
+  leader, so only `'user'` events should hand over the lead.
+- **`cause: 'host'` with a `token`** answers `scrollToBlock`; only that carries a token.
 
 `scrollToBlock({ block, fraction, token })` puts `fraction` (0 to 1) of the block `block` names at
 the top of the view, with nothing selected and no margin above it. `block` may name any body

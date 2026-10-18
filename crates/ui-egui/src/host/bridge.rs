@@ -99,8 +99,9 @@ pub enum HostEvent {
     /// top (0 to 1), `visible_height` the view's height in document points, `page` the 1-based page at
     /// the top of the view and `pages` the page count. Sent once per frame at most, when one of them
     /// changed. A scroll the host asked for (`scrollToBlock`) is answered with `cause: Host` and its
-    /// token; the first one after `Opened` is `Host` without a token; any other is the person's
-    /// (`User`).
+    /// token. Without a token, `User` means the person's own input moved the view (wheel, scroll bar,
+    /// scroll keys, a press or drag in the document); every other change, the first reading after
+    /// `Opened`, the host's `jumpTo` and `setZoom`, layout settling and a resize, is `Host`.
     Viewport {
         top: Option<BlockRef>,
         fraction: f32,

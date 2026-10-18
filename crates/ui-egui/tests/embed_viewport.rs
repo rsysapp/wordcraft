@@ -7,7 +7,7 @@ mod common;
 use common::*;
 use egui_kittest::Harness;
 use wordcraft_ui_egui::WordApp;
-use wordcraft_ui_egui::host::{BlockRef, Cause, HostCommand, HostEvent, ScrollRequest};
+use wordcraft_ui_egui::host::{BlockRef, Cause, HostCommand, HostEvent, JumpTarget, ScrollRequest, ZoomRequest, ZoomValue};
 
 const BODY: &str = "word/document.xml";
 
@@ -164,4 +164,97 @@ fn a_table_is_named_by_its_first_paragraph_and_scrolled_to_whole() {
         scroll_to(&mut h, &bridge, 0, 0.0, 30);
         bridge.take_events();
     }
+}
+
+/// Every `viewport` since the last call must be the host's own doing, without a token.
+fn assert_all_host_without_token(events: Vec<HostEvent>, what: &str) {
+    let events = viewports(events);
+    assert!(!events.is_empty(), "{what} moved the view, so a viewport is due");
+    assert!(events.iter().all(|event| matches!(event, HostEvent::Viewport { cause: Cause::Host, token: None, .. })), "{what}: {events:?}");
+}
+
+#[test]
+fn a_host_jump_is_not_the_persons_scroll() {
+    let (mut h, bridge) = embed_app();
+    open_doc(&mut h, &bridge, &clauses(120));
+    bridge.take_events();
+    bridge.send(HostCommand::JumpTo(JumpTarget::Page { page: 5 }));
+    frames(&mut h, 6);
+    let events = bridge.take_events();
+    let moved = viewports(events.clone());
+    assert!(moved.iter().any(|event| matches!(event, HostEvent::Viewport { page: 5, .. })), "the jump reached page 5: {events:?}");
+    assert_all_host_without_token(events, "jumpTo");
+}
+
+#[test]
+fn a_host_zoom_and_its_reflow_are_not_the_persons_scroll() {
+    let (mut h, bridge) = embed_app();
+    open_doc(&mut h, &bridge, &clauses(120));
+    scroll_to(&mut h, &bridge, 80, 0.0, 1);
+    bridge.take_events();
+    bridge.send(HostCommand::SetZoom(ZoomRequest { zoom: ZoomValue::Percent(300), token: 2 }));
+    frames(&mut h, 6);
+    assert_all_host_without_token(bridge.take_events(), "setZoom");
+}
+
+#[test]
+fn a_window_resize_is_not_the_persons_scroll() {
+    let (mut h, bridge) = embed_app();
+    open_doc(&mut h, &bridge, &clauses(120));
+    scroll_to(&mut h, &bridge, 80, 0.5, 1);
+    bridge.take_events();
+    h.set_size(egui::vec2(700.0, 500.0));
+    frames(&mut h, 6);
+    assert_all_host_without_token(bridge.take_events(), "a resize");
+}
+
+#[test]
+fn page_down_in_the_document_is_the_persons_scroll() {
+    let (mut h, bridge) = embed_app();
+    open_doc(&mut h, &bridge, &clauses(120));
+    // The canvas has the keyboard after a click in the text, as for a person reading.
+    let at = screen_of(&mut h, &wordcraft_doc::Pos::body(0, 3));
+    click(&mut h, at, egui::PointerButton::Primary);
+    frames(&mut h, 2);
+    assert!(h.state().canvas.focused);
+    bridge.take_events();
+    h.key_press(egui::Key::PageDown);
+    frames(&mut h, 4);
+    let events = viewports(bridge.take_events());
+    assert!(!events.is_empty(), "PageDown moved the view");
+    assert!(events.iter().all(|event| matches!(event, HostEvent::Viewport { cause: Cause::User, token: None, .. })), "{events:?}");
+}
+
+#[test]
+fn a_block_cut_by_a_page_break_is_one_block_and_a_fraction_of_it_lands_on_its_second_page() {
+    use wordcraft_doc::props::CharProps;
+    use wordcraft_doc::{Document, Paragraph, Pos, para_block};
+    let line = |text: &str| Paragraph::with_text(text, CharProps::default());
+    let long = "The Supplier shall deliver the goods listed in the Schedule within thirty days of the order. ".repeat(40);
+    let mut body: Vec<_> = (0..5).map(|i| para_block(line(&format!("Clause {i}. Short.")))).collect();
+    body.push(para_block(line(&long)));
+    body.extend((6..30).map(|i| para_block(line(&format!("Clause {i}. Short.")))));
+    let mut doc = Document::new();
+    doc.body = body;
+    let (mut h, bridge) = embed_app();
+    open_doc(&mut h, &bridge, &doc);
+    let (first_page, last_page) = {
+        let app = h.state_mut();
+        let layout = app.session.layout();
+        let first = layout.caret_on(&Pos::body(5, 0), 0).expect("laid out").page;
+        let last = layout.caret_on(&Pos::body(5, long.trim_end().len()), 0).expect("laid out").page;
+        (first, last)
+    };
+    assert!(last_page > first_page, "the fixture's paragraph must span a page break: pages {first_page} to {last_page}");
+    bridge.take_events();
+    scroll_to(&mut h, &bridge, 5, 0.9, 7);
+    let last = viewports(bridge.take_events()).pop().expect("a viewport after the scroll");
+    let HostEvent::Viewport { top, fraction, page, cause, token, .. } = last else { unreachable!() };
+    assert_eq!((top, cause, token), (Some(block(5)), Cause::Host, Some(7)));
+    assert!((fraction - 0.9).abs() < 0.1, "the fraction survives the page break: {fraction}");
+    assert!(
+        page as usize > first_page + 1,
+        "the view is on the block's later page, not its first: page {page}, block starts on page {}",
+        first_page + 1
+    );
 }

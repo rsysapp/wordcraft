@@ -64,6 +64,16 @@ pub(crate) struct ViewportState {
     pub(crate) scroll_token: Option<u32>,
     /// The last reading the host was told; `None` until the first after an open.
     pub(crate) last: Option<ViewKey>,
+    /// The person's own input reached the canvas this frame (`state::person_input`).
+    pub(crate) person_input: bool,
+    /// The person's input started a move that is still under way (a key's or a bar drag's glide
+    /// takes frames after the input); it ends with a frame in which the view did not change, or
+    /// when a host call moves the view.
+    pub(crate) person_moving: bool,
+    /// The view changed since the last input of the person's, so the glide has begun.
+    pub(crate) moved_since_input: bool,
+    /// Egui's time of the person's last input.
+    pub(crate) last_input_time: f64,
 }
 
 impl ViewportState {

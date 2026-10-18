@@ -245,10 +245,20 @@ pub(crate) fn before_frame(app: &mut WordApp, ctx: &egui::Context) {
     let Some(mut host) = app.host.take() else { return };
     host.frame = ctx.cumulative_frame_nr();
     // Read before the canvas's scroll area consumes the frame's scroll delta.
+    host.viewport.person_input = person_input(ctx, app.canvas.canvas_rect, app.canvas.focused);
     if host.page_target.is_some() && scrolled_by_person(ctx, app.canvas.canvas_rect, app.canvas.focused) {
         host.page_target = None;
     }
+    let mut host_moves_view = false;
     for command in host.bridge.take_commands() {
+        host_moves_view |= matches!(
+            command,
+            HostCommand::Open { .. }
+                | HostCommand::OpenTooLarge { .. }
+                | HostCommand::JumpTo(_)
+                | HostCommand::SetZoom(_)
+                | HostCommand::ScrollToBlock(_)
+        );
         match command {
             HostCommand::Open { name, bytes, options } => {
                 super::edit::before_open(app, &mut host);
@@ -269,6 +279,10 @@ pub(crate) fn before_frame(app: &mut WordApp, ctx: &egui::Context) {
             HostCommand::SetZoom(request) => set_zoom(app, &mut host, &request),
             HostCommand::ScrollToBlock(request) => scroll_to_block(app, &mut host, &request),
         }
+    }
+    // A host call replaces a glide the person's input started; the move is the host's from here.
+    if host_moves_view && !host.viewport.person_input {
+        host.viewport.person_moving = false;
     }
     app.host = Some(host);
 }
@@ -323,11 +337,19 @@ fn scroll_to_block(app: &mut WordApp, host: &mut HostState, request: &ScrollRequ
     host.viewport.scroll_token = Some(request.token);
 }
 
+/// How long after the person's input a move still counts as theirs when none has begun: a key's
+/// scroll starts gliding a frame or two after the key press.
+const PERSON_GLIDE_GRACE_SECONDS: f64 = 1.0;
+
 /// Tell the host where the view is, after the frame that drew it, when it changed. Its own
 /// `scrollToBlock` is answered once its scroll has landed, with its token, even when the view was
-/// already there (it may be waiting on the token); the first reading after an open is `Host` without
-/// one; any other change is the person's (or the pages moving under them: a resize, a layout).
-fn report_viewport(app: &mut WordApp, host: &mut HostState) {
+/// already there (it may be waiting on the token). Otherwise the cause is `User` only when the
+/// person's own input moved the view in that frame (see [`person_input`]; a wheel's easing counts as
+/// the wheel's); everything else is `Host` without a token: the first reading after an open, the
+/// host's `jumpTo` and `setZoom` and the reflow they cause, layout settling and a resize. A host's
+/// scroll sync makes the side the reviewer moves the leader, so the host's own calls must not look
+/// like the reviewer.
+fn report_viewport(app: &mut WordApp, host: &mut HostState, ctx: &egui::Context) {
     if !host.opened {
         return;
     }
@@ -336,13 +358,25 @@ fn report_viewport(app: &mut WordApp, host: &mut HostState) {
     // Not drawn yet: asked again next frame, the token still waiting.
     let Some(reading) = super::viewport::read(app, &mut host.viewport) else { return };
     let (reading, key) = reading.rounded();
-    let first = host.viewport.last.is_none();
     let changed = host.viewport.last.replace(key.clone()) != Some(key);
     let token = if landed { host.viewport.scroll_token.take() } else { None };
+    let now = ctx.input(|input| input.time);
+    if host.viewport.person_input || app.canvas.wheel.is_animating() {
+        host.viewport.person_moving = true;
+        host.viewport.moved_since_input = false;
+        host.viewport.last_input_time = now;
+    } else if host.viewport.person_moving {
+        if changed {
+            host.viewport.moved_since_input = true;
+        } else if host.viewport.moved_since_input || now - host.viewport.last_input_time > PERSON_GLIDE_GRACE_SECONDS {
+            // The glide the person started has come to rest (or never began).
+            host.viewport.person_moving = false;
+        }
+    }
     if !(changed || token.is_some()) {
         return;
     }
-    let cause = if token.is_some() || first { Cause::Host } else { Cause::User };
+    let cause = if token.is_none() && host.viewport.person_moving { Cause::User } else { Cause::Host };
     host.bridge.emit(HostEvent::Viewport {
         top: reading.top,
         fraction: reading.fraction,
@@ -352,6 +386,19 @@ fn report_viewport(app: &mut WordApp, host: &mut HostState) {
         cause,
         token,
     });
+}
+
+/// Whether the person's own input is on the canvas this frame: a wheel or trackpad scroll, a drag on
+/// a scroll bar, a touch drag, a scroll key while the canvas has the keyboard, or a press or drag
+/// that began in the document. Read before the canvas consumes the frame's input.
+fn person_input(ctx: &egui::Context, canvas: Option<Rect>, canvas_focused: bool) -> bool {
+    if scrolled_by_person(ctx, canvas, canvas_focused) {
+        return true;
+    }
+    let Some(canvas) = canvas else { return false };
+    ctx.input(|input| {
+        (input.pointer.any_pressed() || input.pointer.primary_down()) && input.pointer.press_origin().is_some_and(|at| canvas.contains(at))
+    })
 }
 
 /// Tell the host of a zoom change, after the frame that drew it. The host's own request is always
@@ -397,7 +444,7 @@ pub(crate) fn after_frame(app: &mut WordApp, ctx: &egui::Context) {
         host.bridge.emit(HostEvent::PageChanged { page: page_number(page) });
     }
     report_zoom(app, &mut host);
-    report_viewport(app, &mut host);
+    report_viewport(app, &mut host, ctx);
     // Selecting is part of editing: no selection events in edit mode (embed API 0.2).
     if host.edit.is_none() {
         settle_selection(app, &mut host, ctx);
