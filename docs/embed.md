@@ -8,9 +8,10 @@ change, and save, which hands the `.docx` bytes to the host ("Edit mode (API 0.2
 `embed-v0.3.0` keeps the API and adds the `fullEditing` permission, and its save keeps the opened
 package: only the paragraphs the session changed are rewritten, every other part is the original's
 bytes, and a change that cannot be written that way is refused with its reason. API 0.3 (release
-`embed-v0.4.0`) is the current API: it lets a host that draws its own controls and keeps two views
-level (a document comparison) drive the editor's display, zoom, scrolling, find and marks by location
-("API 0.3"); everything it adds is optional, and a 0.2 host runs unchanged. Sources:
+`embed-v0.4.0`; `embed-v0.4.1` adds optional fields to it, "Embed 0.4.1") is the current API: it lets a
+host that draws its own controls and keeps two views level (a document comparison) drive the editor's
+display, zoom, scrolling, find and marks by location ("API 0.3"); everything it adds is optional, and a
+0.2 host runs unchanged. Sources:
 `apps/wordcraft-embed` (wasm-bindgen glue) and `crates/ui-egui/src/host/` (host bridge, view and
 edit mode, marks, selection, opening files).
 
@@ -158,7 +159,7 @@ editor.destroy();
 ```
 
 `EmbeddedEditor`'s methods are `static mount(canvas, options)`, `open(bytes, fileName, options?)`,
-`jumpTo(target)`, `setMarks(marks)`, `setTheme(theme)`, `setListener(listener)`, `destroy()` and,
+`jumpTo(target, token?)`, `setMarks(marks)`, `setTheme(theme)`, `setListener(listener)`, `destroy()` and,
 from API 0.2, `setMode(request: ModeRequest)`, `requestSave()` and `applyRedactions()` and, from API
 0.3, `setZoom(request: ZoomRequest)`, `scrollToBlock(request: ScrollRequest)`,
 `locate(request: LocateRequest)` and `find(request: FindRequest)`; `setMarks` takes `EditorMark[]` from API 0.3 (a 0.2 `Mark[]` still
@@ -240,7 +241,7 @@ export type EditorEvent =
     | { type: 'selection'; text: string; copyText: string; page: number | null; x: number; y: number }
     | { type: 'selectionCleared' }
     | { type: 'markActivated'; id: string }
-    | { type: 'jumpNotFound'; target: JumpTarget }
+    | { type: 'jumpNotFound'; target: JumpTarget; token?: number }
     | { type: 'modeChanged'; mode: 'view' | 'edit' }
     | { type: 'dirtyChanged'; dirty: boolean }
     | { type: 'saveRequested'; bytes: Uint8Array; fileName: string }
@@ -248,7 +249,7 @@ export type EditorEvent =
     | { type: 'commentRequested'; text: string; copyText: string; page: number | null; x: number; y: number }
     | { type: 'findRequested' }
     | { type: 'zoomChanged'; percent: number; pageWidth: boolean; cause: 'user' | 'host'; token: number | null }
-    | { type: 'viewport'; top: BlockRef | null; fraction: number; visibleHeight: number; page: number; pages: number; cause: 'user' | 'host'; token: number | null }
+    | { type: 'viewport'; top: BlockRef | null; fraction: number; visibleHeight: number; page: number; pages: number; offset: number; cause: 'user' | 'host'; token: number | null }
     | { type: 'blockNotFound'; block: BlockRef; token: number }
     | { type: 'located'; positions: (number | null)[]; height: number; token: number }
     | { type: 'findResult'; count: number; index: number | null; token: number }
@@ -376,10 +377,19 @@ the strip then says "Header (shared with sections N–M)". Making a new header o
 ## API 0.3
 
 Every 0.3 field is optional. A host that sends none of them sees exactly what API 0.2 showed: the same
-display, the view bar, text marks, and a view mode whose command gate has not moved. Two things a 0.2
-host does see are events it never asked for (it should ignore event types it does not know, as above):
-`viewport` after every `opened` and when the view moves, `zoomChanged` when the person zooms, and
-`findRequested` only without a view bar (which a 0.2 host never mounts).
+display, the view bar, text marks, and a view mode whose command gate has not moved. What a 0.2 host
+does see is events it never asked for (it should ignore event types it does not know, as above); these
+are all of them:
+
+- `viewport`, after every `opened` and whenever the view moves (the person scrolling, a resize, the
+  layout settling);
+- `zoomChanged`, whenever the person zooms (Ctrl/⌘+wheel, pinch, Ctrl/⌘+plus or minus, the view bar's
+  buttons);
+- `marksDropped`, when its `setMarks` was given more than 2,000 text marks (the list is cut there, as
+  before; the event says how many were ignored).
+
+`findRequested` is sent only without a view bar, which a 0.2 host never mounts, and the other new
+events (`blockNotFound`, `located`, `findResult`, `locationMismatch`) answer only the 0.3 calls and fields.
 
 | Item | JSON shape | 0.2 compatibility |
 |---|---|---|
@@ -388,7 +398,7 @@ host does see are events it never asked for (it should ignore event types it doe
 | `setZoom` | `{ zoom: 10..500 \| 'pageWidth', token }` | New method; 0.2 had zoom only in the bar and by keys |
 | `zoomChanged` | `{ type: 'zoomChanged', percent, pageWidth, cause: 'user' \| 'host', token: number \| null }` | New event; ignorable |
 | `scrollToBlock` | `{ block: { part, index }, fraction, token }` | New method |
-| `viewport` | `{ type: 'viewport', top: BlockRef \| null, fraction, visibleHeight, page, pages, cause: 'user' \| 'host', token: number \| null }` | New event; ignorable (`pageChanged` is unchanged) |
+| `viewport` | `{ type: 'viewport', top: BlockRef \| null, fraction, visibleHeight, page, pages, offset, cause: 'user' \| 'host', token: number \| null }` | New event; ignorable (`pageChanged` is unchanged). `offset` is new in 0.4.1 |
 | `blockNotFound` | `{ type: 'blockNotFound', block, token }` | New event; sent only for a `scrollToBlock` |
 | `locate` | `{ blocks: BlockRef[], token }` | New method |
 | `located` | `{ type: 'located', positions: (number \| null)[], height, token }` | New event; sent only for a `locate` |
@@ -396,12 +406,24 @@ host does see are events it never asked for (it should ignore event types it doe
 | `locationMismatch` | `{ type: 'locationMismatch', ids: string[] }` | New event; sent only for location marks |
 | `marksDropped` | `{ type: 'marksDropped', count }` | New event; sent only when `setMarks` was given more than 2,000 marks |
 | `jumpTo` a location | `{ kind: 'location', at }` | New kind of target; `jumpNotFound` answers as for any jump |
+| `jumpTo` token (0.4.1) | `jumpTo(target, token?)`, answered by `{ type: 'jumpNotFound', target, token? }` or the `viewport` the jump causes | Optional second argument; `jumpNotFound` has no `token` field without one |
 | `find` | `{ text, matchCase?, step: 'first' \| 'next' \| 'previous', select?, token }` | New method; the bar's find is as before |
 | `findResult` | `{ type: 'findResult', count, index: number \| null, token }` | New event; sent only for a `find` |
 | `findRequested` | `{ type: 'findRequested' }` | New event; sent only without a view bar |
 
 - **Tokens.** A `token` is a whole number from 0 to 4,294,967,295 that the host chooses and the answer
   echoes; anything else is a `TypeError` (below).
+- **One waiting token.** `scrollToBlock`, a selecting `find` and (0.4.1) `jumpTo` with a token are
+  answered by the `viewport` their scroll causes, and the editor keeps one such token at a time. A
+  newer token-bearing command that moves the view **replaces** the token of an older one whose scroll
+  has not landed: the older token is never answered, so a host draws the tokens of all three calls from
+  one counter and expects only the newest. A jump replaced by another jump (with a token or without) is
+  not answered and its token is dropped with it. A command answered at once (`blockNotFound`,
+  `jumpNotFound`, a find that matches nothing, a count-only find) moves nothing and leaves a waiting
+  token of another command alone. An `open` answers a jump still waiting with `jumpNotFound` (carrying
+  its token) and drops every other waiting token without answering it: the new document's first
+  `viewport` is the baseline, with `token: null`. (`setZoom`'s token is a different
+  kind: `zoomChanged` carries it, never a `viewport`.)
 - **`null` and absent.** `null` for `open`'s `options` argument reads as no options (it is declared
   `options?: OpenOptions | null`), and `null` for a mark's `page`, `from` or `to` reads as absent. Inside
   an options object, the other optional fields (`display`, `viewBar`, `style`, `matchCase`, `select`) are
@@ -416,6 +438,17 @@ options at all, is API 0.2's display: tracked changes marked up as the file hold
 
 - **Not with edit mode.** The clean display combined with edit mode is not supported; a host that
   edits opens the document as stored.
+- **A deleted paragraph mark stays a paragraph break.** The clean display accepts the deleted
+  wording, not the merging of paragraphs: a paragraph whose mark was deleted in the file is still
+  laid out as its own paragraph. (A comparison engine merges such paragraphs into one block; the
+  editor does not. A block that engine names by several origin paragraphs shows here as several
+  paragraphs, and `viewport`'s `top` names the first model paragraph.) A paragraph whose whole text
+  was deleted is an empty line: it keeps its place, its name and its top, so `locate`, `scrollToBlock`
+  and a location with the fingerprint of its (empty) accepted text all find it.
+- **Find reads what is shown (0.4.1).** In the clean display `find`, and the view bar's own find, read
+  each paragraph as its accepted text without hidden text: a phrase across a deleted run ("Pay 45
+  days" for "Pay [30 ]45 days") is found, and wording that is only inside a deletion, or only hidden,
+  is not ("Find" below). As stored, the search is unchanged.
 
 - **A display per open.** The display belongs to the `open` that asked for it. The next `open`
   without `display: 'final'` shows its document as stored again, with the markup view settings the
@@ -472,12 +505,23 @@ sides never drift apart:
 - **No event for the first reading.** The zoom a document opens with is the baseline, taken again
   at every `open`: the first `zoomChanged` after an `open` is the first change (or the first
   `setZoom` answer), never the open itself.
+- **The top of the view stays put (0.4.1).** A host `setZoom` keeps the block at the top of the view
+  and the fraction of it above the view's edge: the next `viewport` names the same `top` and the same
+  `fraction` (to rounding), and `offset` does not move, whatever the zoom does to the pixels. This holds
+  while the pages stack one above the next (page-width fit, or a zoom at which a single page fills more
+  than half the canvas's width; at a lower zoom the pages flow side by side, and `viewport` reads the
+  first page of the row). The block a `scrollToBlock` or `jumpTo` put at the top is kept in the same
+  way. The person's own Ctrl/⌘+wheel zoom keeps the point under the pointer instead.
+- **Order in the frame (0.4.1).** The frame that draws the new zoom sends `zoomChanged` first (with
+  the request's `token`), then the `viewport` the zoom caused, if the view's numbers changed (the
+  visible height always does): `cause: 'host'` and `token: null`. The `setZoom` token is carried by
+  `zoomChanged` only, never by the `viewport`.
 - **View mode's command gate is unchanged.** The zoom is applied by the editor's host state; the
   commands view mode refuses stay refused.
 
 ### Viewport and scrollToBlock
 
-`{ type: 'viewport', top, fraction, visibleHeight, page, pages, cause, token }` tells the host where
+`{ type: 'viewport', top, fraction, visibleHeight, page, pages, offset, cause, token }` tells the host where
 the view is in document terms, so two editors can be kept scrolled level without comparing pixels:
 
 - **`top`** is the top-level block of the body at the top of the view, as `{ part, index }`: the
@@ -490,8 +534,17 @@ the view is in document terms, so two editors can be kept scrolled level without
 - **`visibleHeight`** is the height of the view in document points (layout points, 1/72 inch): how
   much of the document it shows, so it grows as the zoom falls.
 - **`page`** is the 1-based page at the top of the view and **`pages`** the page count.
+- **`offset`** (0.4.1) is the top of the view in document points on the stacked axis `locate` and
+  `height` use (the pages one above the next, no gaps): while the top of the view is inside the block
+  `top` names it is `locate(top)` plus `fraction` of that block's height, so a change strip can place
+  its thumb as `offset / height` and its size as `visibleHeight / height`. In the gap above a block (a
+  page margin, spacing between blocks) `fraction` is 0 and `offset` is the true position, above the
+  block's top. Rounded to a tenth of a point. It does not take part in deciding whether to send a
+  `viewport` (a view that did not change in the fields below sends nothing), and it does not move with
+  the zoom.
 - **When.** After `opened`, once the document is drawn: the first `viewport` after an `open` is
-  `cause: 'host'` with `token: null`, the baseline. After that one is sent after a frame in which
+  `cause: 'host'` with `token: null`, the baseline (a token waiting from before the `open` is dropped
+  by it, so the baseline never carries one). After that one is sent after a frame in which
   `top`, `fraction` (to a thousandth), `page`, `pages` or `visibleHeight` (to a tenth) changed, at
   most one per frame; a view that did not change sends nothing. A resize or a layout settling is a
   change too (`cause: 'host'`, below).
@@ -506,7 +559,8 @@ the view is in document terms, so two editors can be kept scrolled level without
   person's Ctrl/⌘+wheel zoom (told by `zoomChanged`), typing that scrolls the caret into view, the edit
   strip taking room from the view, and a resize of the canvas. A host that keeps two editors level makes the side the person moves the
   leader, so only `'user'` events should hand over the lead.
-- **`cause: 'host'` with a `token`** answers `scrollToBlock`; only that carries a token.
+- **`cause: 'host'` with a `token`** answers `scrollToBlock`, a selecting `find` or (0.4.1) a `jumpTo`
+  that was given a token; only those carry a token ("One waiting token" above).
 
 `scrollToBlock({ block, fraction, token })` puts `fraction` (0 to 1) of the block `block` names at
 the top of the view, with nothing selected and no margin above it. `block` may name any body
@@ -522,8 +576,10 @@ queues nothing.
   the later token. Only the answer to the host's own request carries a token, so a host that ignores
   `viewport` events with its own tokens never mistakes its scroll for the person's.
 - **`blockNotFound`.** A block the open document does not have (no such part or index, nothing open,
-  or a block with nothing laid out, such as wording the clean display removed) moves nothing and is
+  or a block the layout does not place at all) moves nothing and is
   answered `{ type: 'blockNotFound', block, token }`, with the request's `token` and no `viewport`.
+  (In the clean display a paragraph whose wording was all deleted is not such a block: its empty line
+  is laid out, so it is found, "Clean display".)
 - **Placing is exact for one editor, approximate for two.** `top` and `fraction` read from one
   editor and sent to the same editor put the view back where it was. Between two different documents
   the host maps the blocks; the editors only agree on what a block and a fraction of it are.
@@ -537,8 +593,9 @@ changes beside the view. The answer is one `{ type: 'located', positions, height
 
 - **`positions`** has one entry per requested block, in the request's order: the top of the block's
   first line, in document points (layout points, 1/72 inch), along the pages stacked one above the
-  next. `null` where the document has no such block: no such part or index, or a block with nothing
-  laid out (wording the clean display removed). A block cut by a page break, or a table, is one block
+  next. `null` where the document has no such block: no such part or index, or a block the layout does not
+  place at all. (A paragraph whose wording the clean display removed keeps its empty line and has a
+  position.) A block cut by a page break, or a table, is one block
   and has one top. A table's every paragraph is placed at the table's top, as `scrollToBlock` treats
   it.
 - **`height`** is the height of all the pages on the same axis, the end of the last page. The page
@@ -596,9 +653,11 @@ paragraph.
 - **View mode's command gate is unchanged.** Marks are placed by the editor's host state from the
   document's layout; nothing is selected and no command is run. As before, marks are hidden while the
   document is edited.
-- **Numbers.** `from`, `to`, the block's `index` and the fingerprint's `length` follow the same rule
-  as pages: a whole number of zero or more, else a `TypeError` and nothing queued; a huge one is
-  merely past the end of any paragraph and is reported like one.
+- **Numbers.** `from`, `to`, the block's `index` and the fingerprint's `length` are whole numbers of
+  zero or more, else a `TypeError` and nothing queued. A huge `from` or `to` (beyond 4,294,967,295) is
+  merely past the end of any paragraph and is reported like one (`locationMismatch`). The block's
+  `index` and the fingerprint's `length` are plain 32-bit numbers: one beyond 4,294,967,295 is a
+  `TypeError`, not a block or a length that is "past the end".
 
 ### Jump to a location
 
@@ -617,13 +676,30 @@ location): `{ block, fingerprint, from?, to? }`.
   the `fingerprint`, and the range must lie inside its accepted text. If not, or when `block` is not
   in the open document, nothing moves and the host is sent `{ type: 'jumpNotFound', target }` with the
   target echoed, as for any jump that finds nothing. The jump is never made to a nearby paragraph.
-- **The view it causes.** The `viewport` event that follows says `cause: 'host'` and `token: null`,
-  as for any `jumpTo`; a host that syncs two views should not take it for the reviewer scrolling.
-  Only `scrollToBlock` answers with a token.
-- **A newer jump replaces one still waiting**, as for the other kinds, and the same limits and number
-  rules as marks apply to `from`, `to`, `index` and `length`.
+- **The view it causes.** The `viewport` event that follows says `cause: 'host'`; a host that syncs
+  two views should not take it for the reviewer scrolling. Its `token` is `null` unless the jump was
+  given one ("Tokens" below).
+- **A newer jump replaces one still waiting**, as for the other kinds (the replaced one is not
+  answered), and the same limits and number rules as marks apply to `from`, `to`, `index` and `length`.
 - **View mode's command gate is unchanged.** The jump is made by the editor's host state; no command
   is run.
+
+### Tokens on `jumpTo` (0.4.1)
+
+`jumpTo(target, token?)` takes an optional second argument, a token as everywhere else (a whole
+number from 0 to 4,294,967,295; anything else is a `TypeError` and queues nothing). It is a second
+argument and not a field of the target so that the target (and `jumpNotFound`'s echo of it) stay what
+they were.
+
+- **Found.** The `viewport` that follows the jump's scroll has `cause: 'host'` and the jump's
+  `token`, sent once the scroll has landed, **even when the view was already there**, so a host waiting
+  on its token is always answered. This is how a host that syncs two views tells the landing of its own
+  page, passage or location jump from the layout settling, and from the reviewer scrolling.
+- **Not found.** `{ type: 'jumpNotFound', target, token }` echoes the token (`token` is absent from the
+  event when the jump had none, so a host that sends none hears what 0.4.0 said), and no `viewport` is
+  sent.
+- **Without a token** a jump is exactly what 0.4.0 did: its `viewport` has `token: null`.
+- **Replacing.** "One waiting token" above says which token a newer command leaves behind.
 
 ### Find
 
@@ -638,6 +714,12 @@ bar, in view mode and while the document is in edit mode, and changes nothing in
   began; `'next'` and `'previous'` go from the current match and wrap past the ends. A `next` or
   `previous` whose `text` or `matchCase` differs from the last search begins a new one, as `'first'`.
   The search is of the document's body, literal text (no patterns, not whole words), and ignores case unless `matchCase` is true.
+  In the clean display (`display: 'final'`, 0.4.1) it reads each paragraph as it is shown: the
+  accepted text, in which a phrase may run across a tracked deletion, and without hidden text, so
+  wording that exists only inside a deletion or only as hidden text is not found (count 0), and the
+  selection of a match across a deletion covers the deleted run too. The view bar's own find reads
+  the same text. As stored (and for a host that never asks for the clean display) the search is the
+  engine's, as in 0.4.0: it reads live text and cuts at every tracked deletion.
 - **`findResult`.** One per `find`, in order, carrying the request's `token`:
   `{ type: 'findResult', count, index, token }`. `count` is the matches the text has and `index` the
   0-based one the find is on, in document order, `null` when `count` is 0. Empty `text` clears the
@@ -649,8 +731,8 @@ bar, in view mode and while the document is in edit mode, and changes nothing in
 - **The scroll it causes is the host's.** The `viewport` that follows says `cause: 'host'` and
   carries the find's `token` (one per selecting find that found a match, sent once the scroll has
   landed, even when the view was already there), so a host that syncs two views can tell its leader's
-  own find from the reviewer scrolling. A newer `scrollToBlock` or `find` replaces a token still
-  waiting. Nothing else about the view changes (`pageChanged` follows the match's page as it does for
+  own find from the reviewer scrolling. A newer token-bearing command replaces a token still
+  waiting ("One waiting token" above). Nothing else about the view changes (`pageChanged` follows the match's page as it does for
   any jump).
 - **Counting (`select: false`).** The search runs and `findResult` answers, but nothing is selected,
   nothing scrolls, no `viewport` is sent and the bar's text is left alone; for the other side of a
@@ -658,6 +740,19 @@ bar, in view mode and while the document is in edit mode, and changes nothing in
   the person's selection (for `'first'`: the first at or after it).
 - **View mode's command gate is unchanged.** `find` is a host call, answered by the editor's host
   state; Ctrl/⌘+F and the Find command without text still do what No view bar describes.
+
+### Embed 0.4.1
+
+Release `embed-v0.4.1` keeps API 0.3 and adds, all optional (a host that uses none sees 0.4.0, and an
+API 0.2 host is unaffected):
+
+- `jumpTo(target, token?)`, answered like `scrollToBlock` ("Tokens on `jumpTo`"), and the rule for
+  which token a newer command leaves waiting ("One waiting token").
+- `viewport.offset`, the view's top on the stacked axis `locate` uses ("Viewport and scrollToBlock").
+- A host `setZoom` keeps the block at the top of the view where it was, and `zoomChanged` comes before
+  the `viewport` it causes ("Zoom").
+- `find` (and the view bar's find) reads what the clean display shows ("Find").
+- No `viewport` carries a token from before an `open` ("Viewport and scrollToBlock").
 
 ## Behaviour a host page relies on
 
@@ -680,8 +775,9 @@ bar, in view mode and while the document is in edit mode, and changes nothing in
   and hidden text is not matched. A match may span lines, never paragraphs. A mark shows its first
   match (on its page when given); marks not found are skipped. Pages are layout pages, 1-based.
 - **Jumps**: a found jump moves the view and reports `pageChanged`; one that finds nothing answers
-  `jumpNotFound` with the target echoed. A newer `jumpTo` replaces one still waiting, which is not
-  answered; opening a document answers a waiting jump with `jumpNotFound` before `opened`.
+  `jumpNotFound` with the target echoed (and the jump's token, if it had one). A newer `jumpTo`
+  replaces one still waiting, which is not answered; opening a document answers a waiting jump with
+  `jumpNotFound` before `opened`.
 - **Selection**: sent each time a selection settles (pointer released, or a keyboard selection
   changed), not on every frame, and again when a new press and release ends on the same text as the
   selection reported before (the host hides its toolbar on any input); `x`, `y` are CSS pixels from the canvas's top-left at the selection's end. `text` has
