@@ -231,7 +231,8 @@ fn body_anchor(app: &WordApp) -> Pos {
 pub fn run_find(app: &mut WordApp, query: &str, step: FindStep) {
     let before = app.session.sel.clone();
     let mut anchor = app.host.as_mut().and_then(|host| host.find_anchor.take());
-    let moved = find(app, &mut anchor, query, false, step);
+    let clean = app.host.as_ref().is_some_and(|host| host.clean_display);
+    let moved = find(app, &mut anchor, query, false, step, clean);
     if let Some(host) = app.host.as_mut() {
         host.find_anchor = anchor;
         if moved {
@@ -251,7 +252,7 @@ pub fn run_find(app: &mut WordApp, query: &str, step: FindStep) {
 pub(crate) fn run_host_find(app: &mut WordApp, host: &mut HostState, query: &str, match_case: bool, step: FindStep) {
     let before = app.session.sel.clone();
     let caret_scroll = app.canvas.scroll_to_caret;
-    let moved = find(app, &mut host.find_anchor, query, match_case, step);
+    let moved = find(app, &mut host.find_anchor, query, match_case, step, host.clean_display);
     if moved {
         host.page_target = None;
     }
@@ -268,7 +269,7 @@ pub(crate) fn run_host_find(app: &mut WordApp, host: &mut HostState, query: &str
 /// the match the same step would go to from the person's selection, but the selection, the scroll
 /// and the bar's text are left as they are. The engine's search runs on the session with the
 /// selection moved to the search's start only while it runs.
-pub(crate) fn count_matches(app: &mut WordApp, query: &str, match_case: bool, step: FindStep) {
+pub(crate) fn count_matches(app: &mut WordApp, query: &str, match_case: bool, step: FindStep, clean: bool) {
     if query.is_empty() {
         app.session.find.results.clear();
         app.session.find.current = 0;
@@ -278,7 +279,13 @@ pub(crate) fn count_matches(app: &mut WordApp, query: &str, match_case: bool, st
     // The engine searches the story the caret is in; anything but the body starts at its top.
     let (start, end) = if saved.ordered().0.story == StoryRef::Body { saved.ordered() } else { (Pos::body(0, 0), Pos::body(0, 0)) };
     app.session.sel = Selection::caret(start.clone());
-    let found = app.session.run("edit.find", &json!({"text": query, "matchCase": match_case, "wholeWord": false, "regex": false}));
+    let found = if clean {
+        // The clean display's own search, selecting nothing.
+        super::clean_find::begin(&mut app.session, query, match_case);
+        Ok(json!({}))
+    } else {
+        app.session.run("edit.find", &json!({"text": query, "matchCase": match_case, "wholeWord": false, "regex": false}))
+    };
     app.session.sel = saved;
     if found.is_err() {
         app.session.find.results.clear();
@@ -305,8 +312,9 @@ fn note_programmatic_selection(app: &mut WordApp) {
 }
 
 /// Runs a find step; `true` when the view went to a match (the page a jump made current no longer is).
-/// `find_anchor` is where the search began, which typing refines from.
-fn find(app: &mut WordApp, find_anchor: &mut Option<Pos>, query: &str, match_case: bool, step: FindStep) -> bool {
+/// `find_anchor` is where the search began, which typing refines from. In the clean display (`clean`)
+/// the search reads the text the display shows (`clean_find`); otherwise it is the engine's.
+fn find(app: &mut WordApp, find_anchor: &mut Option<Pos>, query: &str, match_case: bool, step: FindStep, clean: bool) -> bool {
     if query.is_empty() {
         let (start, end) = app.session.sel.ordered();
         let was_match = app.session.find.results.iter().any(|(a, b)| *a == start && *b == end);
@@ -326,12 +334,17 @@ fn find(app: &mut WordApp, find_anchor: &mut Option<Pos>, query: &str, match_cas
             let anchor = find_anchor.clone().unwrap_or_else(|| body_anchor(app));
             *find_anchor = Some(anchor.clone());
             app.session.sel = Selection::caret(anchor);
+            if clean {
+                super::clean_find::find(app, query, match_case);
+                return true;
+            }
             // The options are set every time: a host's earlier regex search must not make typed text a pattern.
             app.run("edit.find", json!({"text": query, "matchCase": match_case, "wholeWord": false, "regex": false})).is_ok()
         }
         FindStep::Next | FindStep::Previous => {
             let command = if step == FindStep::Next { "edit.findNext" } else { "edit.findPrevious" };
-            if app.run(command, json!({})).is_err() {
+            let stepped = if clean { super::clean_find::step(app, step == FindStep::Next) } else { app.run(command, json!({})).is_ok() };
+            if !stepped {
                 return false;
             }
             // Typing on refines the search from the match just stepped to.

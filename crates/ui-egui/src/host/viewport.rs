@@ -25,6 +25,11 @@ pub(crate) struct ViewReading {
     /// 1-based page at the top of the view.
     pub page: u32,
     pub pages: u32,
+    /// The view's top on the stacked axis `locate` and the page heights use, in document points. It
+    /// is the top of the block `top` names plus `fraction` of its height while the view's top lies in
+    /// that block; in the gap above a block (a page margin, spacing) `fraction` is 0 and this is
+    /// the true position, above the block's top (embed API 0.4.1).
+    pub offset: f32,
 }
 
 /// A reading as it is compared with the last one told: the fraction to a thousandth and the height
@@ -45,6 +50,9 @@ impl ViewReading {
         let height_tenths = (self.visible_height * 10.0).round() as i64;
         self.fraction = fraction_milli as f32 / 1000.0;
         self.visible_height = height_tenths as f32 / 10.0;
+        // Not part of the key: the key's fraction already changes with it, and a view that does not
+        // change must not be told again.
+        self.offset = (self.offset * 10.0).round() / 10.0;
         let key = ViewKey { top: self.top.clone(), fraction_milli, page: self.page, pages: self.pages, height_tenths };
         (self, key)
     }
@@ -59,8 +67,9 @@ pub(crate) struct ViewportState {
     part_names: Vec<String>,
     /// The content version the locator's paths were made for (edit mode changes them).
     locator_version: u64,
-    /// The token of a `scrollToBlock` not yet answered; the `viewport` that follows the scroll
-    /// carries it, and clears it.
+    /// The token of a `scrollToBlock`, `find` or `jumpTo` not yet answered; the `viewport` that
+    /// follows the scroll carries it, and clears it. One slot: a newer token-bearing command
+    /// replaces the token of an older one still waiting, which is then never answered.
     pub(crate) scroll_token: Option<u32>,
     /// `locate` requests not answered yet: they wait for a document that is open and laid out.
     pub(crate) pending_locates: Vec<LocateRequest>,
@@ -79,13 +88,15 @@ pub(crate) struct ViewportState {
 }
 
 impl ViewportState {
-    /// A new document is open: its locator, and a first reading that is a baseline again. A pending
-    /// token still gets its answer.
+    /// A new document is open: its locator, and a first reading that is a baseline again. A token
+    /// still waiting (a `scrollToBlock`, `find` or `jumpTo` whose scroll had not landed) belonged to
+    /// the document being replaced: it is dropped, not answered, so the baseline viewport has none.
     pub(crate) fn opened(&mut self, doc: &Document, content_version: u64, part_names: Option<Vec<String>>) {
         self.part_names = part_names.unwrap_or_default();
         self.locator = (!self.part_names.is_empty()).then(|| Locator::new(doc, &self.part_names));
         self.locator_version = content_version;
         self.last = None;
+        self.scroll_token = None;
     }
 
     /// The locator for `doc` as it is now: edits move paragraphs, so a locator made at the open is
@@ -219,26 +230,44 @@ fn block_bounds(doc: &Document, layout: &DocLayout, starts: &[f32], block: usize
     Some((top, bottom.max(top)))
 }
 
-/// Where the view is, or `None` while the pages are not drawn yet (the first frame of an open, or a
+/// Where the top of the view is: the page it is on, how far below that page's top, and the same place
+/// on the stacked axis. `None` while the pages are not drawn yet (the first frame of an open, or a
 /// layout that has not caught up with the canvas).
-pub(crate) fn read(app: &mut WordApp, viewport: &mut ViewportState) -> Option<ViewReading> {
+fn view_start(app: &WordApp, layout: &DocLayout, starts: &[f32]) -> Option<(usize, f32, f32)> {
     let canvas = app.canvas.canvas_rect?;
     let scale = app.canvas.scale;
     if app.canvas.page_rects.is_empty() || !(scale.is_finite() && scale > 0.0) {
         return None;
     }
-    let layout = app.session.layout();
     // The canvas draws the pages of the layout it was handed; rects of another count are older.
     if layout.pages.len() != app.canvas.page_rects.len() {
         return None;
     }
-    let starts = page_starts(&layout);
     let view_top = canvas.min.y;
     let page = app.canvas.page_rects.iter().position(|rect| rect.max.y > view_top).unwrap_or(app.canvas.page_rects.len().saturating_sub(1));
     let page_rect = app.canvas.page_rects.get(page)?;
     let page_height = layout.pages.get(page)?.h;
     let into_page = ((view_top - page_rect.min.y) / scale).clamp(0.0, page_height);
-    let at = absolute(&starts, page, into_page)?;
+    Some((page, into_page, absolute(starts, page, into_page)?))
+}
+
+/// The place at the top of the view as `scroll_to_doc` takes it (a page and the points below its top).
+/// Layout points do not change with the zoom, so putting it back after a zoom keeps the same block at
+/// the top with the same fraction of it above the view. `None` while the pages are not drawn.
+pub(crate) fn view_top(app: &mut WordApp) -> Option<(usize, f32)> {
+    let layout = app.session.layout();
+    let starts = page_starts(&layout);
+    view_start(app, &layout, &starts).map(|(page, into_page, _)| (page, into_page))
+}
+
+/// Where the view is, or `None` while the pages are not drawn yet (the first frame of an open, or a
+/// layout that has not caught up with the canvas).
+pub(crate) fn read(app: &mut WordApp, viewport: &mut ViewportState) -> Option<ViewReading> {
+    let layout = app.session.layout();
+    let starts = page_starts(&layout);
+    let (page, _, at) = view_start(app, &layout, &starts)?;
+    let canvas = app.canvas.canvas_rect?;
+    let scale = app.canvas.scale;
 
     let doc = &app.session.doc;
     let first = layout.pages.get(page).map_or(0, |p| p.first_block).saturating_sub(1);
@@ -269,6 +298,7 @@ pub(crate) fn read(app: &mut WordApp, viewport: &mut ViewportState) -> Option<Vi
         visible_height: canvas.height() / scale,
         page: super::state::page_number(page),
         pages: u32::try_from(layout.pages.len()).unwrap_or(u32::MAX),
+        offset: at,
     })
 }
 

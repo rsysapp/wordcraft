@@ -3,6 +3,8 @@
 //! lives here so upstream merges stay easy.
 
 pub mod bridge;
+// embed: find in the clean display (embed API 0.4.1).
+pub(crate) mod clean_find;
 // embed: edit mode (embed API 0.2).
 pub(crate) mod edit;
 pub(crate) mod marks;

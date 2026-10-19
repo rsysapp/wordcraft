@@ -82,7 +82,7 @@ export type EditorEvent =
     | { type: 'selection'; text: string; copyText: string; page: number | null; x: number; y: number }
     | { type: 'selectionCleared' }
     | { type: 'markActivated'; id: string }
-    | { type: 'jumpNotFound'; target: JumpTarget }
+    | { type: 'jumpNotFound'; target: JumpTarget; token?: number }
     | { type: 'modeChanged'; mode: 'view' | 'edit' }
     | { type: 'dirtyChanged'; dirty: boolean }
     | { type: 'saveRequested'; bytes: Uint8Array; fileName: string }
@@ -90,7 +90,7 @@ export type EditorEvent =
     | { type: 'commentRequested'; text: string; copyText: string; page: number | null; x: number; y: number }
     | { type: 'findRequested' }
     | { type: 'zoomChanged'; percent: number; pageWidth: boolean; cause: 'user' | 'host'; token: number | null }
-    | { type: 'viewport'; top: BlockRef | null; fraction: number; visibleHeight: number; page: number; pages: number; cause: 'user' | 'host'; token: number | null }
+    | { type: 'viewport'; top: BlockRef | null; fraction: number; visibleHeight: number; page: number; pages: number; offset: number; cause: 'user' | 'host'; token: number | null }
     | { type: 'blockNotFound'; block: BlockRef; token: number }
     | { type: 'located'; positions: (number | null)[]; height: number; token: number }
     | { type: 'findResult'; count: number; index: number | null; token: number }
@@ -146,13 +146,13 @@ mod tests {
             "export type EditorEvent = | { type: 'opened'; pages: number } | { type: 'openFailed'; message: string } \
              | { type: 'pageChanged'; page: number } \
              | { type: 'selection'; text: string; copyText: string; page: number | null; x: number; y: number } \
-             | { type: 'selectionCleared' } | { type: 'markActivated'; id: string } | { type: 'jumpNotFound'; target: JumpTarget } \
+             | { type: 'selectionCleared' } | { type: 'markActivated'; id: string } | { type: 'jumpNotFound'; target: JumpTarget; token?: number } \
              | { type: 'modeChanged'; mode: 'view' | 'edit' } | { type: 'dirtyChanged'; dirty: boolean } \
              | { type: 'saveRequested'; bytes: Uint8Array; fileName: string } | { type: 'saveFailed'; message: string } \
              | { type: 'commentRequested'; text: string; copyText: string; page: number | null; x: number; y: number } \
              | { type: 'findRequested' } \
              | { type: 'zoomChanged'; percent: number; pageWidth: boolean; cause: 'user' | 'host'; token: number | null } \
-             | { type: 'viewport'; top: BlockRef | null; fraction: number; visibleHeight: number; page: number; pages: number; cause: 'user' | 'host'; token: number | null } \
+             | { type: 'viewport'; top: BlockRef | null; fraction: number; visibleHeight: number; page: number; pages: number; offset: number; cause: 'user' | 'host'; token: number | null } \
              | { type: 'blockNotFound'; block: BlockRef; token: number } \
              | { type: 'located'; positions: (number | null)[]; height: number; token: number } \
              | { type: 'findResult'; count: number; index: number | null; token: number } \
@@ -181,7 +181,7 @@ mod tests {
             ),
             (
                 "jumpTo",
-                "#[wasm_bindgen(js_name = jumpTo)] pub fn jump_to(&self, #[wasm_bindgen(unchecked_param_type = \"JumpTarget\")] target: JsValue)",
+                "#[wasm_bindgen(js_name = jumpTo)] pub fn jump_to(&self, #[wasm_bindgen(unchecked_param_type = \"JumpTarget\")] target: JsValue, token: Option<f64>)",
             ),
             (
                 "setMarks",

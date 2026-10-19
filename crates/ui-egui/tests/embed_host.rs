@@ -33,7 +33,7 @@ fn no_page_changed_comes_before_the_first_opened() {
     bridge.set_context(h.ctx.clone());
     wordcraft_ui_egui::host::prepare_context(&h.ctx);
     frames(&mut h, 3);
-    bridge.send(HostCommand::JumpTo(JumpTarget::Page { page: 1 }));
+    bridge.send(HostCommand::JumpTo(JumpTarget::Page { page: 1 }, None));
     frames(&mut h, 3);
     let before = bridge.take_events();
     assert!(!before.iter().any(|e| matches!(e, HostEvent::PageChanged { .. })), "{before:?}");
@@ -50,7 +50,7 @@ fn no_page_changed_comes_before_the_first_opened() {
     h.state_mut().canvas.scroll_to_doc = Some((2, 0.0));
     frames(&mut h, 4);
     assert_eq!(without_viewports(bridge.take_events()), vec![HostEvent::PageChanged { page: 3 }]);
-    bridge.send(HostCommand::JumpTo(JumpTarget::Page { page: 2 }));
+    bridge.send(HostCommand::JumpTo(JumpTarget::Page { page: 2 }, None));
     frames(&mut h, 4);
     assert_eq!(without_viewports(bridge.take_events()), vec![HostEvent::PageChanged { page: 2 }]);
     // A second open: its `opened` comes before its page, which is reported again even though the
@@ -68,7 +68,7 @@ fn a_one_page_document_reports_its_page_only_after_opened() {
     bridge.set_context(h.ctx.clone());
     wordcraft_ui_egui::host::prepare_context(&h.ctx);
     frames(&mut h, 3);
-    bridge.send(HostCommand::JumpTo(JumpTarget::Page { page: 1 }));
+    bridge.send(HostCommand::JumpTo(JumpTarget::Page { page: 1 }, None));
     frames(&mut h, 3);
     assert!(!bridge.take_events().iter().any(|e| matches!(e, HostEvent::PageChanged { .. })));
     let events = open_doc(&mut h, &bridge, &clauses(1));
@@ -491,7 +491,7 @@ fn a_scroll_animation_already_running_does_not_carry_the_view_off_a_host_jump() 
     h.step();
     h.step();
     assert_eq!(h.state().canvas.visible_page, Some(0), "the animation should still be running");
-    bridge.send(HostCommand::JumpTo(JumpTarget::Page { page: 2 }));
+    bridge.send(HostCommand::JumpTo(JumpTarget::Page { page: 2 }, None));
     for _ in 0..40 {
         h.step();
     }
@@ -623,7 +623,7 @@ fn clause_starts_on(h: &mut egui_kittest::Harness<'_, WordApp>, clauses: usize, 
 fn jumping_to_a_page_puts_its_top_at_the_top_of_the_view() {
     let (mut h, bridge) = embed_app();
     open_doc(&mut h, &bridge, &clauses(120));
-    bridge.send(HostCommand::JumpTo(JumpTarget::Page { page: 3 }));
+    bridge.send(HostCommand::JumpTo(JumpTarget::Page { page: 3 }, None));
     frames(&mut h, 4);
     assert_eq!(without_viewports(bridge.take_events()), vec![HostEvent::PageChanged { page: 3 }]);
     let app = h.state();
@@ -636,7 +636,7 @@ fn jumping_to_a_page_puts_its_top_at_the_top_of_the_view() {
 fn jumping_to_text_selects_the_folded_match_and_scrolls_to_it() {
     let (mut h, bridge) = embed_app();
     open_doc(&mut h, &bridge, &clauses(120));
-    bridge.send(HostCommand::JumpTo(text_target("CLAUSE 77. the  supplier", None, 0)));
+    bridge.send(HostCommand::JumpTo(text_target("CLAUSE 77. the  supplier", None, 0), None));
     frames(&mut h, 4);
     assert_eq!(h.state().session.selected_text(), "Clause 77. The Supplier");
     let page = {
@@ -661,28 +661,28 @@ fn page_and_occurrence_narrow_a_text_jump() {
     open_doc(&mut h, &bridge, &clauses(120));
     let on_page_two = clause_starts_on(&mut h, 120, 1);
     assert!(on_page_two.len() >= 2, "fixture has too few clauses on page 2");
-    bridge.send(HostCommand::JumpTo(text_target("the supplier shall deliver", Some(2), 1)));
+    bridge.send(HostCommand::JumpTo(text_target("the supplier shall deliver", Some(2), 1), None));
     frames(&mut h, 4);
     assert_eq!(h.state().session.sel.ordered().0, on_page_two[1]);
     assert_eq!(h.state().session.selected_text(), "The Supplier shall deliver");
     assert_eq!(without_viewports(bridge.take_events()), vec![HostEvent::PageChanged { page: 2 }]);
     // Without a page, the occurrence counts through the whole document.
-    bridge.send(HostCommand::JumpTo(text_target("the supplier shall deliver", None, 76)));
+    bridge.send(HostCommand::JumpTo(text_target("the supplier shall deliver", None, 76), None));
     frames(&mut h, 4);
     assert_eq!(h.state().session.sel.ordered().0, Pos::body(76, "Clause 77. ".len()));
     // The last match on a page is found; one past it is not.
     let last = on_page_two.len() as u32 - 1;
     bridge.take_events();
-    bridge.send(HostCommand::JumpTo(text_target("the supplier shall deliver", Some(2), last)));
+    bridge.send(HostCommand::JumpTo(text_target("the supplier shall deliver", Some(2), last), None));
     frames(&mut h, 4);
     assert_eq!(h.state().session.sel.ordered().0, on_page_two[last as usize]);
     bridge.take_events();
     let past = text_target("the supplier shall deliver", Some(2), last + 1);
-    bridge.send(HostCommand::JumpTo(past.clone()));
+    bridge.send(HostCommand::JumpTo(past.clone(), None));
     frames(&mut h, 2);
     // Finding nothing drops the target, so the host hears the page that is in view from then on.
     let events = bridge.take_events();
-    assert_eq!(events.first(), Some(&HostEvent::JumpNotFound { target: past }), "{events:?}");
+    assert_eq!(events.first(), Some(&HostEvent::JumpNotFound { target: past, token: None }), "{events:?}");
     let visible = h.state().canvas.visible_page.expect("a visible page");
     assert!(events[1..].iter().all(|e| *e == HostEvent::PageChanged { page: visible as u32 + 1 }), "{events:?}");
 }
@@ -693,7 +693,7 @@ fn a_match_may_cross_lines_but_not_paragraphs() {
     open_doc(&mut h, &bridge, &clauses(20));
     // Clause 3 wraps: its whole text spans more than one line.
     let clause = "Clause 3. The Supplier shall deliver the goods listed in Schedule 3 within thirty days of the order.";
-    bridge.send(HostCommand::JumpTo(text_target(clause, None, 0)));
+    bridge.send(HostCommand::JumpTo(text_target(clause, None, 0), None));
     frames(&mut h, 4);
     assert_eq!(h.state().session.selected_text(), clause);
     let (start, end) = h.state().session.sel.ordered();
@@ -703,9 +703,9 @@ fn a_match_may_cross_lines_but_not_paragraphs() {
     assert!(bottom > top, "the fixture's clause fits on one line, so this proves nothing");
     bridge.take_events();
     let across = text_target("of the order. Clause 4.", None, 0);
-    bridge.send(HostCommand::JumpTo(across.clone()));
+    bridge.send(HostCommand::JumpTo(across.clone(), None));
     frames(&mut h, 2);
-    assert_eq!(bridge.take_events(), vec![HostEvent::JumpNotFound { target: across }]);
+    assert_eq!(bridge.take_events(), vec![HostEvent::JumpNotFound { target: across, token: None }]);
 }
 
 #[test]
@@ -718,9 +718,9 @@ fn a_jump_that_finds_nothing_answers_jump_not_found_with_its_target() {
         text_target("Clause 7.", None, 5),
         JumpTarget::Page { page: 99 },
     ] {
-        bridge.send(HostCommand::JumpTo(target.clone()));
+        bridge.send(HostCommand::JumpTo(target.clone(), None));
         frames(&mut h, 2);
-        assert_eq!(bridge.take_events(), vec![HostEvent::JumpNotFound { target }]);
+        assert_eq!(bridge.take_events(), vec![HostEvent::JumpNotFound { target, token: None }]);
     }
 }
 
@@ -742,9 +742,9 @@ fn saturated_zero_and_empty_targets_answer_jump_not_found() {
         text_target(&"a".repeat(MAX_NEEDLE_CHARS + 1), None, 0),
     ];
     for target in targets {
-        bridge.send(HostCommand::JumpTo(target.clone()));
+        bridge.send(HostCommand::JumpTo(target.clone(), None));
         frames(&mut h, 2);
-        assert_eq!(bridge.take_events(), vec![HostEvent::JumpNotFound { target: target.clone() }], "{:.40?}", target);
+        assert_eq!(bridge.take_events(), vec![HostEvent::JumpNotFound { target: target.clone(), token: None }], "{:.40?}", target);
     }
     assert_eq!(h.state().session.sel, before);
     assert_eq!(page_target(&h), None);
@@ -755,14 +755,14 @@ fn a_passage_at_the_length_limit_is_found_and_one_past_it_is_not() {
     let (mut h, bridge) = embed_app();
     let long = "x".repeat(MAX_NEEDLE_CHARS + 5);
     open_doc(&mut h, &bridge, &Document::from_text(&format!("Start\n{long}")));
-    bridge.send(HostCommand::JumpTo(text_target(&"X".repeat(MAX_NEEDLE_CHARS), None, 0)));
+    bridge.send(HostCommand::JumpTo(text_target(&"X".repeat(MAX_NEEDLE_CHARS), None, 0), None));
     frames(&mut h, 4);
     assert_eq!(h.state().session.selected_text().len(), MAX_NEEDLE_CHARS);
     assert!(!bridge.take_events().iter().any(|e| matches!(e, HostEvent::JumpNotFound { .. })));
     let over = text_target(&"x".repeat(MAX_NEEDLE_CHARS + 1), None, 0);
-    bridge.send(HostCommand::JumpTo(over.clone()));
+    bridge.send(HostCommand::JumpTo(over.clone(), None));
     frames(&mut h, 2);
-    assert_eq!(bridge.take_events(), vec![HostEvent::JumpNotFound { target: over }]);
+    assert_eq!(bridge.take_events(), vec![HostEvent::JumpNotFound { target: over, token: None }]);
 }
 
 #[test]
@@ -771,7 +771,7 @@ fn commands_sent_before_the_first_frame_apply_in_order() {
     let app = WordApp::new(Session::new(Document::new()), Services::default()).with_host(bridge.clone(), EmbedProfile::View);
     // Queued before the app ran a single frame, as a host may do right after mount.
     bridge.send(HostCommand::Open { name: "agreement.docx".into(), bytes: docx(&clauses(120)), options: Default::default() });
-    bridge.send(HostCommand::JumpTo(text_target("Clause 90.", None, 0)));
+    bridge.send(HostCommand::JumpTo(text_target("Clause 90.", None, 0), None));
     let mut h = harness(app, 1.0);
     frames(&mut h, 4);
     let events = without_viewports(bridge.take_events());
@@ -791,8 +791,8 @@ fn a_newer_host_jump_replaces_a_waiting_one() {
     let (mut h, bridge) = embed_app();
     open_doc(&mut h, &bridge, &clauses(120));
     // Both arrive before a frame: only the second lands, and the first is not answered.
-    bridge.send(HostCommand::JumpTo(JumpTarget::Page { page: 4 }));
-    bridge.send(HostCommand::JumpTo(text_target("Clause 30.", None, 0)));
+    bridge.send(HostCommand::JumpTo(JumpTarget::Page { page: 4 }, None));
+    bridge.send(HostCommand::JumpTo(text_target("Clause 30.", None, 0), None));
     frames(&mut h, 4);
     let page = {
         let app = h.state_mut();
@@ -804,10 +804,10 @@ fn a_newer_host_jump_replaces_a_waiting_one() {
     // A newer jump that finds nothing replaces a waiting one too: the view stays where it was.
     let before = h.state().canvas.page_rects.clone();
     let missing = text_target("no such passage", None, 0);
-    bridge.send(HostCommand::JumpTo(JumpTarget::Page { page: 5 }));
-    bridge.send(HostCommand::JumpTo(missing.clone()));
+    bridge.send(HostCommand::JumpTo(JumpTarget::Page { page: 5 }, None));
+    bridge.send(HostCommand::JumpTo(missing.clone(), None));
     frames(&mut h, 4);
-    assert_eq!(bridge.take_events(), vec![HostEvent::JumpNotFound { target: missing }]);
+    assert_eq!(bridge.take_events(), vec![HostEvent::JumpNotFound { target: missing, token: None }]);
     assert_eq!(h.state().canvas.page_rects, before, "the replaced jump still moved the view");
     assert_eq!(page_target(&h), None);
 }
@@ -820,18 +820,18 @@ fn a_host_jump_replaces_the_page_target() {
     wordcraft_ui_egui::host::view::go_to_page(h.state_mut(), 1);
     frames(&mut h, 4);
     assert_eq!(page_target(&h), Some(1));
-    bridge.send(HostCommand::JumpTo(JumpTarget::Page { page: 4 }));
+    bridge.send(HostCommand::JumpTo(JumpTarget::Page { page: 4 }, None));
     frames(&mut h, 4);
     assert_eq!(page_target(&h), Some(3));
-    bridge.send(HostCommand::JumpTo(text_target("Clause 3.", None, 0)));
+    bridge.send(HostCommand::JumpTo(text_target("Clause 3.", None, 0), None));
     frames(&mut h, 4);
     assert_eq!(page_target(&h), Some(0));
     bridge.take_events();
     // Not found: the target is dropped, and the host hears the page that is in view.
-    bridge.send(HostCommand::JumpTo(JumpTarget::Page { page: 99 }));
+    bridge.send(HostCommand::JumpTo(JumpTarget::Page { page: 99 }, None));
     frames(&mut h, 4);
     assert_eq!(page_target(&h), None);
-    assert_eq!(bridge.take_events(), vec![HostEvent::JumpNotFound { target: JumpTarget::Page { page: 99 } }]);
+    assert_eq!(bridge.take_events(), vec![HostEvent::JumpNotFound { target: JumpTarget::Page { page: 99 }, token: None }]);
 }
 
 #[test]
@@ -841,13 +841,17 @@ fn a_jump_waiting_when_an_open_replaces_the_document_answers_jump_not_found() {
     let second = docx(&clauses(30));
     for target in [JumpTarget::Page { page: 4 }, text_target("Clause 90.", None, 0)] {
         // The jump is found in the open document but has not landed when the next one replaces it.
-        bridge.send(HostCommand::JumpTo(target.clone()));
+        bridge.send(HostCommand::JumpTo(target.clone(), None));
         bridge.send(HostCommand::Open { name: "next.docx".into(), bytes: second.clone(), options: Default::default() });
         frames(&mut h, 4);
         let count = pages(&mut h) as u32;
         assert_eq!(
             without_viewports(bridge.take_events()),
-            vec![HostEvent::JumpNotFound { target: target.clone() }, HostEvent::Opened { pages: count }, HostEvent::PageChanged { page: 1 }]
+            vec![
+                HostEvent::JumpNotFound { target: target.clone(), token: None },
+                HostEvent::Opened { pages: count },
+                HostEvent::PageChanged { page: 1 }
+            ]
         );
         assert_eq!(h.state().canvas.visible_page, Some(0), "{target:?} was applied to the new document");
         assert_eq!(h.state().session.sel.ordered().0, Pos::body(0, 0));
@@ -859,13 +863,13 @@ fn a_jump_waiting_when_an_open_replaces_the_document_answers_jump_not_found() {
     let app = WordApp::new(Session::new(Document::new()), Services::default()).with_host(bridge.clone(), EmbedProfile::View);
     let early = text_target("Clause 90.", None, 0);
     bridge.send(HostCommand::Open { name: "a.docx".into(), bytes: docx(&clauses(120)), options: Default::default() });
-    bridge.send(HostCommand::JumpTo(early.clone()));
+    bridge.send(HostCommand::JumpTo(early.clone(), None));
     bridge.send(HostCommand::Open { name: "b.docx".into(), bytes: second.clone(), options: Default::default() });
     let mut h = harness(app, 1.0);
     frames(&mut h, 4);
     let events = without_viewports(bridge.take_events());
     let (first, second) = (HostEvent::Opened { pages: 8 }, HostEvent::Opened { pages: pages(&mut h) as u32 });
-    assert_eq!(events, vec![first, HostEvent::JumpNotFound { target: early }, second, HostEvent::PageChanged { page: 1 }]);
+    assert_eq!(events, vec![first, HostEvent::JumpNotFound { target: early, token: None }, second, HostEvent::PageChanged { page: 1 }]);
 }
 
 /// Embed API order for one open: the reported selection's `selectionCleared`, then the waiting
@@ -879,13 +883,18 @@ fn an_open_clears_the_reported_selection_before_answering_the_waiting_jump() {
     let reported = [released, bridge.take_events()].concat();
     assert!(reported.iter().any(is_selection), "no selection was reported: {reported:?}");
     let target = JumpTarget::Page { page: 4 };
-    bridge.send(HostCommand::JumpTo(target.clone()));
+    bridge.send(HostCommand::JumpTo(target.clone(), None));
     bridge.send(HostCommand::Open { name: "next.docx".into(), bytes: docx(&clauses(30)), options: Default::default() });
     frames(&mut h, 4);
     let count = pages(&mut h) as u32;
     assert_eq!(
         without_viewports(bridge.take_events()),
-        vec![HostEvent::SelectionCleared, HostEvent::JumpNotFound { target }, HostEvent::Opened { pages: count }, HostEvent::PageChanged { page: 1 }]
+        vec![
+            HostEvent::SelectionCleared,
+            HostEvent::JumpNotFound { target, token: None },
+            HostEvent::Opened { pages: count },
+            HostEvent::PageChanged { page: 1 }
+        ]
     );
 }
 
@@ -893,7 +902,7 @@ fn an_open_clears_the_reported_selection_before_answering_the_waiting_jump() {
 fn a_jump_waiting_when_an_open_fails_still_lands() {
     let (mut h, bridge) = embed_app();
     open_doc(&mut h, &bridge, &clauses(120));
-    bridge.send(HostCommand::JumpTo(JumpTarget::Page { page: 4 }));
+    bridge.send(HostCommand::JumpTo(JumpTarget::Page { page: 4 }, None));
     bridge.send(HostCommand::Open { name: "broken.docx".into(), bytes: b"PK\x03\x04 broken".to_vec(), options: Default::default() });
     frames(&mut h, 4);
     let events = without_viewports(bridge.take_events());
@@ -904,7 +913,7 @@ fn a_jump_waiting_when_an_open_fails_still_lands() {
 fn a_resize_keeps_the_jump_target_in_view() {
     let (mut h, bridge) = embed_app();
     open_doc(&mut h, &bridge, &clauses(120));
-    bridge.send(HostCommand::JumpTo(JumpTarget::Page { page: 3 }));
+    bridge.send(HostCommand::JumpTo(JumpTarget::Page { page: 3 }, None));
     frames(&mut h, 4);
     bridge.take_events();
     // A narrower window rescales the fitted pages: page 3 goes back to the top of the view.
@@ -919,7 +928,7 @@ fn a_resize_keeps_the_jump_target_in_view() {
     assert!(without_viewports(bridge.take_events()).is_empty(), "the reported page stays 3");
     // A passage stays in view too.
     h.set_size(WINDOW);
-    bridge.send(HostCommand::JumpTo(text_target("Clause 77.", None, 0)));
+    bridge.send(HostCommand::JumpTo(text_target("Clause 77.", None, 0), None));
     frames(&mut h, 4);
     for size in [egui::vec2(600.0, 800.0), egui::vec2(1400.0, 700.0)] {
         h.set_size(size);
@@ -934,7 +943,7 @@ fn a_resize_keeps_the_jump_target_in_view() {
 fn a_selection_drag_that_scrolls_the_view_drops_the_page_target() {
     let (mut h, bridge) = embed_app();
     open_doc(&mut h, &bridge, &clauses(120));
-    bridge.send(HostCommand::JumpTo(JumpTarget::Page { page: 3 }));
+    bridge.send(HostCommand::JumpTo(JumpTarget::Page { page: 3 }, None));
     frames(&mut h, 4);
     assert_eq!(page_target(&h), Some(2));
     let view = h.state().canvas.canvas_rect.expect("canvas");
@@ -1162,12 +1171,12 @@ fn a_mark_shows_only_its_first_match_on_its_page_or_in_the_document() {
     // A page: the first match on that page, even with earlier ones on page 1.
     let on_page_two = clause_starts_on(&mut h, 120, 1);
     assert!(on_page_two.len() >= 2, "fixture has too few clauses on page 2");
-    bridge.send(HostCommand::JumpTo(JumpTarget::Page { page: 2 }));
+    bridge.send(HostCommand::JumpTo(JumpTarget::Page { page: 2 }, None));
     bridge.send(HostCommand::SetMarks(vec![mark_on("paged", passage, 2)]));
     frames(&mut h, 4);
     assert_eq!(marked_at(&mut h, &on_page_two[0]), vec!["paged".to_string()]);
     assert!(marked_at(&mut h, &on_page_two[1]).is_empty(), "a later match on the page is marked too");
-    bridge.send(HostCommand::JumpTo(JumpTarget::Page { page: 1 }));
+    bridge.send(HostCommand::JumpTo(JumpTarget::Page { page: 1 }, None));
     frames(&mut h, 4);
     assert!(marked_at(&mut h, &at(0)).is_empty(), "a paged mark lies on page 1");
     // A page the document lacks, or one without a match, finds nothing.
@@ -1351,10 +1360,10 @@ fn passages_longer_than_the_raw_cap_are_skipped_and_not_found() {
     assert_eq!(mark_ids(&h), vec!["at".to_string()], "the mark over the raw cap was kept");
     assert!(bridge.take_events().is_empty(), "a mark over the cap is skipped silently");
     let target = text_target(&over, None, 0);
-    bridge.send(HostCommand::JumpTo(target.clone()));
+    bridge.send(HostCommand::JumpTo(target.clone(), None));
     frames(&mut h, 2);
-    assert_eq!(bridge.take_events(), vec![HostEvent::JumpNotFound { target }]);
-    bridge.send(HostCommand::JumpTo(text_target(&at_cap, None, 0)));
+    assert_eq!(bridge.take_events(), vec![HostEvent::JumpNotFound { target, token: None }]);
+    bridge.send(HostCommand::JumpTo(text_target(&at_cap, None, 0), None));
     frames(&mut h, 4);
     assert_eq!(h.state().session.selected_text(), "Clause 2.");
 }
@@ -1472,7 +1481,7 @@ fn selection_coordinates_are_css_pixels_under_an_egui_zoom() {
 fn scrolled_selection_coordinates_follow_the_page() {
     let (mut h, bridge) = embed_app();
     open_doc(&mut h, &bridge, &clauses(120));
-    bridge.send(HostCommand::JumpTo(JumpTarget::Page { page: 3 }));
+    bridge.send(HostCommand::JumpTo(JumpTarget::Page { page: 3 }, None));
     frames(&mut h, 4);
     let clause = {
         let app = h.state_mut();
@@ -1519,7 +1528,7 @@ fn jumps_and_finds_send_no_selection_but_clear_a_reported_one() {
     let (mut h, bridge) = embed_app();
     open_doc(&mut h, &bridge, &clauses(30));
     drag_select(&mut h, &bridge, &Pos::body(0, 0), &Pos::body(0, 9));
-    bridge.send(HostCommand::JumpTo(text_target("Clause 5.", None, 0)));
+    bridge.send(HostCommand::JumpTo(text_target("Clause 5.", None, 0), None));
     frames(&mut h, 3);
     let events = bridge.take_events();
     assert!(events.contains(&HostEvent::SelectionCleared), "{events:?}");
@@ -1539,8 +1548,8 @@ fn every_selection_the_editor_makes_clears_a_reported_one_and_is_never_reported(
     for action in ["host page jump", "host text jump", "next page button", "find", "open"] {
         select_a_visible_clause(&mut h, &bridge, 120);
         match action {
-            "host page jump" => bridge.send(HostCommand::JumpTo(JumpTarget::Page { page: 2 })),
-            "host text jump" => bridge.send(HostCommand::JumpTo(text_target("Clause 9.", None, 0))),
+            "host page jump" => bridge.send(HostCommand::JumpTo(JumpTarget::Page { page: 2 }, None)),
+            "host text jump" => bridge.send(HostCommand::JumpTo(text_target("Clause 9.", None, 0), None)),
             "next page button" => h.get_by_label("Next page").click(),
             "find" => {
                 h.get_by(find_field()).focus();
@@ -1570,9 +1579,9 @@ fn a_jump_that_finds_nothing_keeps_a_reported_selection() {
     open_doc(&mut h, &bridge, &clauses(30));
     drag_select(&mut h, &bridge, &Pos::body(0, 0), &Pos::body(0, 9));
     let missing = text_target("no such passage", None, 0);
-    bridge.send(HostCommand::JumpTo(missing.clone()));
+    bridge.send(HostCommand::JumpTo(missing.clone(), None));
     frames(&mut h, 3);
-    assert_eq!(bridge.take_events(), vec![HostEvent::JumpNotFound { target: missing }]);
+    assert_eq!(bridge.take_events(), vec![HostEvent::JumpNotFound { target: missing, token: None }]);
     assert_eq!(h.state().session.selected_text(), "Clause 1.");
 }
 
@@ -1585,11 +1594,11 @@ fn a_newer_jump_that_finds_nothing_puts_back_the_selection_the_replaced_jump_mad
     let before = h.state().canvas.page_rects.clone();
     for first in [text_target("Clause 90.", None, 0), JumpTarget::Page { page: 5 }] {
         let missing = text_target("no such passage", None, 0);
-        bridge.send(HostCommand::JumpTo(first.clone()));
-        bridge.send(HostCommand::JumpTo(missing.clone()));
+        bridge.send(HostCommand::JumpTo(first.clone(), None));
+        bridge.send(HostCommand::JumpTo(missing.clone(), None));
         frames(&mut h, 4);
         // The replaced jump changed nothing: the person's selection is still the one the host knows.
-        assert_eq!(bridge.take_events(), vec![HostEvent::JumpNotFound { target: missing }], "{first:?}");
+        assert_eq!(bridge.take_events(), vec![HostEvent::JumpNotFound { target: missing, token: None }], "{first:?}");
         assert_eq!(h.state().session.sel, sel, "{first:?}: the selection was not put back");
         assert_eq!(h.state().session.page_hint, hint, "{first:?}: the page hint was not put back");
         assert_eq!(h.state().canvas.page_rects, before, "{first:?}: the view moved");
@@ -1617,7 +1626,7 @@ fn a_whitespace_only_selection_counts_as_cleared() {
 fn holding_the_button_without_moving_keeps_the_page_target() {
     let (mut h, bridge) = embed_app();
     open_doc(&mut h, &bridge, &clauses(120));
-    bridge.send(HostCommand::JumpTo(JumpTarget::Page { page: 3 }));
+    bridge.send(HostCommand::JumpTo(JumpTarget::Page { page: 3 }, None));
     frames(&mut h, 4);
     assert_eq!(page_target(&h), Some(2));
     let view = h.state().canvas.canvas_rect.expect("canvas");
@@ -1661,14 +1670,14 @@ fn text_jump_occurrences_count_only_laid_out_matches_with_or_without_a_page() {
     };
     assert_eq!(unplaced, 1, "the fixture has no unplaced match, so this proves nothing");
     for page in [None, Some(1)] {
-        bridge.send(HostCommand::JumpTo(text_target("notice period", page, 1)));
+        bridge.send(HostCommand::JumpTo(text_target("notice period", page, 1), None));
         frames(&mut h, 4);
         assert_eq!(h.state().session.sel.ordered().0, Pos::body(2, 0), "page {page:?}");
         bridge.take_events();
         let past = text_target("notice period", page, 2);
-        bridge.send(HostCommand::JumpTo(past.clone()));
+        bridge.send(HostCommand::JumpTo(past.clone(), None));
         frames(&mut h, 4);
-        assert!(bridge.take_events().contains(&HostEvent::JumpNotFound { target: past }), "page {page:?}");
+        assert!(bridge.take_events().contains(&HostEvent::JumpNotFound { target: past, token: None }), "page {page:?}");
     }
 }
 
@@ -1717,7 +1726,7 @@ fn selection_text_leaves_out_tracked_deletions_and_hidden_text_and_is_found_agai
         let events = bridge.take_events();
         let [HostEvent::Selection { text, .. }] = events.as_slice() else { panic!("{events:?}") };
         let text = text.clone();
-        bridge.send(HostCommand::JumpTo(text_target(&text, None, 0)));
+        bridge.send(HostCommand::JumpTo(text_target(&text, None, 0), None));
         frames(&mut h, 3);
         assert!(!bridge.take_events().iter().any(|e| matches!(e, HostEvent::JumpNotFound { .. })), "{text:?} was not found by a jump");
         assert_eq!(h.state().session.sel.ordered(), (Pos::body(i, 0), end), "{text:?}");
@@ -1795,14 +1804,14 @@ fn a_jump_held_across_a_frame_is_not_undone_by_a_newer_one_that_finds_nothing() 
     drag_select(&mut h, &bridge, &Pos::body(0, 0), &Pos::body(0, 9));
     // The first jump is found in a frame that draws nothing, so it is still waiting a frame later.
     skip.set(true);
-    bridge.send(HostCommand::JumpTo(text_target("Clause 90.", None, 0)));
+    bridge.send(HostCommand::JumpTo(text_target("Clause 90.", None, 0), None));
     frames(&mut h, 1);
     skip.set(false);
     let missing = text_target("no such passage", None, 0);
-    bridge.send(HostCommand::JumpTo(missing.clone()));
+    bridge.send(HostCommand::JumpTo(missing.clone(), None));
     frames(&mut h, 3);
     assert_eq!(h.state().session.selected_text(), "Clause 90.", "a selection from an earlier frame was put back");
-    assert_eq!(bridge.take_events(), vec![HostEvent::JumpNotFound { target: missing }, HostEvent::SelectionCleared]);
+    assert_eq!(bridge.take_events(), vec![HostEvent::JumpNotFound { target: missing, token: None }, HostEvent::SelectionCleared]);
 }
 
 #[test]

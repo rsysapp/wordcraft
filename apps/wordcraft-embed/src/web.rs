@@ -76,11 +76,14 @@ impl EmbeddedEditor {
         Ok(())
     }
 
+    /// Shows a page, a passage or a verified location. The optional `token` (embed API 0.4.1) is
+    /// carried back by the `viewport` the jump causes (`cause: 'host'`) and by `jumpNotFound`.
     #[wasm_bindgen(js_name = jumpTo)]
-    pub fn jump_to(&self, #[wasm_bindgen(unchecked_param_type = "JumpTarget")] target: JsValue) -> Result<(), JsValue> {
+    pub fn jump_to(&self, #[wasm_bindgen(unchecked_param_type = "JumpTarget")] target: JsValue, token: Option<f64>) -> Result<(), JsValue> {
         check_counts(&target, &["page", "occurrence"], "jumpTo")?;
+        let token = token.map(wire::parse_jump_token).transpose().map_err(|e| type_error(&e))?;
         let target = wire::parse_jump_target(&json_of(&target)?).map_err(|e| type_error(&e))?;
-        self.send(HostCommand::JumpTo(target));
+        self.send(HostCommand::JumpTo(target, token));
         Ok(())
     }
 

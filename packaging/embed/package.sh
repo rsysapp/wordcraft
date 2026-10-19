@@ -131,7 +131,7 @@ for want in \
   'export class EmbeddedEditor' \
   'static mount(canvas: HTMLCanvasElement, options: MountOptions): Promise<EmbeddedEditor>;' \
   'open(bytes: Uint8Array, fileName: string, options?: OpenOptions' \
-  'jumpTo(target: JumpTarget): void;' \
+  'jumpTo(target: JumpTarget, token?: number | null): void;' \
   'setMarks(marks: EditorMark[]): void;' \
   'setTheme(theme: Theme): void;' \
   'setListener(listener: (event: EditorEvent) => void): void;' \
@@ -154,7 +154,8 @@ for want in \
   'export type FindRequest' \
   "{ type: 'findResult'; count: number; index: number | null; token: number }" \
   "{ type: 'located'; positions: (number | null)[]; height: number; token: number }" \
-  "{ type: 'viewport'; top: BlockRef | null; fraction: number; visibleHeight: number; page: number; pages: number; cause: 'user' | 'host'; token: number | null }" \
+  "{ type: 'viewport'; top: BlockRef | null; fraction: number; visibleHeight: number; page: number; pages: number; offset: number; cause: 'user' | 'host'; token: number | null }" \
+  "{ type: 'jumpNotFound'; target: JumpTarget; token?: number }" \
   "{ type: 'blockNotFound'; block: BlockRef; token: number }" \
   'export interface Theme' \
   'export type JumpTarget' \

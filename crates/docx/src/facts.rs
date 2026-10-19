@@ -81,7 +81,7 @@ fn accepted_object_text(object: &InlineObject) -> &str {
 /// until it breaks: `piece` is the text, `start..end` the bytes of `paragraph.text` it comes from.
 /// Characters in tracked deletions (and move sources) are not visited; an object is one piece
 /// (empty for a marker). The k-th U+FFFC is the k-th object, deleted ones counted.
-fn for_each_accepted(paragraph: &Paragraph, mut visit: impl FnMut(&str, usize, usize) -> ControlFlow<()>) {
+pub fn for_each_accepted(paragraph: &Paragraph, mut visit: impl FnMut(&str, usize, usize) -> ControlFlow<()>) {
     let deleted = paragraph.deleted_ranges();
     let mut next_deleted = 0usize;
     let mut next_object = 0usize;

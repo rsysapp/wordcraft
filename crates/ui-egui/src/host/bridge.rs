@@ -16,8 +16,10 @@ pub enum HostCommand {
     /// A file over `open::MAX_OPEN_BYTES`, of which nothing was copied (`open::open_command`).
     /// Answered by `OpenFailed` (`open::TOO_LARGE`), in order with the other opens.
     OpenTooLarge { name: String, len: usize },
-    /// Show a page or a passage; answered by `JumpNotFound` when there is nothing to show.
-    JumpTo(JumpTarget),
+    /// Show a page or a passage; answered by `JumpNotFound` when there is nothing to show. The
+    /// optional token (embed API 0.4.1) is carried back by the `Viewport` the jump causes and by
+    /// `JumpNotFound`.
+    JumpTo(JumpTarget, Option<u32>),
     /// Replace every host mark; an empty list clears them. Marks not found are skipped silently.
     SetMarks(Vec<MarkSpec>),
     /// Dark or light chrome and the host's accent; pages stay white.
@@ -65,6 +67,10 @@ pub enum HostEvent {
     },
     JumpNotFound {
         target: JumpTarget,
+        /// The `jumpTo` token that asked, when it had one; absent from the JSON otherwise, so a host
+        /// that sends none hears what API 0.2 said.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        token: Option<u32>,
     },
     ModeChanged {
         mode: EditorMode,
@@ -114,6 +120,9 @@ pub enum HostEvent {
         visible_height: f32,
         page: u32,
         pages: u32,
+        /// The view's top on the stacked document-point axis `locate` and `height` use (embed API
+        /// 0.4.1): `locate(top)` plus `fraction` of the block's height while the view's top is in the block.
+        offset: f32,
         cause: Cause,
         token: Option<u32>,
     },
@@ -322,12 +331,17 @@ mod tests {
             (HostEvent::SelectionCleared, json!({"type": "selectionCleared"})),
             (HostEvent::MarkActivated { id: "t1".into() }, json!({"type": "markActivated", "id": "t1"})),
             (
-                HostEvent::JumpNotFound { target: JumpTarget::Text { text: "x".into(), page: None, occurrence: 0 } },
+                HostEvent::JumpNotFound { target: JumpTarget::Text { text: "x".into(), page: None, occurrence: 0 }, token: None },
                 json!({"type": "jumpNotFound", "target": {"kind": "text", "text": "x", "page": null, "occurrence": 0}}),
             ),
             (
-                HostEvent::JumpNotFound { target: JumpTarget::Page { page: u32::MAX } },
+                HostEvent::JumpNotFound { target: JumpTarget::Page { page: u32::MAX }, token: None },
                 json!({"type": "jumpNotFound", "target": {"kind": "page", "page": 4294967295u32}}),
+            ),
+            // A jump that had a token hears it back (embed API 0.4.1); one without says nothing of it.
+            (
+                HostEvent::JumpNotFound { target: JumpTarget::Page { page: 9 }, token: Some(12) },
+                json!({"type": "jumpNotFound", "target": {"kind": "page", "page": 9}, "token": 12}),
             ),
             (HostEvent::ModeChanged { mode: EditorMode::Edit }, json!({"type": "modeChanged", "mode": "edit"})),
             (HostEvent::ModeChanged { mode: EditorMode::View }, json!({"type": "modeChanged", "mode": "view"})),
@@ -350,6 +364,7 @@ mod tests {
                     visible_height: 600.0,
                     page: 2,
                     pages: 9,
+                    offset: 1234.5,
                     cause: Cause::Host,
                     token: Some(3),
                 },
@@ -360,13 +375,23 @@ mod tests {
                     "visibleHeight": 600.0,
                     "page": 2,
                     "pages": 9,
+                    "offset": 1234.5,
                     "cause": "host",
                     "token": 3
                 }),
             ),
             (
-                HostEvent::Viewport { top: None, fraction: 0.0, visible_height: 600.0, page: 1, pages: 1, cause: Cause::User, token: None },
-                json!({"type": "viewport", "top": null, "fraction": 0.0, "visibleHeight": 600.0, "page": 1, "pages": 1, "cause": "user", "token": null}),
+                HostEvent::Viewport {
+                    top: None,
+                    fraction: 0.0,
+                    visible_height: 600.0,
+                    page: 1,
+                    pages: 1,
+                    offset: 0.0,
+                    cause: Cause::User,
+                    token: None,
+                },
+                json!({"type": "viewport", "top": null, "fraction": 0.0, "visibleHeight": 600.0, "page": 1, "pages": 1, "offset": 0.0, "cause": "user", "token": null}),
             ),
             (
                 HostEvent::BlockNotFound { block: BlockRef { part: "word/document.xml".into(), index: 999 }, token: 4 },

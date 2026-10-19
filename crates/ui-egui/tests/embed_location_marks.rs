@@ -360,7 +360,7 @@ fn a_location_jump_centres_the_place_and_selects_nothing() {
     open_doc(&mut h, &bridge, &clauses(120));
     let text = paragraph_text(&h, 90);
     let selection_before = h.state().session.sel.clone();
-    bridge.send(HostCommand::JumpTo(location_jump(90, &text, Some(0), Some(0))));
+    bridge.send(HostCommand::JumpTo(location_jump(90, &text, Some(0), Some(0)), None));
     frames(&mut h, 4);
     assert_eq!(h.state().session.sel, selection_before);
     let middle = h.state().canvas.canvas_rect.expect("the canvas was drawn").center().y;
@@ -373,7 +373,7 @@ fn a_location_jump_without_a_range_goes_to_the_start_of_the_paragraph() {
     let (mut h, bridge) = embed_app();
     open_doc(&mut h, &bridge, &clauses(120));
     let text = paragraph_text(&h, 60);
-    bridge.send(HostCommand::JumpTo(location_jump(60, &text, None, None)));
+    bridge.send(HostCommand::JumpTo(location_jump(60, &text, None, None), None));
     frames(&mut h, 4);
     let middle = h.state().canvas.canvas_rect.expect("the canvas was drawn").center().y;
     let place = screen_of(&mut h, &wordcraft_doc::Pos::body(60, 0));
@@ -385,7 +385,7 @@ fn a_location_jump_near_the_top_of_the_document_stops_at_the_top() {
     let (mut h, bridge) = embed_app();
     open_doc(&mut h, &bridge, &clauses(120));
     let text = paragraph_text(&h, 1);
-    bridge.send(HostCommand::JumpTo(location_jump(1, &text, None, None)));
+    bridge.send(HostCommand::JumpTo(location_jump(1, &text, None, None), None));
     frames(&mut h, 4);
     let view = h.state().canvas.canvas_rect.expect("the canvas was drawn");
     let place = screen_of(&mut h, &wordcraft_doc::Pos::body(1, 0));
@@ -405,7 +405,7 @@ fn a_location_jump_leaves_a_selection_the_person_made_alone() {
     assert_ne!(selection_before.anchor, selection_before.focus, "something is selected");
     bridge.take_events();
     let text = paragraph_text(&h, 90);
-    bridge.send(HostCommand::JumpTo(location_jump(90, &text, Some(0), Some(6))));
+    bridge.send(HostCommand::JumpTo(location_jump(90, &text, Some(0), Some(6)), None));
     frames(&mut h, 4);
     assert_eq!(h.state().session.sel, selection_before);
     let events = bridge.take_events();
@@ -419,7 +419,7 @@ fn a_location_jump_is_reported_as_the_hosts_own_move() {
     open_doc(&mut h, &bridge, &clauses(120));
     bridge.take_events();
     let text = paragraph_text(&h, 90);
-    bridge.send(HostCommand::JumpTo(location_jump(90, &text, Some(0), Some(6))));
+    bridge.send(HostCommand::JumpTo(location_jump(90, &text, Some(0), Some(6)), None));
     frames(&mut h, 6);
     let events = bridge.take_events();
     let viewports: Vec<_> = events.iter().filter(|event| matches!(event, HostEvent::Viewport { .. })).collect();
@@ -433,16 +433,16 @@ fn a_location_jump_with_a_wrong_fingerprint_is_not_found() {
     open_doc(&mut h, &bridge, &clauses(20));
     bridge.take_events();
     let target = location_jump(5, "Not this.", None, None);
-    bridge.send(HostCommand::JumpTo(target.clone()));
+    bridge.send(HostCommand::JumpTo(target.clone(), None));
     frames(&mut h, 3);
-    assert!(bridge.take_events().contains(&HostEvent::JumpNotFound { target }));
+    assert!(bridge.take_events().contains(&HostEvent::JumpNotFound { target, token: None }));
 }
 
 #[test]
 fn a_location_jump_that_is_not_found_moves_nothing() {
     let (mut h, bridge) = embed_app();
     open_doc(&mut h, &bridge, &clauses(120));
-    bridge.send(HostCommand::JumpTo(JumpTarget::Page { page: 2 }));
+    bridge.send(HostCommand::JumpTo(JumpTarget::Page { page: 2 }, None));
     frames(&mut h, 4);
     let selection_before = h.state().session.sel.clone();
     let scroll_before = h.state().canvas.visible_page;
@@ -453,10 +453,10 @@ fn a_location_jump_that_is_not_found_moves_nothing() {
         at: LocationSpec { block: BlockRef { part: "word/other.xml".into(), index: 100 }, fingerprint: fingerprint(&text), from: None, to: None },
     };
     for target in [location_jump(100, "Not this.", None, None), unknown_block, wrong_part] {
-        bridge.send(HostCommand::JumpTo(target.clone()));
+        bridge.send(HostCommand::JumpTo(target.clone(), None));
         frames(&mut h, 4);
         let events = bridge.take_events();
-        assert!(events.contains(&HostEvent::JumpNotFound { target: target.clone() }), "{target:?}: {events:?}");
+        assert!(events.contains(&HostEvent::JumpNotFound { target: target.clone(), token: None }), "{target:?}: {events:?}");
         assert!(!events.iter().any(|event| matches!(event, HostEvent::Viewport { .. })), "nothing moved: {events:?}");
     }
     assert_eq!(h.state().session.sel, selection_before);
@@ -472,9 +472,9 @@ fn a_location_jump_with_a_bad_range_is_not_found() {
     for (from, to) in [(Some(8), Some(3)), (Some(0), Some(length + 1)), (Some(length + 1), None), (Some(u32::MAX), Some(u32::MAX))] {
         bridge.take_events();
         let target = location_jump(5, &text, from, to);
-        bridge.send(HostCommand::JumpTo(target.clone()));
+        bridge.send(HostCommand::JumpTo(target.clone(), None));
         frames(&mut h, 3);
-        assert!(bridge.take_events().contains(&HostEvent::JumpNotFound { target }), "{from:?}..{to:?}");
+        assert!(bridge.take_events().contains(&HostEvent::JumpNotFound { target, token: None }), "{from:?}..{to:?}");
     }
 }
 
@@ -488,11 +488,11 @@ fn a_location_jump_agrees_with_the_mark_on_the_same_location() {
     bridge.send(HostCommand::SetMarks(vec![location_mark("stale", 5, "Other.", None, None, MarkStyle::Fill)]));
     settle_marks(&mut h);
     let target = location_jump(5, "Other.", None, None);
-    bridge.send(HostCommand::JumpTo(target.clone()));
+    bridge.send(HostCommand::JumpTo(target.clone(), None));
     frames(&mut h, 3);
     let events = bridge.take_events();
     assert!(events.contains(&HostEvent::LocationMismatch { ids: vec!["stale".into()] }), "{events:?}");
-    assert!(events.contains(&HostEvent::JumpNotFound { target }), "{events:?}");
+    assert!(events.contains(&HostEvent::JumpNotFound { target, token: None }), "{events:?}");
     let _ = text;
 }
 
@@ -502,9 +502,9 @@ fn a_range_after_a_deletion_is_jumped_to_on_its_words() {
     let accepted = accepted_text(&first_body_paragraph(&h));
     bridge.take_events();
     let target = location_jump(0, &accepted, Some(12), Some(17));
-    bridge.send(HostCommand::JumpTo(target.clone()));
+    bridge.send(HostCommand::JumpTo(target.clone(), None));
     frames(&mut h, 4);
-    assert!(!bridge.take_events().contains(&HostEvent::JumpNotFound { target }));
+    assert!(!bridge.take_events().contains(&HostEvent::JumpNotFound { target, token: None }));
 }
 
 #[test]

@@ -421,3 +421,36 @@ pub fn table_height_on_screen(h: &mut Harness<'_, WordApp>, block: usize) -> f32
     let (_, _, bottom) = caret_on_screen(h, &last, last_length);
     bottom - top
 }
+
+// ---- the clean display with tracked changes (Clauflow #42, embed 0.4.1) ----
+
+/// `text` (paragraphs separated by newlines) as a file in which each wording of `deleted` is a tracked
+/// deletion and each wording of `hidden` is hidden text. Built through the engine so the file holds
+/// real `w:del` runs and real hidden runs. Each wording must occur once.
+pub fn docx_with_changes(text: &str, deleted: &[&str], hidden: &[&str]) -> Vec<u8> {
+    let mut session = Session::new(Document::from_text(text));
+    session.author = "Ana Setia".into();
+    for wording in hidden {
+        session.run("select.text", &serde_json::json!({ "text": wording })).expect("select the hidden wording");
+        session.run("format.hidden", &serde_json::json!({})).expect("hide it");
+    }
+    session.run("review.trackChanges", &serde_json::json!({ "value": true })).expect("track changes");
+    for wording in deleted {
+        session.run("select.text", &serde_json::json!({ "text": wording })).expect("select the deleted wording");
+        session.run("text.delete", &serde_json::json!({})).expect("delete it");
+    }
+    wordcraft_engine::io::save_bytes("changes.docx", &session.doc).expect("write docx")
+}
+
+/// The embed app mounted with or without its view bar and `bytes` opened in the clean display.
+pub fn embed_app_final(bytes: &[u8], view_bar: bool) -> (Harness<'static, WordApp>, HostBridge) {
+    let (mut h, bridge) = embed_app_with_view_bar(view_bar);
+    bridge.send(HostCommand::Open {
+        name: "changes.docx".into(),
+        bytes: bytes.to_vec(),
+        options: wordcraft_ui_egui::host::OpenOptions { display: wordcraft_ui_egui::host::Display::Final },
+    });
+    frames(&mut h, 4);
+    bridge.take_events();
+    (h, bridge)
+}

@@ -22,6 +22,8 @@ const JUMP_MARGIN_PT: f32 = 60.0;
 /// A host jump that was found but whose scroll the canvas has not applied yet.
 struct PendingJump {
     target: JumpTarget,
+    /// The host's token for it, if it sent one.
+    token: Option<u32>,
     /// The scroll it replaced, put back when a newer jump finds nothing.
     displaced: Option<(usize, f32)>,
     /// The selection it replaced, put back with the scroll while still in the frame it was found in.
@@ -269,7 +271,7 @@ pub(crate) fn before_frame(app: &mut WordApp, ctx: &egui::Context) {
             command,
             HostCommand::Open { .. }
                 | HostCommand::OpenTooLarge { .. }
-                | HostCommand::JumpTo(_)
+                | HostCommand::JumpTo(..)
                 | HostCommand::SetZoom(_)
                 | HostCommand::ScrollToBlock(_)
         ) || matches!(&command, HostCommand::Find(request) if request.select);
@@ -283,7 +285,7 @@ pub(crate) fn before_frame(app: &mut WordApp, ctx: &egui::Context) {
                 super::edit::before_open(app, &mut host);
                 refuse_open(&mut host, super::open::TOO_LARGE.to_string());
             }
-            HostCommand::JumpTo(target) => jump(app, &mut host, target, ctx.cumulative_frame_nr()),
+            HostCommand::JumpTo(target, token) => jump(app, &mut host, target, token, ctx.cumulative_frame_nr()),
             // Looked for when next painted, against the layout painted then.
             HostCommand::SetMarks(marks) => host.marks.set(marks),
             HostCommand::SetTheme(theme) => set_theme(app, &mut host, ctx, &theme),
@@ -320,8 +322,13 @@ fn set_theme(app: &mut WordApp, host: &mut HostState, ctx: &egui::Context, theme
 
 /// The zoom the host asked for, applied to the view as host state: view mode's command gate is not
 /// consulted (and not widened). It mirrors what the engine's `view.zoom` sets: a percentage ends any
-/// fit; the page-width fit shows one page per row.
+/// fit; the page-width fit shows one page per row. The block at the top of the view stays at the top,
+/// with the same fraction of it above the view's edge (the person's own Ctrl/⌘+wheel zoom keeps the
+/// page point under the pointer instead).
 fn set_zoom(app: &mut WordApp, host: &mut HostState, request: &ZoomRequest) {
+    // The place at the top of the view, in document points, which a zoom does not move (embed API
+    // 0.4.1). A jump's target that still holds is put back by `keep_target_in_view` instead.
+    let anchor = if host.page_target.is_none() { super::viewport::view_top(app) } else { None };
     let view = &mut app.session.view;
     match request.zoom {
         ZoomValue::Percent(percent) => {
@@ -337,7 +344,13 @@ fn set_zoom(app: &mut WordApp, host: &mut HostState, request: &ZoomRequest) {
     }
     // A wheel zoom still easing out would overwrite the host's value.
     app.canvas.wheel.cancel();
-    super::view::keep_target_in_view(app);
+    if let Some(point) = anchor {
+        // Not a person's scroll; the page stays what it was (no jump target is made).
+        app.canvas.scroll_to_doc = Some(point);
+        host.scroll_queued = true;
+    } else {
+        super::view::keep_target_in_view(app);
+    }
     host.zoom_token = Some(request.token);
 }
 
@@ -377,7 +390,7 @@ fn find(app: &mut WordApp, host: &mut HostState, request: &FindRequest) {
             show_match(app, host, request.token);
         }
     } else {
-        super::view::count_matches(app, &request.text, request.match_case, step);
+        super::view::count_matches(app, &request.text, request.match_case, step, host.clean_display);
     }
     let count = u32::try_from(app.session.find.results.len()).unwrap_or(u32::MAX);
     let index = (count > 0).then(|| u32::try_from(app.session.find.current).unwrap_or(u32::MAX));
@@ -457,6 +470,7 @@ fn report_viewport(app: &mut WordApp, host: &mut HostState, ctx: &egui::Context)
         visible_height: reading.visible_height,
         page: reading.page,
         pages: reading.pages,
+        offset: reading.offset,
         cause,
         token,
     });
@@ -683,16 +697,24 @@ fn scrolled_by_person(ctx: &egui::Context, canvas: Option<egui::Rect>, canvas_fo
     })
 }
 
-/// Show the host's page or passage; `jumpNotFound` when there is none. A newer jump replaces one
-/// whose scroll has not landed yet, found or not, as in the PDF editor's embed build.
+/// Show the host's page or passage; `jumpNotFound` (with the jump's token, if it had one) when there
+/// is none. A newer jump replaces one whose scroll has not landed yet, found or not, as in the PDF
+/// editor's embed build; the replaced jump is not answered.
 ///
 /// A found jump's selection (the passage, or the caret at the page's top) is the editor's own: it
 /// is never reported and clears a reported one. A jump that finds nothing leaves the selection be,
 /// and one that replaces a jump found in this same frame puts back the selection that jump
 /// replaced, with its scroll. A jump found in an earlier frame is not undone: by then the end of
 /// that frame may have cleared a reported selection, or a person may have selected anew.
-fn jump(app: &mut WordApp, host: &mut HostState, target: JumpTarget, frame: u64) {
+fn jump(app: &mut WordApp, host: &mut HostState, target: JumpTarget, token: Option<u32>, frame: u64) {
     let waiting = host.pending_jump.take();
+    // A jump replaced before its scroll lands is not answered, and its token does not stay behind to
+    // ride the view of whatever comes next.
+    if let Some(older) = waiting.as_ref().and_then(|waiting| waiting.token)
+        && host.viewport.scroll_token == Some(older)
+    {
+        host.viewport.scroll_token = None;
+    }
     let displaced = match &waiting {
         Some(waiting) => waiting.displaced,
         None => app.canvas.scroll_to_doc,
@@ -711,11 +733,16 @@ fn jump(app: &mut WordApp, host: &mut HostState, target: JumpTarget, frame: u64)
         Some((page, y)) => {
             app.canvas.scroll_to_doc = Some((page, y));
             host.aim(page, y);
+            // The `viewport` the scroll lands in carries the host's token. A newer token-bearing
+            // command replaces an older one still waiting, as in `scroll_to_block` and `show_match`.
+            if token.is_some() {
+                host.viewport.scroll_token = token;
+            }
             // A location jump leaves the selection as it was, so there is no new one to forget.
             if !matches!(target, JumpTarget::Location { .. }) {
                 host.note_programmatic_selection(&app.session.sel);
             }
-            host.pending_jump = Some(PendingJump { target, displaced, replaced, frame });
+            host.pending_jump = Some(PendingJump { target, token, displaced, replaced, frame });
         }
         None => {
             app.canvas.scroll_to_doc = displaced;
@@ -724,7 +751,7 @@ fn jump(app: &mut WordApp, host: &mut HostState, target: JumpTarget, frame: u64)
             host.settled = replaced.settled;
             host.clear_reported = replaced.clear_reported;
             host.page_target = None;
-            host.bridge.emit(HostEvent::JumpNotFound { target });
+            host.bridge.emit(HostEvent::JumpNotFound { target, token });
         }
     }
 }
@@ -782,7 +809,7 @@ fn open(app: &mut WordApp, host: &mut HostState, name: &str, bytes: &[u8], optio
             }
             // A jump found in the document being replaced never lands, so the host hears it failed.
             if let Some(waiting) = host.pending_jump.take() {
-                host.bridge.emit(HostEvent::JumpNotFound { target: waiting.target });
+                host.bridge.emit(HostEvent::JumpNotFound { target: waiting.target, token: waiting.token });
             }
             host.file_open = true;
             host.file_name = name.to_string();
@@ -937,7 +964,7 @@ mod tests {
         bridge.send(HostCommand::Open { name: "a.docx".into(), bytes: bytes.clone(), options: Default::default() });
         h.run_steps(4);
         bridge.take_events();
-        bridge.send(HostCommand::JumpTo(JumpTarget::Page { page: 3 }));
+        bridge.send(HostCommand::JumpTo(JumpTarget::Page { page: 3 }, None));
         race.set(true);
         h.step();
         race.set(false);

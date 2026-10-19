@@ -329,6 +329,18 @@ pub fn parse_open_options(json: &str) -> Result<OpenOptions, String> {
     serde_json::from_str(json).map_err(|error| format!("open: {error}"))
 }
 
+/// `jumpTo`'s optional token (embed API 0.4.1), a whole number from 0 to `u32::MAX` like every other
+/// token. It arrives as a number from the host's script, so NaN, infinities, fractions and negatives
+/// are refused here, before anything is queued.
+pub fn parse_jump_token(value: f64) -> Result<u32, String> {
+    if value.is_finite() && value.fract() == 0.0 && (0.0..=f64::from(u32::MAX)).contains(&value) {
+        // Whole and in range, checked above.
+        Ok(value as u32)
+    } else {
+        Err(format!("jumpTo: token {value} is not a whole number from 0 to {}", u32::MAX))
+    }
+}
+
 pub fn parse_jump_target(json: &str) -> Result<JumpTarget, String> {
     serde_json::from_str(json).map_err(|error| format!("jumpTo: {error}"))
 }

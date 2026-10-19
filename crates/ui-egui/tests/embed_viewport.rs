@@ -178,7 +178,7 @@ fn a_host_jump_is_not_the_persons_scroll() {
     let (mut h, bridge) = embed_app();
     open_doc(&mut h, &bridge, &clauses(120));
     bridge.take_events();
-    bridge.send(HostCommand::JumpTo(JumpTarget::Page { page: 5 }));
+    bridge.send(HostCommand::JumpTo(JumpTarget::Page { page: 5 }, None));
     frames(&mut h, 6);
     let events = bridge.take_events();
     let moved = viewports(events.clone());

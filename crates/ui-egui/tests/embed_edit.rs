@@ -95,7 +95,7 @@ fn stays_in_view_mode_without_an_open_document() {
 fn opening_a_document_returns_to_view_mode_first_and_answers_a_waiting_jump_before_opened() {
     let (mut harness, bridge) = editing(true);
     // A jump found in the same frame is still waiting for its scroll when the open runs.
-    bridge.send(HostCommand::JumpTo(rent()));
+    bridge.send(HostCommand::JumpTo(rent(), None));
     bridge.send(HostCommand::Open { name: "other.docx".into(), bytes: docx("Other."), options: Default::default() });
     harness.run_steps(3);
     let events = bridge.take_events();
@@ -112,7 +112,7 @@ fn sends_an_open_s_events_in_the_contract_s_order_in_view_mode() {
     harness.state_mut().run("select.all", json!({})).unwrap();
     harness.run_steps(3);
     assert!(bridge.take_events().iter().any(|event| matches!(event, HostEvent::Selection { .. })));
-    bridge.send(HostCommand::JumpTo(rent()));
+    bridge.send(HostCommand::JumpTo(rent(), None));
     bridge.send(HostCommand::Open { name: "other.docx".into(), bytes: docx("Other."), options: Default::default() });
     harness.run_steps(3);
     let events = bridge.take_events();
@@ -451,7 +451,7 @@ fn clears_a_reported_selection_before_editing_and_reports_none_while_editing() {
 #[test]
 fn typing_drops_a_jump_s_page_target_so_the_page_follows_the_caret() {
     let (mut harness, bridge) = editing(false);
-    bridge.send(HostCommand::JumpTo(JumpTarget::Page { page: 1 }));
+    bridge.send(HostCommand::JumpTo(JumpTarget::Page { page: 1 }, None));
     harness.run_steps(2);
     assert_eq!(harness.state().host.as_ref().unwrap().page_target(), Some(0));
     harness.state_mut().run("text.insert", json!({ "text": "x" })).unwrap();
@@ -1262,13 +1262,13 @@ fn mini_toolbar_drawn(harness: &Harness<'static, WordApp>) -> bool {
 #[test]
 fn the_mini_toolbar_appears_only_where_formatting_runs() {
     let (mut harness, bridge) = opened();
-    bridge.send(HostCommand::JumpTo(rent()));
+    bridge.send(HostCommand::JumpTo(rent(), None));
     harness.run_steps(4);
     assert!(!harness.state().session.sel.is_collapsed(), "the jump selected the passage");
     assert!(!wordcraft_ui_egui::mini_toolbar::visible(harness.state()) && !mini_toolbar_drawn(&harness), "view mode");
 
     let (mut harness, bridge) = editing(true);
-    bridge.send(HostCommand::JumpTo(rent()));
+    bridge.send(HostCommand::JumpTo(rent(), None));
     harness.run_steps(4);
     assert!(!harness.state().session.sel.is_collapsed());
     assert!(!wordcraft_ui_egui::mini_toolbar::visible(harness.state()) && !mini_toolbar_drawn(&harness), "edit mode without fullEditing");
@@ -1276,7 +1276,7 @@ fn the_mini_toolbar_appears_only_where_formatting_runs() {
     let (mut harness, bridge) = opened();
     bridge.send(edit_request(&format!(r#"{EDIT_JSON},"fullEditing":true}}}}"#)));
     harness.run_steps(3);
-    bridge.send(HostCommand::JumpTo(rent()));
+    bridge.send(HostCommand::JumpTo(rent(), None));
     harness.run_steps(4);
     assert!(wordcraft_ui_egui::mini_toolbar::visible(harness.state()) && mini_toolbar_drawn(&harness), "full editing keeps it");
 }
