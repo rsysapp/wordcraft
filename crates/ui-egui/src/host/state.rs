@@ -59,6 +59,9 @@ pub struct HostState {
     pub(crate) find_query: String,
     /// Where the current find began: typing refines the search from here, not from the last match.
     pub(crate) find_anchor: Option<Pos>,
+    /// What the clean display's find results were made from, so Next and Previous step through them
+    /// (`clean_find`).
+    pub(crate) clean_find_stamp: Option<super::clean_find::Stamp>,
     /// The page the view bar or the host last jumped to. It stays the current page until a person
     /// scrolls (wheel, scroll bar, touch drag, a scroll key or a selection drag that moves the view)
     /// or the next jump or find replaces it. "Most visible" cannot name a page that never wins that
@@ -208,6 +211,7 @@ impl HostState {
             view_bar: true,
             find_query: String::new(),
             find_anchor: None,
+            clean_find_stamp: None,
             page_target: None,
             target_y: 0.0,
             scroll_queued: false,
@@ -390,7 +394,7 @@ fn find(app: &mut WordApp, host: &mut HostState, request: &FindRequest) {
             show_match(app, host, request.token);
         }
     } else {
-        super::view::count_matches(app, &request.text, request.match_case, step, host.clean_display);
+        super::view::count_matches(app, &request.text, request.match_case, step, host.clean_display, &mut host.clean_find_stamp);
     }
     let count = u32::try_from(app.session.find.results.len()).unwrap_or(u32::MAX);
     let index = (count > 0).then(|| u32::try_from(app.session.find.current).unwrap_or(u32::MAX));
@@ -832,6 +836,7 @@ fn open(app: &mut WordApp, host: &mut HostState, name: &str, bytes: &[u8], optio
             host.last_zoom = None;
             host.find_query.clear();
             host.find_anchor = None;
+            host.clean_find_stamp = None;
             // Marks belong to the document they were set on.
             host.marks.clear();
             host.settled = app.session.sel.clone();
@@ -869,6 +874,8 @@ fn apply_display(app: &mut WordApp, host: &mut HostState, display: Display) {
         }
         Display::AsStored => return,
     }
+    // What the display shows decides what a search finds: results made before are another search's.
+    host.clean_find_stamp = None;
     // Deleted wording leaves (or returns to) the layout.
     app.session.relayout();
 }

@@ -720,6 +720,9 @@ bar, in view mode and while the document is in edit mode, and changes nothing in
   selection of a match across a deletion covers the deleted run too. The view bar's own find reads
   the same text. As stored (and for a host that never asks for the clean display) the search is the
   engine's, as in 0.4.0: it reads live text and cuts at every tracked deletion.
+  The clean display's search takes time linear in the document's text and its matches (0.4.2), and
+  stops at 100,000 matches, the engine's own limit, so `count` never passes it; `next` and `previous`
+  step through the matches already found while the query, `matchCase` and the document are unchanged.
 - **`findResult`.** One per `find`, in order, carrying the request's `token`:
   `{ type: 'findResult', count, index, token }`. `count` is the matches the text has and `index` the
   0-based one the find is on, in document order, `null` when `count` is 0. Empty `text` clears the
